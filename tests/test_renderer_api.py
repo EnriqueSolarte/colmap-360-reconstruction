@@ -4,7 +4,11 @@ import numpy as np
 import pytest
 
 from ep_pinhole import EquirectangularToPinhole, render_pinhole
-from ep_pinhole.tools.render_image import main as render_image_main
+from ep_pinhole.tools.render_image import (
+    DEFAULT_HEIGHT,
+    DEFAULT_WIDTH,
+    main as render_image_main,
+)
 
 
 def make_equirectangular_image() -> np.ndarray:
@@ -100,7 +104,7 @@ def test_render_pinhole_rejects_unknown_interpolation() -> None:
         )
 
 
-def test_render_image_cli_writes_output(tmp_path) -> None:
+def test_render_image_cli_writes_output(tmp_path, capsys) -> None:
     input_path = tmp_path / "input.png"
     output_path = tmp_path / "output.png"
     Image = pytest.importorskip("PIL.Image")
@@ -130,3 +134,29 @@ def test_render_image_cli_writes_output(tmp_path) -> None:
     assert exit_code == 0
     assert output_path.exists()
     assert np.asarray(Image.open(output_path)).shape == (8, 10, 3)
+    output = capsys.readouterr().out
+    assert "Input EP resolution: 32x16" in output
+    assert "Output pinhole resolution: 10x8" in output
+
+
+def test_render_image_cli_uses_reconstruction_defaults(tmp_path, capsys) -> None:
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(input_path)
+
+    exit_code = render_image_main(
+        [
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert output_path.exists()
+    assert np.asarray(Image.open(output_path)).shape == (DEFAULT_HEIGHT, DEFAULT_WIDTH, 3)
+    output = capsys.readouterr().out
+    assert "Input EP resolution: 32x16" in output
+    assert f"Output pinhole resolution: {DEFAULT_WIDTH}x{DEFAULT_HEIGHT}" in output
