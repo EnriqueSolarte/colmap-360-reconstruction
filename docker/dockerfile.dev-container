@@ -3,6 +3,8 @@ FROM nvcr.io/nvidia/cuda-dl-base:24.09-cuda12.6-devel-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
+    bash-completion \
+    ca-certificates \
     curl \
     libjpeg-dev \
     libpng-dev \
@@ -40,6 +42,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-venv && \
     ln -sf /usr/bin/python3 /usr/bin/python && \
     rm -rf /var/lib/apt/lists/*
+
+ARG GLAB_VERSION=1.81.0
+
+# Install GitHub CLI from the official GitHub APT repository.
+RUN mkdir -p -m 755 /etc/apt/keyrings /etc/apt/sources.list.d && \
+    wget -nv -O /etc/apt/keyrings/githubcli-archive-keyring.gpg https://cli.github.com/packages/githubcli-archive-keyring.gpg && \
+    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install GitLab CLI from a pinned upstream release package.
+RUN arch="$(dpkg --print-architecture)" && \
+    case "${arch}" in amd64|arm64) ;; *) echo "Unsupported architecture: ${arch}" >&2; exit 1 ;; esac && \
+    curl -fsSL -o /tmp/glab.deb "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_${arch}.deb" && \
+    apt-get update && apt-get install -y --no-install-recommends /tmp/glab.deb && \
+    rm -f /tmp/glab.deb && \
+    rm -rf /var/lib/apt/lists/*
+
+# Enable Bash completions for git, gh, and glab.
+RUN mkdir -p /etc/bash_completion.d && \
+    gh completion -s bash > /etc/bash_completion.d/gh && \
+    glab completion -s bash > /etc/bash_completion.d/glab && \
+    printf '\nif [ -f /etc/bash_completion ]; then\n    . /etc/bash_completion\nfi\n' >> /root/.bashrc
 
 COPY dockerfile.dev-container /dockerfile.dev-container
 

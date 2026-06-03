@@ -33,6 +33,7 @@ else
         --env="DISPLAY=${DISPLAY}" \
         --volume="/tmp/.X11-unix:/tmp/.X11-unix:rw" \
         --volume="${DOCKER_UTILS}:/docker_utils" \
+        --volume="${AGENT_SKILLS}:/agent-skills" \
         --volume="${DIR}/../:/workspace" \
         --volume="${ITRI_3D_RECONSTRUCTION}:/data/itri-3d-reconstruction" \
         -e QT_XCB_GL_INTEGRATION=xcb_egl \
