@@ -21,6 +21,7 @@ test = [
 [project.scripts]
 ep-pinhole-render = "ep_pinhole.tools.render_pinhole_image:main"
 ep-pinhole-random-render = "ep_pinhole.tools.random_pinhole_image:main"
+ep-pinhole-render-directory = "ep_pinhole.tools.render_pinhole_directory:main"
 
 
 [tool.hatch.build.targets.wheel]

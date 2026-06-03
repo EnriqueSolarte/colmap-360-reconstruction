@@ -1,3 +1,4 @@
+import json
 from math import pi
 
 import numpy as np
@@ -10,6 +11,7 @@ from ep_pinhole.tools.render_pinhole_image import (
     main as render_image_main,
 )
 from ep_pinhole.tools.random_pinhole_image import main as random_render_image_main
+from ep_pinhole.tools.render_pinhole_directory import main as render_directory_main
 
 
 def make_equirectangular_image() -> np.ndarray:
@@ -18,6 +20,10 @@ def make_equirectangular_image() -> np.ndarray:
     image[..., 1] = np.arange(16, dtype=np.uint8)[:, None]
     image[..., 2] = 127
     return image
+
+
+def angular_distance(a: float, b: float) -> float:
+    return abs((a - b + pi) % (2 * pi) - pi)
 
 
 def test_constructor_accepts_valid_image() -> None:
@@ -196,3 +202,205 @@ def test_random_render_image_cli_writes_output(tmp_path, capsys) -> None:
     assert "Random longitude:" in output
     assert "Random latitude:" in output
     assert "Output pinhole resolution: 10x8" in output
+
+
+def test_render_directory_cli_writes_multiple_outputs_per_image(tmp_path, capsys) -> None:
+    input_dir = tmp_path / "eps"
+    output_dir = tmp_path / "pinholes"
+    input_dir.mkdir()
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(input_dir / "front.png")
+    Image.fromarray(make_equirectangular_image()).save(input_dir / "back.jpg")
+    (input_dir / "notes.txt").write_text("not an image")
+
+    exit_code = render_directory_main(
+        [
+            "--input-dir",
+            str(input_dir),
+            "--output-dir",
+            str(output_dir),
+            "--num-views",
+            "3",
+            "--height",
+            "8",
+            "--width",
+            "10",
+            "--fov-x",
+            str(pi / 2),
+            "--fov-y",
+            str(pi / 3),
+            "--output-extension",
+            ".png",
+            "--latitude-min",
+            "-0.2",
+            "--latitude-max",
+            "0.2",
+            "--longitude-min",
+            "-0.3",
+            "--longitude-max",
+            "0.3",
+            "--seed",
+            "123",
+        ]
+    )
+
+    assert exit_code == 0
+    output_paths = sorted(output_dir.glob("*.png"))
+    assert [path.name for path in output_paths] == [
+        "back_pinhole_00.png",
+        "back_pinhole_01.png",
+        "back_pinhole_02.png",
+        "front_pinhole_00.png",
+        "front_pinhole_01.png",
+        "front_pinhole_02.png",
+    ]
+    for output_path in output_paths:
+        assert np.asarray(Image.open(output_path)).shape == (8, 10, 3)
+    metadata_path = output_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["num_views"] == 3
+    assert metadata["height"] == 8
+    assert metadata["width"] == 10
+    assert metadata["latitude_min"] == -0.2
+    assert metadata["latitude_max"] == 0.2
+    assert metadata["longitude_min"] == -0.3
+    assert metadata["longitude_max"] == 0.3
+    assert metadata["longitude_jitter"] == 0.0
+    assert metadata["latitude_jitter"] == 0.0
+    assert metadata["fov_x"] == pi / 2
+    assert metadata["fov_y"] == pi / 3
+    assert metadata["interpolation"] == "bilinear"
+    assert metadata["seed"] == 123
+    assert len(metadata["images"]) == 6
+    first_image = metadata["images"][0].copy()
+    first_longitude = first_image.pop("longitude")
+    first_base_longitude = first_image.pop("base_longitude")
+    first_latitude = first_image.pop("latitude")
+    first_base_latitude = first_image.pop("base_latitude")
+    assert -0.3 <= first_longitude <= 0.3
+    assert angular_distance(first_longitude, first_base_longitude) < 1e-12
+    assert -0.2 <= first_latitude <= 0.2
+    assert first_latitude == first_base_latitude
+    assert first_image == {
+        "source_file": str(input_dir / "back.jpg"),
+        "source_name": "back.jpg",
+        "source_width": 32,
+        "source_height": 16,
+        "file": str(output_dir / "back_pinhole_00.png"),
+        "file_name": "back_pinhole_00.png",
+        "view_index": 0,
+        "width": 10,
+        "height": 8,
+        "fov_x": pi / 2,
+        "fov_y": pi / 3,
+        "interpolation": "bilinear",
+    }
+    assert all(-0.3 <= image["longitude"] <= 0.3 for image in metadata["images"])
+    assert all(-0.2 <= image["latitude"] <= 0.2 for image in metadata["images"])
+    back_views = [
+        (image["longitude"], image["latitude"])
+        for image in metadata["images"]
+        if image["source_name"] == "back.jpg"
+    ]
+    front_views = [
+        (image["longitude"], image["latitude"])
+        for image in metadata["images"]
+        if image["source_name"] == "front.png"
+    ]
+    assert back_views != front_views
+    output = capsys.readouterr().out
+    assert f"Metadata: {metadata_path}" in output
+    assert "Rendered 6 pinhole images from 2 EP images." in output
+
+
+def test_render_directory_cli_supports_fixed_latitude_shortcut(tmp_path) -> None:
+    input_dir = tmp_path / "eps"
+    output_dir = tmp_path / "pinholes"
+    input_dir.mkdir()
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(input_dir / "front.png")
+
+    exit_code = render_directory_main(
+        [
+            "--input-dir",
+            str(input_dir),
+            "--output-dir",
+            str(output_dir),
+            "--num-views",
+            "2",
+            "--height",
+            "8",
+            "--width",
+            "10",
+            "--latitude",
+            "0.25",
+            "--fov-x",
+            str(pi / 2),
+            "--fov-y",
+            str(pi / 3),
+        ]
+    )
+
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+
+    assert exit_code == 0
+    assert metadata["latitude_min"] == 0.25
+    assert metadata["latitude_max"] == 0.25
+    assert [image["latitude"] for image in metadata["images"]] == [0.25, 0.25]
+
+
+def test_render_directory_cli_supports_random_views_and_jitter(tmp_path) -> None:
+    input_dir = tmp_path / "eps"
+    output_dir = tmp_path / "pinholes"
+    input_dir.mkdir()
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(input_dir / "front.png")
+
+    exit_code = render_directory_main(
+        [
+            "--input-dir",
+            str(input_dir),
+            "--output-dir",
+            str(output_dir),
+            "--num-views",
+            "2",
+            "--height",
+            "8",
+            "--width",
+            "10",
+            "--latitude-min",
+            "-0.35",
+            "--latitude-max",
+            "0.35",
+            "--longitude-jitter",
+            "0.05",
+            "--latitude-jitter",
+            "0.03",
+            "--seed",
+            "123",
+            "--fov-x",
+            str(pi / 2),
+            "--fov-y",
+            str(pi / 3),
+        ]
+    )
+
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    records = metadata["images"]
+
+    assert exit_code == 0
+    assert metadata["latitude_min"] == -0.35
+    assert metadata["latitude_max"] == 0.35
+    assert metadata["longitude_jitter"] == 0.05
+    assert metadata["latitude_jitter"] == 0.03
+    assert metadata["total_views_per_image"] == 2
+    assert len(records) == 2
+    assert all(-0.35 <= record["base_latitude"] <= 0.35 for record in records)
+    assert all(
+        angular_distance(record["longitude"], record["base_longitude"]) <= 0.05
+        for record in records
+    )
+    assert all(
+        abs(record["latitude"] - record["base_latitude"]) <= 0.03
+        for record in records
+    )
