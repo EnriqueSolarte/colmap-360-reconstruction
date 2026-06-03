@@ -16,10 +16,40 @@ from pathlib import Path
 os.environ.setdefault("XDG_RUNTIME_DIR", "/tmp/open3d-runtime")
 
 import numpy as np
-import open3d as o3d
-import pycolmap
 
-from .scale_recover import DEFAULT_MODEL
+from .reconstruct import DEFAULT_WORKSPACE
+
+try:
+    import pycolmap
+except ImportError:  # pragma: no cover - environment dependent
+    pycolmap = None
+
+try:
+    import open3d as o3d
+except ImportError:  # pragma: no cover - environment dependent
+    o3d = None
+
+
+DEFAULT_MODEL = DEFAULT_WORKSPACE / "sparse_best"
+
+
+def require_pycolmap():
+    if pycolmap is None:
+        raise RuntimeError(
+            "pycolmap is required to read COLMAP models. Install the `colmap` "
+            "extra or add `pycolmap` to the environment."
+        )
+    return pycolmap
+
+
+def require_open3d():
+    if o3d is None:
+        raise RuntimeError(
+            "Open3D is required for point-cloud visualization. Install the "
+            "`visualize` extra or add `open3d` to the environment."
+        )
+    return o3d
+
 
 def point_cloud_from_reconstruction(
     reconstruction: pycolmap.Reconstruction,
@@ -254,9 +284,10 @@ def apply_report_similarity(
     translation: np.ndarray,
 ) -> None:
     """Apply report similarity to a reconstruction in-place."""
-    transform = pycolmap.Sim3d(
+    pycolmap_module = require_pycolmap()
+    transform = pycolmap_module.Sim3d(
         float(scale),
-        pycolmap.Rotation3d(rotation),
+        pycolmap_module.Rotation3d(rotation),
         translation,
     )
     reconstruction.transform(transform)
@@ -341,10 +372,11 @@ def visualize(
     remove_outliers: bool,
     summary_only: bool,
 ) -> None:
+    pycolmap_module = require_pycolmap()
     if not model_path.exists():
         raise FileNotFoundError(f"COLMAP model path does not exist: {model_path}")
 
-    reconstruction = pycolmap.Reconstruction(model_path)
+    reconstruction = pycolmap_module.Reconstruction(model_path)
     metric_scale: float | None = None
     marker_frame_applied = False
     if scale_report is not None:
@@ -357,6 +389,15 @@ def visualize(
         )
         apply_report_similarity(reconstruction, metric_scale, rotation, translation)
 
+    if summary_only and save_image is None:
+        summarize_reconstruction(
+            reconstruction,
+            metric_scale=metric_scale,
+            marker_frame_applied=marker_frame_applied,
+        )
+        return
+
+    open3d_module = require_open3d()
     point_cloud = point_cloud_from_reconstruction(
         reconstruction,
         min_track_length=min_track_length,
@@ -372,7 +413,9 @@ def visualize(
     )
     geometries: list[o3d.geometry.Geometry] = [point_cloud]
     geometries.extend(camera_geometries)
-    geometries.append(o3d.geometry.TriangleMesh.create_coordinate_frame(size=scale))
+    geometries.append(
+        open3d_module.geometry.TriangleMesh.create_coordinate_frame(size=scale)
+    )
     view_points = np.vstack(
         [
             array
@@ -381,24 +424,14 @@ def visualize(
         ]
     )
 
-    print(reconstruction.summary())
-    print(f"visualized points: {len(point_cloud.points)}")
-    print(f"registered cameras: {centers.shape[0]}")
-    print(f"camera frustum scale: {scale:.6g}")
-    if metric_scale is None:
-        print(
-            "warning: raw monocular COLMAP model is not metric until marker "
-            "scale recovery."
-        )
-    else:
-        print(f"metric scale applied: {metric_scale:.12g} m / COLMAP unit")
-        if marker_frame_applied:
-            print("frame: ArUco marker")
-        else:
-            print(
-                "warning: report has no marker-frame transform; map is metric "
-                "scale but still in COLMAP's coordinate frame."
-            )
+    summarize_reconstruction(
+        reconstruction,
+        visualized_points=len(point_cloud.points),
+        registered_cameras=centers.shape[0],
+        camera_scale=scale,
+        metric_scale=metric_scale,
+        marker_frame_applied=marker_frame_applied,
+    )
     if save_image is not None:
         save_map_image(
             save_image,
@@ -410,7 +443,7 @@ def visualize(
     if summary_only:
         return
 
-    visualizer = o3d.visualization.Visualizer()
+    visualizer = open3d_module.visualization.Visualizer()
     window_name = (
         "COLMAP metric sparse map"
         if metric_scale is not None
@@ -429,6 +462,39 @@ def visualize(
         visualizer.run()
     finally:
         visualizer.destroy_window()
+
+
+def summarize_reconstruction(
+    reconstruction,
+    *,
+    visualized_points: int | None = None,
+    registered_cameras: int | None = None,
+    camera_scale: float | None = None,
+    metric_scale: float | None,
+    marker_frame_applied: bool,
+) -> None:
+    print(reconstruction.summary())
+    if visualized_points is None:
+        print(f"sparse points: {reconstruction.num_points3D()}")
+    else:
+        print(f"visualized points: {visualized_points}")
+    if registered_cameras is None:
+        print(f"registered cameras: {reconstruction.num_reg_images()}")
+    else:
+        print(f"registered cameras: {registered_cameras}")
+    if camera_scale is not None:
+        print(f"camera frustum scale: {camera_scale:.6g}")
+    if metric_scale is None:
+        print("warning: raw monocular COLMAP model is not metric.")
+    else:
+        print(f"metric scale applied: {metric_scale:.12g} m / COLMAP unit")
+        if marker_frame_applied:
+            print("frame: external metric report")
+        else:
+            print(
+                "warning: report has no marker-frame transform; map is metric "
+                "scale but still in COLMAP's coordinate frame."
+            )
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

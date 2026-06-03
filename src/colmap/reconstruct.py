@@ -1,8 +1,7 @@
-"""Run a raw COLMAP sparse reconstruction with the challenge camera intrinsics.
+"""Run raw COLMAP sparse reconstruction for generated pinhole images.
 
-This module intentionally stops before metric scale recovery. The output model
-is COLMAP's arbitrary monocular world and must be aligned to the ArUco marker
-trajectory before being treated as metric challenge output.
+The output model is COLMAP's arbitrary monocular world. It is not metric until
+it is aligned with an external scale source such as poses, LiDAR, or markers.
 """
 
 from __future__ import annotations
@@ -13,18 +12,32 @@ import shutil
 import sqlite3
 import sys
 from dataclasses import dataclass
+from math import pi, tan
 from pathlib import Path
 from typing import Any
 
-import pycolmap
+from PIL import Image
 
-from starter.camera_calibration import CameraCalibration
+from ep_pinhole.tools.render_pinhole_directory import (
+    DEFAULT_FOV_X,
+    DEFAULT_FOV_Y,
+    DEFAULT_HEIGHT,
+    DEFAULT_WIDTH,
+)
+
+
+try:  # Keep inspection usable before pycolmap is installed.
+    import pycolmap
+except ImportError:  # pragma: no cover - environment dependent
+    pycolmap = None
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_IMAGE_DIR = PROJECT_ROOT / "data" / "rgb"
-DEFAULT_CALIBRATION = PROJECT_ROOT / "data" / "cfg.yaml"
+DEFAULT_IMAGE_DIR = Path(
+    "/data/itri-3d-reconstruction/itri-3d-reconstruction/pinhole_1780034936312"
+)
 DEFAULT_WORKSPACE = PROJECT_ROOT / "data" / "colmap"
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
 
 
 @dataclass(frozen=True)
@@ -33,27 +46,125 @@ class ColmapCamera:
     width: int
     height: int
     params: tuple[float, float, float, float]
+    fov_x: float | None = None
+    fov_y: float | None = None
 
     @property
     def params_string(self) -> str:
         return ",".join(f"{value:.12g}" for value in self.params)
 
+    def report(self) -> dict[str, Any]:
+        return {
+            "model": self.model,
+            "width": self.width,
+            "height": self.height,
+            "params": list(self.params),
+            "params_order": ["fx", "fy", "cx", "cy"],
+            "fov_x": self.fov_x,
+            "fov_y": self.fov_y,
+            "shared_single_camera": True,
+            "intrinsics_refined": False,
+        }
 
-def camera_from_calibration(calibration: CameraCalibration) -> ColmapCamera:
+
+def camera_from_fov(width: int, height: int, fov_x: float, fov_y: float) -> ColmapCamera:
+    validate_positive_int(width, "width")
+    validate_positive_int(height, "height")
+    validate_fov(fov_x, "fov_x")
+    validate_fov(fov_y, "fov_y")
+
+    fx = (width / 2.0) / tan(fov_x / 2.0)
+    fy = (height / 2.0) / tan(fov_y / 2.0)
+    cx = width / 2.0
+    cy = height / 2.0
     return ColmapCamera(
         model="PINHOLE",
-        width=calibration.image_width,
-        height=calibration.image_height,
-        params=(calibration.fx, calibration.fy,
-                calibration.cx, calibration.cy),
+        width=width,
+        height=height,
+        params=(fx, fy, cx, cy),
+        fov_x=fov_x,
+        fov_y=fov_y,
     )
 
 
 def image_paths(image_dir: Path) -> list[Path]:
     paths: list[Path] = []
-    for suffix in ("*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff"):
-        paths.extend(image_dir.glob(suffix))
-    return sorted(paths)
+    for suffix in IMAGE_EXTENSIONS:
+        paths.extend(image_dir.glob(f"*{suffix}"))
+        paths.extend(image_dir.glob(f"*{suffix.upper()}"))
+    return sorted(set(paths))
+
+
+def inspect_input(
+    image_dir: Path,
+    workspace: Path,
+    camera: ColmapCamera,
+    *,
+    image_limit: int | None = None,
+    verify_all_resolutions: bool = True,
+) -> dict[str, Any]:
+    images = limited_image_paths(image_paths(image_dir), image_limit)
+    if not images:
+        raise RuntimeError(f"No images found in {image_dir}")
+
+    resolutions = image_resolutions(
+        images if verify_all_resolutions else images[:20])
+    expected_resolution = (camera.width, camera.height)
+    mismatches = {
+        str(path): list(resolution)
+        for path, resolution in resolutions.items()
+        if resolution != expected_resolution
+    }
+    if mismatches:
+        examples = list(mismatches.items())[:5]
+        raise ValueError(
+            "Image resolution does not match camera intrinsics. "
+            f"Expected {expected_resolution[0]}x{expected_resolution[1]}, "
+            f"examples: {examples}"
+        )
+
+    report = {
+        "status": "colmap_input_inspected",
+        "warning": (
+            "This report assumes all pinhole images share one virtual PINHOLE "
+            "camera. Confirm the original render FOV before trusting COLMAP "
+            "intrinsics."
+        ),
+        "image_dir": str(image_dir),
+        "workspace": str(workspace),
+        "input_image_count": len(images),
+        "image_limit": image_limit,
+        "first_image": images[0].name,
+        "last_image": images[-1].name,
+        "sample_images": [path.name for path in images[:5]],
+        "image_resolution": {
+            "width": expected_resolution[0],
+            "height": expected_resolution[1],
+        },
+        "camera": camera.report(),
+    }
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "colmap_input_report.json").write_text(
+        json.dumps(report, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return report
+
+
+def image_resolutions(paths: list[Path]) -> dict[Path, tuple[int, int]]:
+    resolutions: dict[Path, tuple[int, int]] = {}
+    for path in paths:
+        with Image.open(path) as image:
+            resolutions[path] = image.size
+    return resolutions
+
+
+def limited_image_paths(paths: list[Path], image_limit: int | None) -> list[Path]:
+    if image_limit is None:
+        return paths
+    if image_limit <= 0:
+        raise ValueError("image_limit must be positive")
+    return paths[:image_limit]
 
 
 def prepare_workspace(workspace: Path, overwrite: bool) -> dict[str, Path]:
@@ -68,6 +179,8 @@ def prepare_workspace(workspace: Path, overwrite: bool) -> dict[str, Path]:
         "best_sparse": workspace / "sparse_best",
         "raw_ply": workspace / "cloud_colmap_raw.ply",
         "report": workspace / "validation_report.json",
+        "input_report": workspace / "colmap_input_report.json",
+        "limited_images": workspace / "images_subset",
     }
     paths["sparse"].mkdir(parents=True, exist_ok=True)
     return paths
@@ -79,6 +192,7 @@ def fail_if_workspace_has_outputs(paths: dict[str, Path]) -> None:
         paths["raw_ply"],
         paths["report"],
         paths["best_sparse"],
+        paths["limited_images"],
     ]
     if any(path.exists() for path in existing):
         raise FileExistsError(
@@ -89,38 +203,53 @@ def fail_if_workspace_has_outputs(paths: dict[str, Path]) -> None:
 
 def run_reconstruction(
     image_dir: Path,
-    calibration_path: Path,
     workspace: Path,
+    camera: ColmapCamera,
     *,
+    matching: str = "sequential",
     overlap: int = 15,
     max_num_features: int = 8192,
+    image_limit: int | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    images = image_paths(image_dir)
+    pycolmap_module = require_pycolmap()
+    all_images = image_paths(image_dir)
+    images = limited_image_paths(all_images, image_limit)
     if not images:
         raise RuntimeError(f"No images found in {image_dir}")
 
-    calibration = CameraCalibration.from_yaml(calibration_path)
-    camera = camera_from_calibration(calibration)
     paths = prepare_workspace(workspace, overwrite)
     if not overwrite:
         fail_if_workspace_has_outputs(paths)
 
-    reader_options = pycolmap.ImageReaderOptions()
+    inspect_input(
+        image_dir=image_dir,
+        workspace=workspace,
+        camera=camera,
+        image_limit=image_limit,
+    )
+    reconstruction_image_dir = image_dir
+    if image_limit is not None:
+        reconstruction_image_dir = prepare_limited_image_dir(
+            images,
+            paths["limited_images"],
+        )
+
+    reader_options = pycolmap_module.ImageReaderOptions()
     reader_options.camera_model = camera.model
     reader_options.camera_params = camera.params_string
 
-    extraction_options = pycolmap.FeatureExtractionOptions()
+    extraction_options = pycolmap_module.FeatureExtractionOptions()
     extraction_options.use_gpu = False
     extraction_options.sift.max_num_features = max_num_features
 
-    matching_options = pycolmap.FeatureMatchingOptions()
+    matching_options = pycolmap_module.FeatureMatchingOptions()
     matching_options.use_gpu = False
 
-    pairing_options = pycolmap.SequentialPairingOptions()
+    pairing_options = pycolmap_module.SequentialPairingOptions()
     pairing_options.overlap = overlap
 
-    mapper_options = pycolmap.IncrementalPipelineOptions()
+    mapper_options = pycolmap_module.IncrementalPipelineOptions()
     mapper_options.ba_refine_focal_length = False
     mapper_options.ba_refine_principal_point = False
     mapper_options.ba_refine_extra_params = False
@@ -129,23 +258,32 @@ def run_reconstruction(
     mapper_options.mapper.abs_pose_refine_focal_length = False
     mapper_options.mapper.abs_pose_refine_extra_params = False
 
-    pycolmap.extract_features(
+    pycolmap_module.extract_features(
         paths["database"],
-        image_dir,
-        camera_mode=pycolmap.CameraMode.SINGLE,
+        reconstruction_image_dir,
+        camera_mode=pycolmap_module.CameraMode.SINGLE,
         reader_options=reader_options,
         extraction_options=extraction_options,
-        device=pycolmap.Device.cpu,
+        device=pycolmap_module.Device.cpu,
     )
-    pycolmap.match_sequential(
+    if matching == "sequential":
+        pycolmap_module.match_sequential(
+            paths["database"],
+            matching_options=matching_options,
+            pairing_options=pairing_options,
+            device=pycolmap_module.Device.cpu,
+        )
+    elif matching == "exhaustive":
+        pycolmap_module.match_exhaustive(
+            paths["database"],
+            matching_options=matching_options,
+            device=pycolmap_module.Device.cpu,
+        )
+    else:
+        raise ValueError("matching must be 'sequential' or 'exhaustive'")
+    reconstructions = pycolmap_module.incremental_mapping(
         paths["database"],
-        matching_options=matching_options,
-        pairing_options=pairing_options,
-        device=pycolmap.Device.cpu,
-    )
-    reconstructions = pycolmap.incremental_mapping(
-        paths["database"],
-        image_dir,
+        reconstruction_image_dir,
         paths["sparse"],
         options=mapper_options,
     )
@@ -164,12 +302,15 @@ def run_reconstruction(
 
     report = build_report(
         image_dir=image_dir,
-        calibration_path=calibration_path,
+        reconstruction_image_dir=reconstruction_image_dir,
         paths=paths,
         camera=camera,
         image_count=len(images),
+        total_available_image_count=len(all_images),
+        matching=matching,
         overlap=overlap,
         max_num_features=max_num_features,
+        image_limit=image_limit,
         reconstructions=reconstructions,
         best_model_id=best_model_id,
         best_reconstruction=best_reconstruction,
@@ -179,19 +320,36 @@ def run_reconstruction(
     return report
 
 
+def prepare_limited_image_dir(images: list[Path], limited_dir: Path) -> Path:
+    if limited_dir.exists():
+        shutil.rmtree(limited_dir)
+    limited_dir.mkdir(parents=True, exist_ok=True)
+    for image in images:
+        target = limited_dir / image.name
+        try:
+            target.symlink_to(image)
+        except OSError:
+            shutil.copy2(image, target)
+    return limited_dir
+
+
 def build_report(
     *,
     image_dir: Path,
-    calibration_path: Path,
+    reconstruction_image_dir: Path,
     paths: dict[str, Path],
     camera: ColmapCamera,
     image_count: int,
+    total_available_image_count: int,
+    matching: str,
     overlap: int,
     max_num_features: int,
-    reconstructions: dict[int, pycolmap.Reconstruction],
+    image_limit: int | None,
+    reconstructions: dict[int, Any],
     best_model_id: int,
-    best_reconstruction: pycolmap.Reconstruction,
+    best_reconstruction: Any,
 ) -> dict[str, Any]:
+    pycolmap_module = require_pycolmap()
     database_stats = read_database_stats(paths["database"])
     model_stats = {
         str(model_id): reconstruction_stats(reconstruction)
@@ -201,32 +359,28 @@ def build_report(
         "status": "raw_colmap_unscaled",
         "warning": (
             "This is a monocular COLMAP reconstruction in arbitrary COLMAP "
-            "scale/frame. Do not use it as metric challenge output until it "
-            "is aligned to the ArUco marker trajectory."
+            "scale/frame. Do not use it as metric output until it is aligned "
+            "with an external metric reference."
         ),
-        "pycolmap_version": pycolmap.__version__,
+        "pycolmap_version": pycolmap_module.__version__,
         "image_dir": str(image_dir),
-        "calibration_path": str(calibration_path),
+        "reconstruction_image_dir": str(reconstruction_image_dir),
         "workspace": str(paths["workspace"]),
         "database_path": str(paths["database"]),
         "sparse_path": str(paths["sparse"]),
         "best_sparse_path": str(paths["best_sparse"]),
         "raw_ply_path": str(paths["raw_ply"]),
-        "camera": {
-            "model": camera.model,
-            "width": camera.width,
-            "height": camera.height,
-            "params": list(camera.params),
-            "params_order": ["fx", "fy", "cx", "cy"],
-            "shared_single_camera": True,
-            "intrinsics_refined": False,
-        },
+        "input_report_path": str(paths["input_report"]),
+        "camera": camera.report(),
         "options": {
+            "matching": matching,
             "sequential_overlap": overlap,
             "max_num_features": max_num_features,
             "use_gpu": False,
+            "image_limit": image_limit,
         },
         "input_image_count": image_count,
+        "total_available_image_count": total_available_image_count,
         "database": database_stats,
         "model_count": len(reconstructions),
         "best_model_id": best_model_id,
@@ -235,7 +389,7 @@ def build_report(
     }
 
 
-def reconstruction_stats(reconstruction: pycolmap.Reconstruction) -> dict[str, Any]:
+def reconstruction_stats(reconstruction: Any) -> dict[str, Any]:
     return {
         "num_images": reconstruction.num_images(),
         "num_registered_images": reconstruction.num_reg_images(),
@@ -274,11 +428,31 @@ def read_database_stats(database_path: Path) -> dict[str, int]:
         }
 
 
+def require_pycolmap():
+    if pycolmap is None:
+        raise RuntimeError(
+            "pycolmap is required to run COLMAP reconstruction. Install the "
+            "`colmap` extra or add `pycolmap` to the environment."
+        )
+    return pycolmap
+
+
+def validate_positive_int(value: int, name: str) -> None:
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+
+
+def validate_fov(value: float, name: str) -> None:
+    if not 0.0 < value < pi:
+        raise ValueError(
+            f"{name} must be greater than 0 and less than pi radians")
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run raw COLMAP registration on data/rgb with fixed challenge "
-            "camera calibration. This does not recover metric scale."
+            "Inspect or reconstruct generated pinhole images with fixed COLMAP "
+            "PINHOLE intrinsics. Output is raw and unscaled."
         )
     )
     parser.add_argument(
@@ -286,14 +460,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--image-dir",
         type=Path,
         default=DEFAULT_IMAGE_DIR,
-        help=f"RGB image directory (default: {DEFAULT_IMAGE_DIR})",
-    )
-    parser.add_argument(
-        "-c",
-        "--calibration",
-        type=Path,
-        default=DEFAULT_CALIBRATION,
-        help=f"Camera calibration YAML (default: {DEFAULT_CALIBRATION})",
+        help=f"Pinhole image directory (default: {DEFAULT_IMAGE_DIR})",
     )
     parser.add_argument(
         "-w",
@@ -301,6 +468,39 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=Path,
         default=DEFAULT_WORKSPACE,
         help=f"COLMAP workspace directory (default: {DEFAULT_WORKSPACE})",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=DEFAULT_WIDTH,
+        help="Virtual pinhole image width in pixels.",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=DEFAULT_HEIGHT,
+        help="Virtual pinhole image height in pixels.",
+    )
+    parser.add_argument(
+        "--fov-x",
+        type=float,
+        default=DEFAULT_FOV_X,
+        help="Virtual pinhole horizontal field of view in radians.",
+    )
+    parser.add_argument(
+        "--fov-y",
+        type=float,
+        default=DEFAULT_FOV_Y,
+        help="Virtual pinhole vertical field of view in radians.",
+    )
+    parser.add_argument(
+        "--matching",
+        choices=("sequential", "exhaustive"),
+        default="sequential",
+        help=(
+            "Feature matching strategy. Exhaustive is useful for small smoke "
+            "subsets when sequential matching is too sparse."
+        ),
     )
     parser.add_argument(
         "--overlap",
@@ -315,26 +515,79 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Maximum SIFT features per image (default: 8192)",
     )
     parser.add_argument(
+        "--image-limit",
+        type=int,
+        default=None,
+        help="Use only the first N sorted images for smoke testing.",
+    )
+    parser.add_argument(
+        "--inspect-only",
+        action="store_true",
+        help="Inspect inputs and write colmap_input_report.json without COLMAP.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Delete and rebuild the COLMAP workspace before running.",
     )
     args = parser.parse_args(argv)
+    if not args.image_dir.is_dir():
+        parser.error(
+            f"--image-dir must be an existing directory: {args.image_dir}")
+    if args.width <= 0:
+        parser.error("--width must be positive")
+    if args.height <= 0:
+        parser.error("--height must be positive")
+    if not 0.0 < args.fov_x < pi:
+        parser.error("--fov-x must be greater than 0 and less than pi radians")
+    if not 0.0 < args.fov_y < pi:
+        parser.error("--fov-y must be greater than 0 and less than pi radians")
     if args.overlap <= 0:
         parser.error("--overlap must be positive")
     if args.max_num_features <= 0:
         parser.error("--max-num-features must be positive")
+    if args.image_limit is not None and args.image_limit <= 0:
+        parser.error("--image-limit must be positive")
     return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    camera = camera_from_fov(
+        width=args.width,
+        height=args.height,
+        fov_x=args.fov_x,
+        fov_y=args.fov_y,
+    )
+
+    if args.inspect_only:
+        report = inspect_input(
+            image_dir=args.image_dir,
+            workspace=args.workspace,
+            camera=camera,
+            image_limit=args.image_limit,
+        )
+        print(f"workspace: {report['workspace']}")
+        print(f"input report: {args.workspace / 'colmap_input_report.json'}")
+        print(
+            "images: "
+            f"{report['input_image_count']} at "
+            f"{report['image_resolution']['width']}x"
+            f"{report['image_resolution']['height']}"
+        )
+        print(f"first image: {report['first_image']}")
+        print(f"last image: {report['last_image']}")
+        print(f"camera params: {camera.params_string}")
+        return 0
+
     report = run_reconstruction(
         image_dir=args.image_dir,
-        calibration_path=args.calibration,
         workspace=args.workspace,
+        camera=camera,
+        matching=args.matching,
         overlap=args.overlap,
         max_num_features=args.max_num_features,
+        image_limit=args.image_limit,
         overwrite=args.overwrite,
     )
 
@@ -348,7 +601,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{best['num_points3D']} points, "
         f"{best['mean_reprojection_error_px']:.3f}px mean reprojection error"
     )
-    print("status: raw COLMAP reconstruction is unscaled; marker alignment comes next.")
+    print("status: raw COLMAP reconstruction is unscaled.")
     return 0
 
 

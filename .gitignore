@@ -35,3 +35,6 @@ Thumbs.db
 
 # Tool caches
 .cache/
+
+# Generated local reconstruction workspaces
+data/
