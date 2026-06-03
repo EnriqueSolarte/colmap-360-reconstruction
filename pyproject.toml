@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ep-pinhole"
+version = "0.1.0"
+description = "Render pinhole views from equirectangular projection images."
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "pillow",
+    "py360convert",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+
+[project.scripts]
+ep-pinhole-render = "ep_pinhole.tools.render_image:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ep_pinhole"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
