@@ -28,8 +28,8 @@ visualize = [
 ep-pinhole-render = "ep_pinhole.tools.render_pinhole_image:main"
 ep-pinhole-random-render = "ep_pinhole.tools.random_pinhole_image:main"
 ep-pinhole-render-directory = "ep_pinhole.tools.render_pinhole_directory:main"
-ep-pinhole-colmap-reconstruct = "colmap.reconstruct:main"
-ep-pinhole-colmap-visualize = "colmap.visualize_map:main"
+colmap-reconstruct = "colmap.reconstruct:main"
+colmap-visualize = "colmap.visualize_map:main"
 
 
 [tool.hatch.build.targets.wheel]

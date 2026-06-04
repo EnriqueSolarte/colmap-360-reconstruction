@@ -5,13 +5,14 @@ import numpy as np
 import pytest
 
 import colmap.reconstruct as reconstruct
+from colmap.camera import camera_from_fov
+from ep_pinhole import defaults
 from colmap.reconstruct import (
-    camera_from_fov,
     camera_from_args,
-    inspect_input,
     main as colmap_reconstruct_main,
     parse_args,
 )
+from colmap.input_inspection import inspect_input
 from ep_pinhole.tools import render_pinhole_directory
 
 
@@ -22,10 +23,14 @@ def write_image(path, *, width: int = 10, height: int = 8) -> None:
 
 
 def test_colmap_defaults_follow_directory_renderer_defaults() -> None:
-    assert reconstruct.DEFAULT_WIDTH == render_pinhole_directory.DEFAULT_WIDTH
-    assert reconstruct.DEFAULT_HEIGHT == render_pinhole_directory.DEFAULT_HEIGHT
-    assert reconstruct.DEFAULT_FOV_X == render_pinhole_directory.DEFAULT_FOV_X
-    assert reconstruct.DEFAULT_FOV_Y == render_pinhole_directory.DEFAULT_FOV_Y
+    assert reconstruct.DEFAULT_WIDTH == defaults.DEFAULT_PINHOLE_WIDTH
+    assert reconstruct.DEFAULT_HEIGHT == defaults.DEFAULT_PINHOLE_HEIGHT
+    assert reconstruct.DEFAULT_FOV_X == defaults.DEFAULT_PINHOLE_FOV_X
+    assert reconstruct.DEFAULT_FOV_Y == defaults.DEFAULT_PINHOLE_FOV_Y
+    assert render_pinhole_directory.DEFAULT_WIDTH == defaults.DEFAULT_PINHOLE_WIDTH
+    assert render_pinhole_directory.DEFAULT_HEIGHT == defaults.DEFAULT_PINHOLE_HEIGHT
+    assert render_pinhole_directory.DEFAULT_FOV_X == defaults.DEFAULT_PINHOLE_FOV_X
+    assert render_pinhole_directory.DEFAULT_FOV_Y == defaults.DEFAULT_PINHOLE_FOV_Y
 
 
 def test_camera_from_fov_computes_pinhole_intrinsics() -> None:
