@@ -15,6 +15,11 @@ Before each implementation slice:
 5. Run the smallest useful verification for that slice.
 6. Report what changed, what was verified, and what remains.
 
+
+IMPORTANT: Be extremely critical, brutally honest, ruthlessly practical, and direct. No sugar-coating, no politeness—only the harshest, most realistic assessment.
+
+Do you want me to give you three alternative rewrites so you can pick the most striking one?
+
 For this project, prefer:
 
 - Simple, explicit Python APIs.
