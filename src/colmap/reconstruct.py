@@ -22,12 +22,11 @@ from colmap.camera import (
     camera_from_fov,
     camera_from_resolution_guess,
 )
-
-from ep_pinhole.tools.render_pinhole_directory import (
-    DEFAULT_FOV_X,
-    DEFAULT_FOV_Y,
-    DEFAULT_HEIGHT,
-    DEFAULT_WIDTH,
+from ep_pinhole.defaults import (
+    DEFAULT_PINHOLE_FOV_X,
+    DEFAULT_PINHOLE_FOV_Y,
+    DEFAULT_PINHOLE_HEIGHT,
+    DEFAULT_PINHOLE_WIDTH,
 )
 
 
@@ -43,6 +42,10 @@ DEFAULT_IMAGE_DIR = Path(
 )
 DEFAULT_WORKSPACE = PROJECT_ROOT / "data" / "colmap"
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+DEFAULT_WIDTH = DEFAULT_PINHOLE_WIDTH
+DEFAULT_HEIGHT = DEFAULT_PINHOLE_HEIGHT
+DEFAULT_FOV_X = DEFAULT_PINHOLE_FOV_X
+DEFAULT_FOV_Y = DEFAULT_PINHOLE_FOV_Y
 
 
 def first_image_resolution(image_dir: Path, image_limit: int | None = None) -> tuple[int, int]:
