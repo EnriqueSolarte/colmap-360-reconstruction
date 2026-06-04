@@ -7,8 +7,10 @@ import pytest
 import colmap.reconstruct as reconstruct
 from colmap.reconstruct import (
     camera_from_fov,
+    camera_from_args,
     inspect_input,
     main as colmap_reconstruct_main,
+    parse_args,
 )
 from ep_pinhole.tools import render_pinhole_directory
 
@@ -106,6 +108,68 @@ def test_colmap_reconstruct_cli_inspect_only(tmp_path, capsys) -> None:
     output = capsys.readouterr().out
     assert "images: 1 at 10x8" in output
     assert "camera params: 5,6.92820323028,5,4" in output
+
+
+def test_optimize_intrinsics_infers_image_resolution(tmp_path, capsys) -> None:
+    image_dir = tmp_path / "images"
+    workspace = tmp_path / "workspace"
+    image_dir.mkdir()
+    write_image(image_dir / "frame.png", width=12, height=7)
+
+    exit_code = colmap_reconstruct_main(
+        [
+            "--image-dir",
+            str(image_dir),
+            "--workspace",
+            str(workspace),
+            "--optimize-intrinsics",
+            "--inspect-only",
+        ]
+    )
+
+    assert exit_code == 0
+    report = json.loads(
+        (workspace / "colmap_input_report.json").read_text(encoding="utf-8")
+    )
+    assert report["image_resolution"] == {"width": 12, "height": 7}
+    assert report["camera"]["width"] == 12
+    assert report["camera"]["height"] == 7
+    assert report["camera"]["params"] == [14.399999999999999, 14.399999999999999, 6.0, 3.5]
+    output = capsys.readouterr().out
+    assert "images: 1 at 12x7" in output
+
+
+def test_optimize_intrinsics_requires_width_and_height_together(tmp_path) -> None:
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    write_image(image_dir / "frame.png", width=12, height=7)
+    args = parse_args(
+        [
+            "--image-dir",
+            str(image_dir),
+            "--optimize-intrinsics",
+            "--width",
+            "12",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="both --width and --height"):
+        camera_from_args(args)
+
+
+def test_parse_args_supports_shared_intrinsics_optimization(tmp_path) -> None:
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+
+    args = parse_args(
+        [
+            "--image-dir",
+            str(image_dir),
+            "--optimize-intrinsics",
+        ]
+    )
+
+    assert args.optimize_intrinsics is True
 
 
 def test_require_pycolmap_reports_missing_dependency(monkeypatch) -> None:

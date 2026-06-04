@@ -87,6 +87,55 @@ def camera_from_fov(width: int, height: int, fov_x: float, fov_y: float) -> Colm
     )
 
 
+def camera_from_resolution_guess(width: int, height: int) -> ColmapCamera:
+    """Build a generic initial PINHOLE guess for BA to refine."""
+    validate_positive_int(width, "width")
+    validate_positive_int(height, "height")
+
+    focal = 1.2 * max(width, height)
+    return ColmapCamera(
+        model="PINHOLE",
+        width=width,
+        height=height,
+        params=(focal, focal, width / 2.0, height / 2.0),
+    )
+
+
+def first_image_resolution(image_dir: Path, image_limit: int | None = None) -> tuple[int, int]:
+    images = limited_image_paths(image_paths(image_dir), image_limit)
+    if not images:
+        raise RuntimeError(f"No images found in {image_dir}")
+    with Image.open(images[0]) as image:
+        return image.size
+
+
+def camera_from_args(args: argparse.Namespace) -> ColmapCamera:
+    if args.optimize_intrinsics:
+        width, height = optimized_camera_resolution(args)
+        if args.fov_x is not None or args.fov_y is not None:
+            fov_x = DEFAULT_FOV_X if args.fov_x is None else args.fov_x
+            fov_y = DEFAULT_FOV_Y if args.fov_y is None else args.fov_y
+            return camera_from_fov(width, height, fov_x, fov_y)
+        return camera_from_resolution_guess(width, height)
+
+    width = DEFAULT_WIDTH if args.width is None else args.width
+    height = DEFAULT_HEIGHT if args.height is None else args.height
+    fov_x = DEFAULT_FOV_X if args.fov_x is None else args.fov_x
+    fov_y = DEFAULT_FOV_Y if args.fov_y is None else args.fov_y
+    return camera_from_fov(width, height, fov_x, fov_y)
+
+
+def optimized_camera_resolution(args: argparse.Namespace) -> tuple[int, int]:
+    if args.width is not None and args.height is not None:
+        return args.width, args.height
+    if args.width is not None or args.height is not None:
+        raise ValueError(
+            "--optimize-intrinsics requires both --width and --height when "
+            "overriding image-derived resolution"
+        )
+    return first_image_resolution(args.image_dir, args.image_limit)
+
+
 def image_paths(image_dir: Path) -> list[Path]:
     paths: list[Path] = []
     for suffix in IMAGE_EXTENSIONS:
@@ -210,6 +259,7 @@ def run_reconstruction(
     overlap: int = 15,
     max_num_features: int = 8192,
     image_limit: int | None = None,
+    optimize_intrinsics: bool = False,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     pycolmap_module = require_pycolmap()
@@ -250,12 +300,12 @@ def run_reconstruction(
     pairing_options.overlap = overlap
 
     mapper_options = pycolmap_module.IncrementalPipelineOptions()
-    mapper_options.ba_refine_focal_length = False
-    mapper_options.ba_refine_principal_point = False
+    mapper_options.ba_refine_focal_length = optimize_intrinsics
+    mapper_options.ba_refine_principal_point = optimize_intrinsics
     mapper_options.ba_refine_extra_params = False
     mapper_options.ba_use_gpu = False
     mapper_options.extract_colors = True
-    mapper_options.mapper.abs_pose_refine_focal_length = False
+    mapper_options.mapper.abs_pose_refine_focal_length = optimize_intrinsics
     mapper_options.mapper.abs_pose_refine_extra_params = False
 
     pycolmap_module.extract_features(
@@ -311,6 +361,7 @@ def run_reconstruction(
         overlap=overlap,
         max_num_features=max_num_features,
         image_limit=image_limit,
+        optimize_intrinsics=optimize_intrinsics,
         reconstructions=reconstructions,
         best_model_id=best_model_id,
         best_reconstruction=best_reconstruction,
@@ -345,6 +396,7 @@ def build_report(
     overlap: int,
     max_num_features: int,
     image_limit: int | None,
+    optimize_intrinsics: bool,
     reconstructions: dict[int, Any],
     best_model_id: int,
     best_reconstruction: Any,
@@ -355,6 +407,8 @@ def build_report(
         str(model_id): reconstruction_stats(reconstruction)
         for model_id, reconstruction in sorted(reconstructions.items())
     }
+    camera_report = camera.report()
+    camera_report["intrinsics_refined"] = optimize_intrinsics
     return {
         "status": "raw_colmap_unscaled",
         "warning": (
@@ -371,13 +425,15 @@ def build_report(
         "best_sparse_path": str(paths["best_sparse"]),
         "raw_ply_path": str(paths["raw_ply"]),
         "input_report_path": str(paths["input_report"]),
-        "camera": camera.report(),
+        "camera": camera_report,
         "options": {
             "matching": matching,
             "sequential_overlap": overlap,
             "max_num_features": max_num_features,
             "use_gpu": False,
             "image_limit": image_limit,
+            "optimize_intrinsics": optimize_intrinsics,
+            "shared_single_camera": True,
         },
         "input_image_count": image_count,
         "total_available_image_count": total_available_image_count,
@@ -472,26 +528,38 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--width",
         type=int,
-        default=DEFAULT_WIDTH,
-        help="Virtual pinhole image width in pixels.",
+        default=None,
+        help=(
+            "Virtual pinhole image width in pixels. Defaults to the renderer "
+            f"default ({DEFAULT_WIDTH}) unless --optimize-intrinsics is used."
+        ),
     )
     parser.add_argument(
         "--height",
         type=int,
-        default=DEFAULT_HEIGHT,
-        help="Virtual pinhole image height in pixels.",
+        default=None,
+        help=(
+            "Virtual pinhole image height in pixels. Defaults to the renderer "
+            f"default ({DEFAULT_HEIGHT}) unless --optimize-intrinsics is used."
+        ),
     )
     parser.add_argument(
         "--fov-x",
         type=float,
-        default=DEFAULT_FOV_X,
-        help="Virtual pinhole horizontal field of view in radians.",
+        default=None,
+        help=(
+            "Virtual pinhole horizontal field of view in radians. Defaults to "
+            f"the renderer default ({DEFAULT_FOV_X}) for fixed intrinsics."
+        ),
     )
     parser.add_argument(
         "--fov-y",
         type=float,
-        default=DEFAULT_FOV_Y,
-        help="Virtual pinhole vertical field of view in radians.",
+        default=None,
+        help=(
+            "Virtual pinhole vertical field of view in radians. Defaults to "
+            f"the renderer default ({DEFAULT_FOV_Y}) for fixed intrinsics."
+        ),
     )
     parser.add_argument(
         "--matching",
@@ -526,6 +594,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Inspect inputs and write colmap_input_report.json without COLMAP.",
     )
     parser.add_argument(
+        "--optimize-intrinsics",
+        action="store_true",
+        help=(
+            "Let COLMAP refine focal length and principal point during mapping. "
+            "All images still share one PINHOLE camera."
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Delete and rebuild the COLMAP workspace before running.",
@@ -534,13 +610,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if not args.image_dir.is_dir():
         parser.error(
             f"--image-dir must be an existing directory: {args.image_dir}")
-    if args.width <= 0:
+    if args.width is not None and args.width <= 0:
         parser.error("--width must be positive")
-    if args.height <= 0:
+    if args.height is not None and args.height <= 0:
         parser.error("--height must be positive")
-    if not 0.0 < args.fov_x < pi:
+    if args.fov_x is not None and not 0.0 < args.fov_x < pi:
         parser.error("--fov-x must be greater than 0 and less than pi radians")
-    if not 0.0 < args.fov_y < pi:
+    if args.fov_y is not None and not 0.0 < args.fov_y < pi:
         parser.error("--fov-y must be greater than 0 and less than pi radians")
     if args.overlap <= 0:
         parser.error("--overlap must be positive")
@@ -553,12 +629,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    camera = camera_from_fov(
-        width=args.width,
-        height=args.height,
-        fov_x=args.fov_x,
-        fov_y=args.fov_y,
-    )
+    camera = camera_from_args(args)
 
     if args.inspect_only:
         report = inspect_input(
@@ -588,6 +659,7 @@ def main(argv: list[str] | None = None) -> int:
         overlap=args.overlap,
         max_num_features=args.max_num_features,
         image_limit=args.image_limit,
+        optimize_intrinsics=args.optimize_intrinsics,
         overwrite=args.overwrite,
     )
 

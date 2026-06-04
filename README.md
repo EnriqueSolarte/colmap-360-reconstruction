@@ -213,6 +213,23 @@ colmap_input_report.json
 The output is raw and unscaled. The validation report contains registration
 count, sparse point count, matching database stats, and reprojection error.
 
+To let COLMAP refine the shared virtual camera intrinsics during mapping, add:
+
+```bash
+--optimize-intrinsics
+```
+
+This refines focal length and principal point, but all images still share one
+`PINHOLE` camera. Extra distortion parameters are not enabled.
+
+When `--optimize-intrinsics` is used without explicit `--width`, `--height`,
+`--fov-x`, or `--fov-y`, the COLMAP helper derives the camera resolution from
+the input images and uses a generic initial pinhole guess. This is useful for
+real pinhole image folders that are not rendered with the project defaults, for
+example `1920x1080` frames.
+
+If you pass `--width` or `--height` with `--optimize-intrinsics`, pass both.
+
 ### Matching Strategy
 
 `--matching sequential` is the default and is scalable, but it may be too sparse
@@ -295,4 +312,3 @@ This is a good smoke result, not a final full-dataset strategy.
 ```bash
 pytest -q
 ```
-
