@@ -502,6 +502,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         description="Visualize a COLMAP sparse model with Open3D."
     )
     parser.add_argument(
+        "-m",
         "--model",
         type=Path,
         default=DEFAULT_MODEL,

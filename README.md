@@ -1,9 +1,9 @@
 # EP Pinhole
 
-Render perspective pinhole images from equirectangular panoramas, then run a
-raw COLMAP sparse reconstruction on the generated pinholes.
+Render perspective pinhole images from equirectangular panoramas and run a raw
+COLMAP sparse reconstruction on the generated pinholes.
 
-The project is currently focused on a practical reconstruction workflow:
+The current workflow is:
 
 1. Render one or more pinhole views from each equirectangular image.
 2. Record render metadata and fixed virtual-camera intrinsics.
@@ -29,13 +29,13 @@ python -m pip install -e '.[test]'
 pytest -q
 ```
 
-For COLMAP reconstruction:
+For COLMAP reconstruction support:
 
 ```bash
 python -m pip install -e '.[colmap]'
 ```
 
-For Open3D visualization:
+For Open3D visualization support:
 
 ```bash
 python -m pip install -e '.[visualize]'
@@ -164,7 +164,7 @@ image = renderer.render(
 Before running COLMAP, inspect the pinhole folder and write a report:
 
 ```bash
-ep-pinhole-colmap-reconstruct \
+colmap-reconstruct \
   --inspect-only \
   --image-dir /path/to/pinhole_images \
   --workspace /workspace/data/colmap
@@ -191,7 +191,7 @@ Inspection does not require `pycolmap`.
 Start with a small subset before attempting a full reconstruction:
 
 ```bash
-ep-pinhole-colmap-reconstruct \
+colmap-reconstruct \
   --image-dir /path/to/pinhole_images \
   --workspace /workspace/data/colmap-smoke \
   --image-limit 100 \
@@ -248,7 +248,7 @@ usually too expensive.
 Summary mode works without Open3D:
 
 ```bash
-ep-pinhole-colmap-visualize \
+colmap-visualize \
   --model /workspace/data/colmap-smoke/sparse_best \
   --summary-only
 ```
@@ -256,14 +256,14 @@ ep-pinhole-colmap-visualize \
 Interactive visualization requires Open3D and GUI/OpenGL support:
 
 ```bash
-ep-pinhole-colmap-visualize \
+colmap-visualize \
   --model /workspace/data/colmap-smoke/sparse_best
 ```
 
 To save a preview image:
 
 ```bash
-ep-pinhole-colmap-visualize \
+colmap-visualize \
   --model /workspace/data/colmap-smoke/sparse_best \
   --save-image /workspace/data/colmap-smoke/map-preview.png \
   --summary-only

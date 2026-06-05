@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from math import pi
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +22,12 @@ from ep_pinhole.defaults import (
     DEFAULT_PINHOLE_INTERPOLATION,
     DEFAULT_PINHOLE_WIDTH,
 )
+from ep_pinhole.view_sampling import (
+    VIEW_SAMPLING_DESCRIPTIONS,
+    VIEW_SAMPLING_METHODS,
+    random_views,
+    uniform_longitude_views,
+)
 
 DEFAULT_WIDTH = DEFAULT_PINHOLE_WIDTH
 DEFAULT_HEIGHT = DEFAULT_PINHOLE_HEIGHT
@@ -37,6 +42,7 @@ DEFAULT_LONGITUDE_JITTER = 0.0
 DEFAULT_LATITUDE_JITTER = 0.0
 DEFAULT_LONGITUDE_MIN = DEFAULT_EP_LONGITUDE_MIN
 DEFAULT_LONGITUDE_MAX = DEFAULT_EP_LONGITUDE_MAX
+DEFAULT_VIEW_SAMPLING = "random"
 IMAGE_EXTENSIONS = frozenset(
     {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 )
@@ -56,6 +62,8 @@ def main(argv: list[str] | None = None) -> int:
         "output_dir": str(args.output_dir),
         "num_views": args.num_views,
         "total_views_per_image": args.num_views,
+        "view_sampling": args.view_sampling,
+        "view_sampling_description": VIEW_SAMPLING_DESCRIPTIONS[args.view_sampling],
         "height": args.height,
         "width": args.width,
         "latitude_min": args.latitude_min,
@@ -75,16 +83,7 @@ def main(argv: list[str] | None = None) -> int:
         renderer = EquirectangularToPinhole.from_file(image_path)
         input_width, input_height = _resolution(renderer.image)
         print(f"Input EP: {image_path.name} ({input_width}x{input_height})")
-        views = _view_plan(
-            num_views=args.num_views,
-            rng=rng,
-            longitude_min=args.longitude_min,
-            longitude_max=args.longitude_max,
-            latitude_min=args.latitude_min,
-            latitude_max=args.latitude_max,
-            longitude_jitter=args.longitude_jitter,
-            latitude_jitter=args.latitude_jitter,
-        )
+        views = _view_plan(args, rng)
 
         for view_index, view in enumerate(views):
             pinhole = renderer.render(
@@ -162,6 +161,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=DEFAULT_NUM_VIEWS,
         type=int,
         help="Number of pinhole views to render per EP image.",
+    )
+    parser.add_argument(
+        "--view-sampling",
+        choices=VIEW_SAMPLING_METHODS,
+        default=DEFAULT_VIEW_SAMPLING,
+        help=(
+            "Method used to sample longitude/latitude view points. "
+            f"random: {VIEW_SAMPLING_DESCRIPTIONS['random']} "
+            f"uniform_longitude: {VIEW_SAMPLING_DESCRIPTIONS['uniform_longitude']}"
+        ),
     )
     parser.add_argument(
         "--height",
@@ -280,75 +289,32 @@ def _iter_image_paths(directory: Path) -> list[Path]:
 
 
 def _view_plan(
-    num_views: int,
+    args: argparse.Namespace,
     rng: np.random.Generator,
-    longitude_min: float,
-    longitude_max: float,
-    latitude_min: float,
-    latitude_max: float,
-    longitude_jitter: float,
-    latitude_jitter: float,
 ) -> list[dict[str, float]]:
-    views = []
-    for _ in range(num_views):
-        base_longitude = _random_longitude(rng, longitude_min, longitude_max)
-        base_latitude = _random_latitude(rng, latitude_min, latitude_max)
-        longitude = _jitter_value(rng, base_longitude, longitude_jitter)
-        latitude = _jitter_value(rng, base_latitude, latitude_jitter)
-        views.append(_view_record(base_longitude, base_latitude, longitude, latitude))
-    return views
-
-
-def _random_longitude(
-    rng: np.random.Generator,
-    longitude_min: float,
-    longitude_max: float,
-) -> float:
-    if longitude_min == longitude_max:
-        return longitude_min
-    return float(rng.uniform(longitude_min, longitude_max))
-
-
-def _view_record(
-    base_longitude: float,
-    base_latitude: float,
-    longitude: float,
-    latitude: float,
-) -> dict[str, float]:
-    return {
-        "base_longitude": float(base_longitude),
-        "base_latitude": float(base_latitude),
-        "longitude": _wrap_longitude(longitude),
-        "latitude": _clamp(latitude, -pi / 2, pi / 2),
-    }
-
-
-def _random_latitude(
-    rng: np.random.Generator,
-    latitude_min: float,
-    latitude_max: float,
-) -> float:
-    if latitude_min == latitude_max:
-        return latitude_min
-    return float(rng.uniform(latitude_min, latitude_max))
-
-
-def _jitter_value(
-    rng: np.random.Generator,
-    value: float,
-    jitter: float,
-) -> float:
-    if jitter == 0:
-        return value
-    return float(value + rng.uniform(-jitter, jitter))
-
-
-def _wrap_longitude(longitude: float) -> float:
-    return float((longitude + pi) % (2 * pi) - pi)
-
-
-def _clamp(value: float, minimum: float, maximum: float) -> float:
-    return float(min(max(value, minimum), maximum))
+    if args.view_sampling == "random":
+        return random_views(
+            num_views=args.num_views,
+            rng=rng,
+            longitude_min=args.longitude_min,
+            longitude_max=args.longitude_max,
+            latitude_min=args.latitude_min,
+            latitude_max=args.latitude_max,
+            longitude_jitter=args.longitude_jitter,
+            latitude_jitter=args.latitude_jitter,
+        )
+    if args.view_sampling == "uniform_longitude":
+        latitude = (args.latitude_min + args.latitude_max) / 2
+        return uniform_longitude_views(
+            num_views=args.num_views,
+            longitude_min=args.longitude_min,
+            longitude_max=args.longitude_max,
+            latitude=latitude,
+            rng=rng,
+            longitude_jitter=args.longitude_jitter,
+            latitude_jitter=args.latitude_jitter,
+        )
+    raise ValueError(f"Unsupported view sampling method: {args.view_sampling}")
 
 
 def _output_path(

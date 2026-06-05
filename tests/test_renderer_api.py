@@ -12,6 +12,11 @@ from ep_pinhole.tools.render_pinhole_image import (
 )
 from ep_pinhole.tools.random_pinhole_image import main as random_render_image_main
 from ep_pinhole.tools.render_pinhole_directory import main as render_directory_main
+from ep_pinhole.view_sampling import (
+    VIEW_SAMPLING_DESCRIPTIONS,
+    random_views,
+    uniform_longitude_views,
+)
 
 
 def make_equirectangular_image() -> np.ndarray:
@@ -24,6 +29,67 @@ def make_equirectangular_image() -> np.ndarray:
 
 def angular_distance(a: float, b: float) -> float:
     return abs((a - b + pi) % (2 * pi) - pi)
+
+
+def test_random_views_preserves_existing_sampling_shape() -> None:
+    rng = np.random.default_rng(123)
+
+    views = random_views(
+        num_views=2,
+        rng=rng,
+        longitude_min=-0.3,
+        longitude_max=0.3,
+        latitude_min=-0.2,
+        latitude_max=0.2,
+        longitude_jitter=0.05,
+        latitude_jitter=0.03,
+    )
+
+    assert len(views) == 2
+    assert all(-0.3 <= view["base_longitude"] <= 0.3 for view in views)
+    assert all(-0.2 <= view["base_latitude"] <= 0.2 for view in views)
+    assert all(
+        angular_distance(view["longitude"], view["base_longitude"]) <= 0.05
+        for view in views
+    )
+    assert all(
+        abs(view["latitude"] - view["base_latitude"]) <= 0.03
+        for view in views
+    )
+
+
+def test_uniform_longitude_views_evenly_spaces_longitudes() -> None:
+    views = uniform_longitude_views(
+        num_views=4,
+        longitude_min=-pi,
+        longitude_max=pi,
+        latitude=0.25,
+    )
+
+    assert [view["base_longitude"] for view in views] == [
+        -pi,
+        -pi / 2,
+        0.0,
+        pi / 2,
+    ]
+    assert [view["longitude"] for view in views] == [
+        -pi,
+        -pi / 2,
+        0.0,
+        pi / 2,
+    ]
+    assert [view["latitude"] for view in views] == [0.25, 0.25, 0.25, 0.25]
+
+
+def test_uniform_longitude_single_view_uses_midpoint() -> None:
+    views = uniform_longitude_views(
+        num_views=1,
+        longitude_min=-pi,
+        longitude_max=pi,
+        latitude=0.0,
+    )
+
+    assert views[0]["longitude"] == 0.0
 
 
 def test_constructor_accepts_valid_image() -> None:
@@ -258,6 +324,8 @@ def test_render_directory_cli_writes_multiple_outputs_per_image(tmp_path, capsys
         assert np.asarray(Image.open(output_path)).shape == (8, 10, 3)
     metadata_path = output_dir / "metadata.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["view_sampling"] == "random"
+    assert metadata["view_sampling_description"] == VIEW_SAMPLING_DESCRIPTIONS["random"]
     assert metadata["num_views"] == 3
     assert metadata["height"] == 8
     assert metadata["width"] == 10
@@ -404,3 +472,68 @@ def test_render_directory_cli_supports_random_views_and_jitter(tmp_path) -> None
         abs(record["latitude"] - record["base_latitude"]) <= 0.03
         for record in records
     )
+
+
+def test_render_directory_cli_supports_uniform_longitude_views(tmp_path) -> None:
+    input_dir = tmp_path / "eps"
+    output_dir = tmp_path / "pinholes"
+    input_dir.mkdir()
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(input_dir / "front.png")
+
+    exit_code = render_directory_main(
+        [
+            "--input-dir",
+            str(input_dir),
+            "--output-dir",
+            str(output_dir),
+            "--num-views",
+            "4",
+            "--view-sampling",
+            "uniform_longitude",
+            "--height",
+            "8",
+            "--width",
+            "10",
+            "--latitude",
+            "0.25",
+            "--fov-x",
+            str(pi / 2),
+            "--fov-y",
+            str(pi / 3),
+        ]
+    )
+
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    records = metadata["images"]
+
+    assert exit_code == 0
+    assert metadata["view_sampling"] == "uniform_longitude"
+    assert (
+        metadata["view_sampling_description"]
+        == VIEW_SAMPLING_DESCRIPTIONS["uniform_longitude"]
+    )
+    assert [record["base_longitude"] for record in records] == [
+        -pi,
+        -pi / 2,
+        0.0,
+        pi / 2,
+    ]
+    assert [record["longitude"] for record in records] == [
+        -pi,
+        -pi / 2,
+        0.0,
+        pi / 2,
+    ]
+    assert [record["base_latitude"] for record in records] == [
+        0.25,
+        0.25,
+        0.25,
+        0.25,
+    ]
+    assert [record["latitude"] for record in records] == [
+        0.25,
+        0.25,
+        0.25,
+        0.25,
+    ]
