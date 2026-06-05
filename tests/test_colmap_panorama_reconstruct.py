@@ -9,6 +9,8 @@ from colmap.camera import camera_from_fov
 from colmap.panorama_reconstruct import (
     FeaturePipelineOptions,
     PanoramaRenderOptions,
+    VirtualImageOutputOptions,
+    build_rig_remap_maps,
     build_rig_views,
     configure_ssl_cert_file,
     create_feature_extraction_options,
@@ -19,11 +21,14 @@ from colmap.panorama_reconstruct import (
     mask_statistics,
     match_features,
     parse_args,
+    pad_equirectangular_image,
     read_rendered_rig_masks,
+    render_remapped_view,
     render_panorama_rig_images,
     rig_view_masks,
     validate_rig_masks,
 )
+from ep_pinhole import EquirectangularToPinhole
 
 
 def test_configure_ssl_cert_file_uses_explicit_bundle(tmp_path, monkeypatch) -> None:
@@ -161,6 +166,37 @@ def test_sift_feature_options_preserve_rig_matching_constraints() -> None:
     assert matching.skip_image_pairs_in_same_frame is True
 
 
+def test_precomputed_rig_remaps_match_existing_renderer() -> None:
+    height, width = 24, 48
+    image = np.arange(height * width * 3, dtype=np.uint8).reshape(height, width, 3)
+    options = PanoramaRenderOptions(
+        num_yaw_steps=2,
+        pitches=(-pi / 6, pi / 6),
+        width=12,
+        height=10,
+        fov_x=pi / 2,
+        fov_y=pi / 2,
+    )
+    views = build_rig_views(options)
+    maps = build_rig_remap_maps(image.shape[:2], options, views)
+    padded = pad_equirectangular_image(image)
+    existing_renderer = EquirectangularToPinhole(image)
+
+    for view in views:
+        expected = existing_renderer.render(
+            height=options.height,
+            width=options.width,
+            longitude=view.yaw,
+            latitude=view.pitch,
+            fov_x=options.fov_x,
+            fov_y=options.fov_y,
+            interpolation=options.interpolation,
+        )
+        actual = render_remapped_view(padded, maps[view.index])
+
+        np.testing.assert_array_equal(actual, expected)
+
+
 def test_sequential_matching_expands_rig_and_enables_loop_detection(
     tmp_path,
 ) -> None:
@@ -218,6 +254,10 @@ def test_parse_args_accepts_image_limit(tmp_path) -> None:
     assert args.loop_detection is True
     assert args.feature_extractor == "sift"
     assert args.feature_matcher == "sift-bruteforce"
+    assert args.virtual_image_format == "png"
+    assert args.png_compression == 1
+    assert args.jpeg_quality == 95
+    assert args.image_save_workers == 12
 
 
 def test_render_panorama_rig_images_respects_image_limit(tmp_path, monkeypatch) -> None:
@@ -276,3 +316,44 @@ def test_render_panorama_rig_images_respects_image_limit(tmp_path, monkeypatch) 
         "unit": "view",
         "updates": 1,
     }
+
+
+def test_render_panorama_rig_images_supports_jpeg_output(tmp_path) -> None:
+    input_dir = tmp_path / "panos"
+    image_dir = tmp_path / "images"
+    mask_dir = tmp_path / "masks"
+    input_dir.mkdir()
+    image = np.zeros((16, 32, 3), dtype=np.uint8)
+    Image.fromarray(image).save(input_dir / "pano.png")
+    render_options = PanoramaRenderOptions(
+        num_yaw_steps=1,
+        pitches=(0.0,),
+        width=8,
+        height=8,
+        fov_x=pi / 2,
+        fov_y=pi / 2,
+    )
+    output_options = VirtualImageOutputOptions(
+        image_format="jpeg",
+        jpeg_quality=95,
+        save_workers=1,
+    )
+
+    panorama_paths, _camera, views = render_panorama_rig_images(
+        input_image_path=input_dir,
+        output_image_dir=image_dir,
+        mask_dir=mask_dir,
+        options=render_options,
+        output_options=output_options,
+    )
+
+    assert (image_dir / "pano_camera00" / "pano.jpg").exists()
+    assert (mask_dir / "pano_camera00" / "pano.jpg.png").exists()
+    masks = read_rendered_rig_masks(
+        mask_dir,
+        input_dir,
+        panorama_paths[0],
+        views,
+        output_options,
+    )
+    assert masks[0].shape == (8, 8)

@@ -19,6 +19,7 @@ test = [
     "pytest",
 ]
 colmap = [
+    "opencv-python-headless",
     "pycolmap",
 ]
 visualize = [

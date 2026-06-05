@@ -181,6 +181,24 @@ known relative rotations. Feature-ownership masks prevent duplicate features
 in overlapping crops. SIFT matching uses rig verification, expands sequential
 pairs across complete panorama frames, and enables loop detection.
 
+Virtual-image rendering precomputes the twelve spherical remapping grids once,
+reuses them for every panorama, remaps complete RGB images with OpenCV, and
+encodes images concurrently. The default output is lossless PNG with fast
+compression:
+
+```bash
+--virtual-image-format png \
+--png-compression 1 \
+--image-save-workers 12
+```
+
+For substantially faster and smaller, but lossy, virtual images:
+
+```bash
+--virtual-image-format jpeg \
+--jpeg-quality 95
+```
+
 Start with a small smoke reconstruction before a full run:
 
 ```bash

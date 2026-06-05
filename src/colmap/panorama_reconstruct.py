@@ -8,20 +8,22 @@ import os
 import shutil
 import sqlite3
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from math import cos, pi, radians, sin, tan
 from pathlib import Path
 from typing import Any, Sequence
 
+import cv2
 import numpy as np
 from PIL import Image
+from py360convert.utils import uv2coor, xyz2uv, xyzpers
 from tqdm import tqdm
 
 from colmap.camera import ColmapCamera, camera_from_fov
 from colmap.input_inspection import IMAGE_EXTENSIONS
 from colmap.pipeline import write_best_model
 from colmap.reporting import read_database_stats, reconstruction_stats
-from ep_pinhole import EquirectangularToPinhole
 
 try:  # Keep argument parsing and tests usable before pycolmap is installed.
     import pycolmap
@@ -62,6 +64,14 @@ class FeaturePipelineOptions:
     matcher: str = "sift-bruteforce"
     max_num_features: int = 8192
     guided_matching: bool = False
+
+
+@dataclass(frozen=True)
+class VirtualImageOutputOptions:
+    image_format: str = "png"
+    png_compression: int = 1
+    jpeg_quality: int = 95
+    save_workers: int = 12
 
 
 def default_render_options(render_type: str) -> PanoramaRenderOptions:
@@ -180,8 +190,10 @@ def render_panorama_rig_images(
     mask_dir: Path,
     options: PanoramaRenderOptions,
     *,
+    output_options: VirtualImageOutputOptions = VirtualImageOutputOptions(),
     image_limit: int | None = None,
 ) -> tuple[list[Path], ColmapCamera, list[PanoramaRigView]]:
+    validate_virtual_image_output_options(output_options)
     panorama_paths = panorama_image_paths(input_image_path)
     if image_limit is not None:
         panorama_paths = panorama_paths[:image_limit]
@@ -193,34 +205,161 @@ def render_panorama_rig_images(
     masks = rig_view_masks(camera, views)
     validate_rig_masks(camera, views, masks)
 
-    with tqdm(
-        total=len(panorama_paths) * len(views),
-        desc="Rendering virtual pinhole views",
-        unit="view",
-    ) as progress:
-        for panorama_path in panorama_paths:
-            renderer = EquirectangularToPinhole.from_file(panorama_path)
-            relative_name = panorama_path.relative_to(input_image_path).as_posix()
-            for view in views:
-                image = renderer.render(
-                    height=options.height,
-                    width=options.width,
-                    longitude=view.yaw,
-                    latitude=view.pitch,
-                    fov_x=options.fov_x,
-                    fov_y=options.fov_y,
-                    interpolation=options.interpolation,
+    first_panorama = read_panorama_image(panorama_paths[0])
+    source_shape = first_panorama.shape[:2]
+    remap_maps = build_rig_remap_maps(source_shape, options, views)
+    total_views = len(panorama_paths) * len(views)
+
+    with (
+        ThreadPoolExecutor(max_workers=output_options.save_workers) as save_pool,
+        tqdm(
+            total=total_views,
+            desc="Rendering virtual pinhole views",
+            unit="view",
+        ) as progress,
+    ):
+        for panorama_index, panorama_path in enumerate(panorama_paths):
+            panorama = (
+                first_panorama
+                if panorama_index == 0
+                else read_panorama_image(panorama_path)
+            )
+            if panorama.shape[:2] != source_shape:
+                raise ValueError(
+                    f"Panorama {panorama_path} has size {panorama.shape[1]}x"
+                    f"{panorama.shape[0]}; expected {source_shape[1]}x{source_shape[0]}"
                 )
+            padded_panorama = pad_equirectangular_image(panorama)
+            relative_name = virtual_image_relative_name(
+                panorama_path.relative_to(input_image_path),
+                output_options.image_format,
+            )
+            futures = []
+            for view in views:
+                image = render_remapped_view(padded_panorama, remap_maps[view.index])
                 output_path = output_image_dir / view.image_prefix / relative_name
                 output_path.parent.mkdir(parents=True, exist_ok=True)
-                Image.fromarray(image).save(output_path)
 
                 mask_path = mask_dir / f"{view.image_prefix}{relative_name}.png"
                 mask_path.parent.mkdir(parents=True, exist_ok=True)
-                Image.fromarray(masks[view.index]).save(mask_path)
+                futures.append(
+                    save_pool.submit(
+                        save_virtual_view,
+                        image,
+                        output_path,
+                        masks[view.index],
+                        mask_path,
+                        output_options,
+                    )
+                )
+
+            for future in as_completed(futures):
+                future.result()
                 progress.update()
 
     return panorama_paths, camera, views
+
+
+def validate_virtual_image_output_options(options: VirtualImageOutputOptions) -> None:
+    if options.image_format not in {"png", "jpeg"}:
+        raise ValueError("image_format must be 'png' or 'jpeg'")
+    if not 0 <= options.png_compression <= 9:
+        raise ValueError("png_compression must be between 0 and 9")
+    if not 1 <= options.jpeg_quality <= 100:
+        raise ValueError("jpeg_quality must be between 1 and 100")
+    if options.save_workers <= 0:
+        raise ValueError("save_workers must be positive")
+
+
+def read_panorama_image(path: Path) -> np.ndarray:
+    with Image.open(path) as image:
+        return np.asarray(image).copy()
+
+
+def build_rig_remap_maps(
+    source_shape: tuple[int, int],
+    options: PanoramaRenderOptions,
+    views: Sequence[PanoramaRigView],
+) -> dict[int, tuple[np.ndarray, np.ndarray | None, int]]:
+    source_height, source_width = source_shape
+    interpolation = cv2_interpolation(options.interpolation)
+    nearest = interpolation == cv2.INTER_NEAREST
+    maps = {}
+    for view in views:
+        xyz = xyzpers(
+            options.fov_x,
+            options.fov_y,
+            -view.yaw,
+            view.pitch,
+            (options.height, options.width),
+            0.0,
+        )
+        u, v = xyz2uv(xyz)
+        x, y = uv2coor(u, v, source_height, source_width)
+        map1, map2 = cv2.convertMaps(
+            x + 1,
+            y + 1,
+            cv2.CV_16SC2,
+            nninterpolation=nearest,
+        )
+        maps[view.index] = (map1, map2, interpolation)
+    return maps
+
+
+def cv2_interpolation(interpolation: str) -> int:
+    if interpolation in {"linear", "bilinear"}:
+        return cv2.INTER_LINEAR
+    if interpolation == "nearest":
+        return cv2.INTER_NEAREST
+    raise ValueError("interpolation must be 'linear', 'bilinear', or 'nearest'")
+
+
+def pad_equirectangular_image(image: np.ndarray) -> np.ndarray:
+    # Match py360convert's seam and pole padding for pixel-identical remapping.
+    padding = ((1, 1), (1, 1)) + ((0, 0),) * (image.ndim - 2)
+    padded = np.pad(image, padding, mode="empty")
+    width = image.shape[1]
+    padded[0, 1:-1] = np.roll(image[0], width // 2, axis=0)
+    padded[-1, 1:-1] = np.roll(image[-1], width // 2, axis=0)
+    padded[:, 0] = padded[:, -2]
+    padded[:, -1] = padded[:, 1]
+    return padded
+
+
+def render_remapped_view(
+    padded_panorama: np.ndarray,
+    remap: tuple[np.ndarray, np.ndarray | None, int],
+) -> np.ndarray:
+    map1, map2, interpolation = remap
+    return cv2.remap(padded_panorama, map1, map2, interpolation=interpolation)
+
+
+def virtual_image_relative_name(relative_path: Path, image_format: str) -> Path:
+    suffix = ".png" if image_format == "png" else ".jpg"
+    return relative_path.with_suffix(suffix)
+
+
+def save_virtual_view(
+    image: np.ndarray,
+    output_path: Path,
+    mask: np.ndarray,
+    mask_path: Path,
+    options: VirtualImageOutputOptions,
+) -> None:
+    if options.image_format == "png":
+        Image.fromarray(image).save(
+            output_path,
+            format="PNG",
+            compress_level=options.png_compression,
+        )
+    else:
+        Image.fromarray(image).save(
+            output_path,
+            format="JPEG",
+            quality=options.jpeg_quality,
+            subsampling=0,
+        )
+    Image.fromarray(mask).save(mask_path, format="PNG", compress_level=1)
 
 
 def read_rendered_rig_masks(
@@ -228,8 +367,12 @@ def read_rendered_rig_masks(
     input_image_path: Path,
     panorama_path: Path,
     views: Sequence[PanoramaRigView],
+    output_options: VirtualImageOutputOptions = VirtualImageOutputOptions(),
 ) -> dict[int, np.ndarray]:
-    relative_name = panorama_path.relative_to(input_image_path).as_posix()
+    relative_name = virtual_image_relative_name(
+        panorama_path.relative_to(input_image_path),
+        output_options.image_format,
+    ).as_posix()
     masks: dict[int, np.ndarray] = {}
     for view in views:
         path = mask_dir / f"{view.image_prefix}{relative_name}.png"
@@ -442,6 +585,7 @@ def run_panorama_reconstruction(
     vocab_tree_path: Path | None = None,
     ssl_cert_file: Path | None = None,
     feature_options: FeaturePipelineOptions = FeaturePipelineOptions(),
+    output_options: VirtualImageOutputOptions = VirtualImageOutputOptions(),
     image_limit: int | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
@@ -463,6 +607,7 @@ def run_panorama_reconstruction(
         output_image_dir=paths["image_dir"],
         mask_dir=paths["mask_dir"],
         options=render_options,
+        output_options=output_options,
         image_limit=image_limit,
     )
     masks = read_rendered_rig_masks(
@@ -470,6 +615,7 @@ def run_panorama_reconstruction(
         input_image_path,
         panorama_paths[0],
         views,
+        output_options,
     )
     validate_rig_masks(camera, views, masks)
     masks_report = mask_statistics(masks)
@@ -480,6 +626,7 @@ def run_panorama_reconstruction(
         camera,
         views,
         masks_report,
+        output_options,
         image_limit=image_limit,
     )
 
@@ -546,6 +693,7 @@ def run_panorama_reconstruction(
         vocab_tree_path=vocab_tree_path,
         ssl_cert_file=ssl_cert_file,
         feature_options=feature_options,
+        output_options=output_options,
         masks_report=masks_report,
         feature_report=feature_report,
         feature_health=feature_health,
@@ -579,6 +727,7 @@ def write_rig_metadata(
     camera: ColmapCamera,
     views: Sequence[PanoramaRigView],
     masks_report: dict[str, dict[str, float | int]],
+    output_options: VirtualImageOutputOptions,
     *,
     image_limit: int | None,
 ) -> None:
@@ -593,6 +742,11 @@ def write_rig_metadata(
             "fov_x": options.fov_x,
             "fov_y": options.fov_y,
             "interpolation": options.interpolation,
+            "virtual_image_format": output_options.image_format,
+            "png_compression": output_options.png_compression,
+            "jpeg_quality": output_options.jpeg_quality,
+            "image_save_workers": output_options.save_workers,
+            "render_backend": "precomputed_opencv_remap",
         },
         "camera": camera.report(),
         "masks": masks_report,
@@ -624,6 +778,7 @@ def build_panorama_report(
     vocab_tree_path: Path | None,
     ssl_cert_file: Path | None,
     feature_options: FeaturePipelineOptions,
+    output_options: VirtualImageOutputOptions,
     masks_report: dict[str, dict[str, float | int]],
     feature_report: dict[str, dict[str, float | int]],
     feature_health: dict[str, Any],
@@ -670,6 +825,11 @@ def build_panorama_report(
             "feature_matcher": feature_options.matcher,
             "max_num_features": feature_options.max_num_features,
             "guided_matching": feature_options.guided_matching,
+            "virtual_image_format": output_options.image_format,
+            "png_compression": output_options.png_compression,
+            "jpeg_quality": output_options.jpeg_quality,
+            "image_save_workers": output_options.save_workers,
+            "render_backend": "precomputed_opencv_remap",
             "image_limit": image_limit,
             "use_gpu": False,
             "camera_mode": "PER_FOLDER",
@@ -875,6 +1035,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Enable guided feature matching after geometric verification.",
     )
     parser.add_argument(
+        "--virtual-image-format",
+        choices=("png", "jpeg"),
+        default="png",
+        help="Format for generated virtual pinhole images.",
+    )
+    parser.add_argument(
+        "--png-compression",
+        type=int,
+        default=1,
+        help="PNG compression level from 0 to 9 (default: 1).",
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=95,
+        help="JPEG quality from 1 to 100 (default: 95).",
+    )
+    parser.add_argument(
+        "--image-save-workers",
+        type=int,
+        default=12,
+        help="Concurrent workers used to encode virtual images (default: 12).",
+    )
+    parser.add_argument(
         "--image-limit",
         type=int,
         default=None,
@@ -902,6 +1086,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--image-limit must be positive")
     if args.max_num_features <= 0:
         parser.error("--max-num-features must be positive")
+    if not 0 <= args.png_compression <= 9:
+        parser.error("--png-compression must be between 0 and 9")
+    if not 1 <= args.jpeg_quality <= 100:
+        parser.error("--jpeg-quality must be between 1 and 100")
+    if args.image_save_workers <= 0:
+        parser.error("--image-save-workers must be positive")
     if args.vocab_tree_path is not None and not args.vocab_tree_path.is_file():
         parser.error(f"--vocab-tree-path does not exist: {args.vocab_tree_path}")
     if args.ssl_cert_file is not None and not args.ssl_cert_file.is_file():
@@ -940,6 +1130,12 @@ def main(argv: list[str] | None = None) -> int:
             matcher=args.feature_matcher,
             max_num_features=args.max_num_features,
             guided_matching=args.guided_matching,
+        ),
+        output_options=VirtualImageOutputOptions(
+            image_format=args.virtual_image_format,
+            png_compression=args.png_compression,
+            jpeg_quality=args.jpeg_quality,
+            save_workers=args.image_save_workers,
         ),
         image_limit=args.image_limit,
         overwrite=args.overwrite,
