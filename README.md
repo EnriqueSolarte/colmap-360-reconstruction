@@ -3,13 +3,16 @@
 Render perspective pinhole images from equirectangular panoramas and run a raw
 COLMAP sparse reconstruction on the generated pinholes.
 
-The current workflow is:
+The primary 360-image workflow is:
 
-1. Render one or more pinhole views from each equirectangular image.
-2. Record render metadata and fixed virtual-camera intrinsics.
-3. Inspect the pinhole dataset before reconstruction.
-4. Run COLMAP with fixed `PINHOLE` intrinsics.
-5. Summarize or visualize the raw sparse model.
+1. Render twelve fixed virtual pinhole views from each equirectangular image.
+2. Assign every panorama direction to one virtual camera with feature masks.
+3. Force the virtual cameras into a known, shared-center COLMAP rig.
+4. Match panorama frames with rig verification and loop detection.
+5. Reconstruct, summarize, or visualize the raw sparse model.
+
+The generic `colmap-reconstruct` workflow remains available for ordinary
+perspective-image folders and experiments with independently rendered views.
 
 The COLMAP output is monocular and unscaled. Do not treat it as metric geometry
 until it has been aligned with an external scale source.
@@ -158,6 +161,47 @@ image = renderer.render(
 ```
 
 `image` is a NumPy array.
+
+## Reconstruct Directly From 360 Panoramas
+
+Use the maintained panorama-rig pipeline for equirectangular 360 images:
+
+```bash
+colmap-panorama-reconstruct \
+  --input-image-path /path/to/panoramas \
+  --workspace /workspace/data/colmap-panorama-rig \
+  --matcher sequential \
+  --overlap 15 \
+  --overwrite
+```
+
+The default overlapping layout follows COLMAP's panorama example: twelve
+fixed `PINHOLE` cameras cover the sphere, share a camera center, and retain
+known relative rotations. Feature-ownership masks prevent duplicate features
+in overlapping crops. SIFT matching uses rig verification, expands sequential
+pairs across complete panorama frames, and enables loop detection.
+
+Start with a small smoke reconstruction before a full run:
+
+```bash
+colmap-panorama-reconstruct \
+  --input-image-path /path/to/panoramas \
+  --workspace /workspace/data/colmap-panorama-smoke \
+  --image-limit 12 \
+  --no-loop-detection \
+  --overwrite
+```
+
+Loop detection may download COLMAP's default vocabulary tree. To avoid that
+download and make runs reproducible, pass a local tree with
+`--vocab-tree-path /path/to/vocab_tree.bin`. The command automatically points
+COLMAP/libcurl at `/etc/ssl/certs/ca-certificates.crt` when available; override
+it with `--ssl-cert-file` when needed.
+
+The workspace includes `panorama_rig_config.json` and
+`panorama_rig_report.json`. The report records per-camera mask coverage,
+feature health, matching settings, registered panorama frames, and sparse
+model statistics.
 
 ## Inspect Pinhole Inputs For COLMAP
 

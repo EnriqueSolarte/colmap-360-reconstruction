@@ -1,3 +1,4 @@
+import os
 from math import pi
 
 import numpy as np
@@ -6,14 +7,33 @@ from PIL import Image
 
 from colmap.camera import camera_from_fov
 from colmap.panorama_reconstruct import (
+    FeaturePipelineOptions,
     PanoramaRenderOptions,
     build_rig_views,
+    configure_ssl_cert_file,
+    create_feature_extraction_options,
+    create_feature_matching_options,
     create_rig_config,
     default_render_options,
+    feature_health_summary,
+    mask_statistics,
+    match_features,
     parse_args,
+    read_rendered_rig_masks,
     render_panorama_rig_images,
     rig_view_masks,
+    validate_rig_masks,
 )
+
+
+def test_configure_ssl_cert_file_uses_explicit_bundle(tmp_path, monkeypatch) -> None:
+    cert_file = tmp_path / "ca-certificates.crt"
+    cert_file.write_text("test certificate bundle", encoding="utf-8")
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+
+    configure_ssl_cert_file(cert_file)
+
+    assert os.environ["SSL_CERT_FILE"] == str(cert_file)
 
 
 def test_overlapping_preset_builds_fixed_virtual_camera_rig() -> None:
@@ -51,6 +71,63 @@ def test_rig_view_masks_are_binary_and_match_camera_shape() -> None:
         assert set(np.unique(mask)).issubset({0, 255})
 
 
+def test_overlapping_rig_masks_assign_every_virtual_camera() -> None:
+    options = default_render_options("overlapping")
+    views = build_rig_views(options)
+    camera = camera_from_fov(
+        width=64,
+        height=64,
+        fov_x=options.fov_x,
+        fov_y=options.fov_y,
+    )
+
+    masks = rig_view_masks(camera, views)
+    validate_rig_masks(camera, views, masks)
+
+    assert len(masks) == 12
+    for mask in masks.values():
+        assert np.count_nonzero(mask) > 0
+        assert mask[camera.height // 2, camera.width // 2] == 255
+
+
+def test_validate_rig_masks_rejects_empty_virtual_camera() -> None:
+    options = default_render_options("non-overlapping")
+    views = build_rig_views(options)
+    camera = camera_from_fov(width=32, height=24, fov_x=pi / 2, fov_y=pi / 2)
+    masks = rig_view_masks(camera, views)
+    masks[2] = np.zeros_like(masks[2])
+
+    with pytest.raises(ValueError, match="Mask 2 is empty"):
+        validate_rig_masks(camera, views, masks)
+
+
+def test_mask_statistics_reports_active_fraction() -> None:
+    masks = {
+        0: np.asarray([[0, 255], [0, 255]], dtype=np.uint8),
+        1: np.full((2, 2), 255, dtype=np.uint8),
+    }
+
+    stats = mask_statistics(masks)
+
+    assert stats["0"] == {"active_pixels": 2, "active_fraction": 0.5}
+    assert stats["1"] == {"active_pixels": 4, "active_fraction": 1.0}
+
+
+def test_feature_health_summary_identifies_zero_feature_camera() -> None:
+    views = build_rig_views(default_render_options("non-overlapping"))
+    report = {
+        view.image_prefix.rstrip("/"): {"total_features": 10}
+        for view in views
+    }
+    report["pano_camera02"]["total_features"] = 0
+
+    health = feature_health_summary(views, report)
+
+    assert health["virtual_camera_count"] == 4
+    assert health["virtual_cameras_with_features"] == 3
+    assert health["zero_feature_virtual_cameras"] == ["pano_camera02"]
+
+
 def test_create_rig_config_uses_pinhole_cameras() -> None:
     pycolmap = pytest.importorskip("pycolmap")
     options = default_render_options("non-overlapping")
@@ -66,13 +143,100 @@ def test_create_rig_config_uses_pinhole_cameras() -> None:
     assert rig_config.cameras[1].cam_from_rig is not None
 
 
+def test_sift_feature_options_preserve_rig_matching_constraints() -> None:
+    pycolmap = pytest.importorskip("pycolmap")
+    options = FeaturePipelineOptions(
+        max_num_features=4096,
+        guided_matching=True,
+    )
+
+    extraction = create_feature_extraction_options(pycolmap, options)
+    matching = create_feature_matching_options(pycolmap, options)
+
+    assert extraction.type == pycolmap.FeatureExtractorType.SIFT
+    assert extraction.sift.max_num_features == 4096
+    assert matching.type == pycolmap.FeatureMatcherType.SIFT_BRUTEFORCE
+    assert matching.guided_matching is True
+    assert matching.rig_verification is True
+    assert matching.skip_image_pairs_in_same_frame is True
+
+
+def test_sequential_matching_expands_rig_and_enables_loop_detection(
+    tmp_path,
+) -> None:
+    class SequentialPairingOptions:
+        def __init__(self):
+            self.overlap = 0
+            self.expand_rig_images = False
+            self.loop_detection = False
+            self.vocab_tree_path = None
+
+    class FakePycolmap:
+        class Device:
+            cpu = "cpu"
+
+        calls = []
+
+        @classmethod
+        def match_sequential(
+            cls,
+            database_path,
+            *,
+            matching_options,
+            pairing_options,
+            device,
+        ):
+            cls.calls.append((database_path, matching_options, pairing_options, device))
+
+    FakePycolmap.SequentialPairingOptions = SequentialPairingOptions
+    vocab_tree = tmp_path / "tree.bin"
+    vocab_tree.write_bytes(b"tree")
+    matching_options = object()
+
+    match_features(
+        FakePycolmap,
+        tmp_path / "database.db",
+        matcher="sequential",
+        matching_options=matching_options,
+        overlap=25,
+        loop_detection=True,
+        vocab_tree_path=vocab_tree,
+    )
+
+    _database, _matching, pairing, device = FakePycolmap.calls[0]
+    assert pairing.overlap == 25
+    assert pairing.expand_rig_images is True
+    assert pairing.loop_detection is True
+    assert pairing.vocab_tree_path == vocab_tree
+    assert device == "cpu"
+
+
 def test_parse_args_accepts_image_limit(tmp_path) -> None:
     args = parse_args(["--input-image-path", str(tmp_path), "--image-limit", "3"])
 
     assert args.image_limit == 3
+    assert args.loop_detection is True
+    assert args.feature_extractor == "sift"
+    assert args.feature_matcher == "sift-bruteforce"
 
 
-def test_render_panorama_rig_images_respects_image_limit(tmp_path) -> None:
+def test_render_panorama_rig_images_respects_image_limit(tmp_path, monkeypatch) -> None:
+    progress_state = {}
+
+    class RecordingProgress:
+        def __init__(self, *, total, desc, unit):
+            progress_state.update(total=total, desc=desc, unit=unit, updates=0)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def update(self):
+            progress_state["updates"] += 1
+
+    monkeypatch.setattr("colmap.panorama_reconstruct.tqdm", RecordingProgress)
     input_dir = tmp_path / "panos"
     image_dir = tmp_path / "images"
     mask_dir = tmp_path / "masks"
@@ -102,3 +266,13 @@ def test_render_panorama_rig_images_respects_image_limit(tmp_path) -> None:
     assert (image_dir / "pano_camera00" / "a.png").exists()
     assert not (image_dir / "pano_camera00" / "b.png").exists()
     assert (mask_dir / "pano_camera00" / "a.png.png").exists()
+
+    masks = read_rendered_rig_masks(mask_dir, input_dir, panorama_paths[0], views)
+    assert set(masks) == {0}
+    assert masks[0].shape == (8, 8)
+    assert progress_state == {
+        "total": 1,
+        "desc": "Rendering virtual pinhole views",
+        "unit": "view",
+        "updates": 1,
+    }

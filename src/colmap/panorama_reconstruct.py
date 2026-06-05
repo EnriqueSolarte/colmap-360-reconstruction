@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import sqlite3
 import sys
 from dataclasses import dataclass
 from math import cos, pi, radians, sin, tan
@@ -13,6 +15,7 @@ from typing import Any, Sequence
 
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 from colmap.camera import ColmapCamera, camera_from_fov
 from colmap.input_inspection import IMAGE_EXTENSIONS
@@ -53,6 +56,14 @@ class PanoramaRenderOptions:
     interpolation: str = "bilinear"
 
 
+@dataclass(frozen=True)
+class FeaturePipelineOptions:
+    extractor: str = "sift"
+    matcher: str = "sift-bruteforce"
+    max_num_features: int = 8192
+    guided_matching: bool = False
+
+
 def default_render_options(render_type: str) -> PanoramaRenderOptions:
     if render_type == "overlapping":
         return PanoramaRenderOptions(
@@ -82,6 +93,28 @@ def require_pycolmap():
             "`colmap` extra or add `pycolmap` to the environment."
         )
     return pycolmap
+
+
+def configure_ssl_cert_file(ssl_cert_file: Path | None = None) -> None:
+    """Configure the CA bundle used by COLMAP/libcurl for optional downloads.
+
+    Prefer an explicit bundle, preserve an existing environment configuration,
+    and otherwise use the common system bundle when available. This lets
+    vocabulary-tree downloads verify TLS certificates without overriding a
+    caller's custom trust store.
+    """
+    if ssl_cert_file is not None:
+        if not ssl_cert_file.is_file():
+            raise FileNotFoundError(f"SSL certificate bundle not found: {ssl_cert_file}")
+        os.environ["SSL_CERT_FILE"] = str(ssl_cert_file)
+        return
+
+    if os.environ.get("SSL_CERT_FILE"):
+        return
+
+    default_cert_file = Path("/etc/ssl/certs/ca-certificates.crt")
+    if default_cert_file.is_file():
+        os.environ["SSL_CERT_FILE"] = str(default_cert_file)
 
 
 def panorama_image_paths(input_image_path: Path) -> list[Path]:
@@ -158,29 +191,51 @@ def render_panorama_rig_images(
     views = build_rig_views(options)
     camera = camera_from_fov(options.width, options.height, options.fov_x, options.fov_y)
     masks = rig_view_masks(camera, views)
+    validate_rig_masks(camera, views, masks)
 
-    for panorama_path in panorama_paths:
-        renderer = EquirectangularToPinhole.from_file(panorama_path)
-        relative_name = panorama_path.relative_to(input_image_path).as_posix()
-        for view in views:
-            image = renderer.render(
-                height=options.height,
-                width=options.width,
-                longitude=view.yaw,
-                latitude=view.pitch,
-                fov_x=options.fov_x,
-                fov_y=options.fov_y,
-                interpolation=options.interpolation,
-            )
-            output_path = output_image_dir / view.image_prefix / relative_name
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            Image.fromarray(image).save(output_path)
+    with tqdm(
+        total=len(panorama_paths) * len(views),
+        desc="Rendering virtual pinhole views",
+        unit="view",
+    ) as progress:
+        for panorama_path in panorama_paths:
+            renderer = EquirectangularToPinhole.from_file(panorama_path)
+            relative_name = panorama_path.relative_to(input_image_path).as_posix()
+            for view in views:
+                image = renderer.render(
+                    height=options.height,
+                    width=options.width,
+                    longitude=view.yaw,
+                    latitude=view.pitch,
+                    fov_x=options.fov_x,
+                    fov_y=options.fov_y,
+                    interpolation=options.interpolation,
+                )
+                output_path = output_image_dir / view.image_prefix / relative_name
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                Image.fromarray(image).save(output_path)
 
-            mask_path = mask_dir / f"{view.image_prefix}{relative_name}.png"
-            mask_path.parent.mkdir(parents=True, exist_ok=True)
-            Image.fromarray(masks[view.index]).save(mask_path)
+                mask_path = mask_dir / f"{view.image_prefix}{relative_name}.png"
+                mask_path.parent.mkdir(parents=True, exist_ok=True)
+                Image.fromarray(masks[view.index]).save(mask_path)
+                progress.update()
 
     return panorama_paths, camera, views
+
+
+def read_rendered_rig_masks(
+    mask_dir: Path,
+    input_image_path: Path,
+    panorama_path: Path,
+    views: Sequence[PanoramaRigView],
+) -> dict[int, np.ndarray]:
+    relative_name = panorama_path.relative_to(input_image_path).as_posix()
+    masks: dict[int, np.ndarray] = {}
+    for view in views:
+        path = mask_dir / f"{view.image_prefix}{relative_name}.png"
+        with Image.open(path) as mask:
+            masks[view.index] = np.asarray(mask).copy()
+    return masks
 
 
 def rig_view_masks(
@@ -188,8 +243,9 @@ def rig_view_masks(
     views: Sequence[PanoramaRigView],
 ) -> dict[int, np.ndarray]:
     rays = virtual_camera_rays(camera)
+    forward = np.asarray([0.0, 0.0, 1.0])
     centers = np.vstack(
-        [view.cam_from_pano_rotation @ np.asarray([0.0, 0.0, 1.0]) for view in views]
+        [view.cam_from_pano_rotation.T @ forward for view in views]
     )
     masks: dict[int, np.ndarray] = {}
     for view in views:
@@ -202,6 +258,47 @@ def rig_view_masks(
             * 255
         )
     return masks
+
+
+def validate_rig_masks(
+    camera: ColmapCamera,
+    views: Sequence[PanoramaRigView],
+    masks: dict[int, np.ndarray],
+) -> None:
+    expected_indices = {view.index for view in views}
+    if set(masks) != expected_indices:
+        raise ValueError(
+            f"Rig mask indices {sorted(masks)} do not match views "
+            f"{sorted(expected_indices)}"
+        )
+
+    principal_x = min(max(int(camera.params[2]), 0), camera.width - 1)
+    principal_y = min(max(int(camera.params[3]), 0), camera.height - 1)
+    for view in views:
+        mask = masks[view.index]
+        if mask.shape != (camera.height, camera.width):
+            raise ValueError(
+                f"Mask {view.index} has shape {mask.shape}; expected "
+                f"{(camera.height, camera.width)}"
+            )
+        if mask.dtype != np.uint8 or not set(np.unique(mask)).issubset({0, 255}):
+            raise ValueError(f"Mask {view.index} must be binary uint8")
+        if not np.any(mask):
+            raise ValueError(f"Mask {view.index} is empty")
+        if mask[principal_y, principal_x] == 0:
+            raise ValueError(
+                f"Mask {view.index} excludes its virtual camera principal ray"
+            )
+
+
+def mask_statistics(masks: dict[int, np.ndarray]) -> dict[str, dict[str, float | int]]:
+    return {
+        str(index): {
+            "active_pixels": int(np.count_nonzero(mask)),
+            "active_fraction": float(np.count_nonzero(mask) / mask.size),
+        }
+        for index, mask in sorted(masks.items())
+    }
 
 
 def virtual_camera_rays(camera: ColmapCamera) -> np.ndarray:
@@ -257,6 +354,83 @@ def create_rig_config(
     return pycolmap_module.RigConfig(cameras=rig_cameras)
 
 
+def create_feature_extraction_options(
+    pycolmap_module: Any,
+    options: FeaturePipelineOptions,
+) -> Any:
+    if options.extractor != "sift":
+        raise ValueError(f"Unsupported feature extractor: {options.extractor}")
+    extraction_options = pycolmap_module.FeatureExtractionOptions()
+    extraction_options.type = pycolmap_module.FeatureExtractorType.SIFT
+    extraction_options.use_gpu = False
+    extraction_options.sift.max_num_features = options.max_num_features
+    return extraction_options
+
+
+def create_feature_matching_options(
+    pycolmap_module: Any,
+    options: FeaturePipelineOptions,
+) -> Any:
+    if options.matcher != "sift-bruteforce":
+        raise ValueError(f"Unsupported feature matcher: {options.matcher}")
+    matching_options = pycolmap_module.FeatureMatchingOptions()
+    matching_options.type = pycolmap_module.FeatureMatcherType.SIFT_BRUTEFORCE
+    matching_options.use_gpu = False
+    matching_options.guided_matching = options.guided_matching
+    matching_options.rig_verification = True
+    matching_options.skip_image_pairs_in_same_frame = True
+    return matching_options
+
+
+def validate_vocab_tree_path(vocab_tree_path: Path | None) -> None:
+    if vocab_tree_path is not None and not vocab_tree_path.is_file():
+        raise FileNotFoundError(f"Vocabulary tree not found: {vocab_tree_path}")
+
+
+def match_features(
+    pycolmap_module: Any,
+    database_path: Path,
+    *,
+    matcher: str,
+    matching_options: Any,
+    overlap: int,
+    loop_detection: bool,
+    vocab_tree_path: Path | None,
+) -> None:
+    validate_vocab_tree_path(vocab_tree_path)
+    if matcher == "sequential":
+        pairing_options = pycolmap_module.SequentialPairingOptions()
+        pairing_options.overlap = overlap
+        pairing_options.expand_rig_images = True
+        pairing_options.loop_detection = loop_detection
+        if vocab_tree_path is not None:
+            pairing_options.vocab_tree_path = vocab_tree_path
+        pycolmap_module.match_sequential(
+            database_path,
+            matching_options=matching_options,
+            pairing_options=pairing_options,
+            device=pycolmap_module.Device.cpu,
+        )
+    elif matcher == "exhaustive":
+        pycolmap_module.match_exhaustive(
+            database_path,
+            matching_options=matching_options,
+            device=pycolmap_module.Device.cpu,
+        )
+    elif matcher == "vocabtree":
+        pairing_options = pycolmap_module.VocabTreePairingOptions()
+        if vocab_tree_path is not None:
+            pairing_options.vocab_tree_path = vocab_tree_path
+        pycolmap_module.match_vocabtree(
+            database_path,
+            matching_options=matching_options,
+            pairing_options=pairing_options,
+            device=pycolmap_module.Device.cpu,
+        )
+    else:
+        raise ValueError("matcher must be 'sequential', 'exhaustive', or 'vocabtree'")
+
+
 def run_panorama_reconstruction(
     input_image_path: Path,
     workspace: Path,
@@ -264,10 +438,16 @@ def run_panorama_reconstruction(
     render_options: PanoramaRenderOptions,
     matcher: str = "sequential",
     overlap: int = 15,
+    loop_detection: bool = True,
+    vocab_tree_path: Path | None = None,
+    ssl_cert_file: Path | None = None,
+    feature_options: FeaturePipelineOptions = FeaturePipelineOptions(),
     image_limit: int | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     pycolmap_module = require_pycolmap()
+    pycolmap_module.set_random_seed(0)
+    configure_ssl_cert_file(ssl_cert_file)
     paths = panorama_workspace_paths(workspace)
     if workspace.exists() and overwrite:
         shutil.rmtree(workspace)
@@ -285,45 +465,53 @@ def run_panorama_reconstruction(
         options=render_options,
         image_limit=image_limit,
     )
+    masks = read_rendered_rig_masks(
+        paths["mask_dir"],
+        input_image_path,
+        panorama_paths[0],
+        views,
+    )
+    validate_rig_masks(camera, views, masks)
+    masks_report = mask_statistics(masks)
     write_rig_metadata(
         paths["rig_metadata"],
         input_image_path,
         render_options,
         camera,
         views,
+        masks_report,
         image_limit=image_limit,
     )
 
+    extraction_options = create_feature_extraction_options(
+        pycolmap_module, feature_options
+    )
     pycolmap_module.extract_features(
         paths["database"],
         paths["image_dir"],
         reader_options=pycolmap_module.ImageReaderOptions(mask_path=paths["mask_dir"]),
         camera_mode=pycolmap_module.CameraMode.PER_FOLDER,
+        extraction_options=extraction_options,
         device=pycolmap_module.Device.cpu,
     )
+    feature_report = read_feature_stats_by_camera(paths["database"])
+    feature_health = feature_health_summary(views, feature_report)
     rig_config = create_rig_config(pycolmap_module, camera, views)
     with pycolmap_module.Database.open(paths["database"]) as database:
         pycolmap_module.apply_rig_config([rig_config], database)
 
-    matching_options = pycolmap_module.FeatureMatchingOptions()
-    matching_options.use_gpu = False
-    matching_options.rig_verification = True
-    matching_options.skip_image_pairs_in_same_frame = True
-    if matcher == "sequential":
-        pycolmap_module.match_sequential(
-            paths["database"],
-            matching_options=matching_options,
-            pairing_options=pycolmap_module.SequentialPairingOptions(overlap=overlap),
-            device=pycolmap_module.Device.cpu,
-        )
-    elif matcher == "exhaustive":
-        pycolmap_module.match_exhaustive(
-            paths["database"],
-            matching_options=matching_options,
-            device=pycolmap_module.Device.cpu,
-        )
-    else:
-        raise ValueError("matcher must be 'sequential' or 'exhaustive'")
+    matching_options = create_feature_matching_options(
+        pycolmap_module, feature_options
+    )
+    match_features(
+        pycolmap_module,
+        paths["database"],
+        matcher=matcher,
+        matching_options=matching_options,
+        overlap=overlap,
+        loop_detection=loop_detection,
+        vocab_tree_path=vocab_tree_path,
+    )
 
     mapper_options = pycolmap_module.IncrementalPipelineOptions()
     mapper_options.ba_refine_sensor_from_rig = False
@@ -354,6 +542,13 @@ def run_panorama_reconstruction(
         panorama_count=len(panorama_paths),
         matcher=matcher,
         overlap=overlap,
+        loop_detection=loop_detection,
+        vocab_tree_path=vocab_tree_path,
+        ssl_cert_file=ssl_cert_file,
+        feature_options=feature_options,
+        masks_report=masks_report,
+        feature_report=feature_report,
+        feature_health=feature_health,
         image_limit=image_limit,
         reconstructions=reconstructions,
         best_model_id=best_model_id,
@@ -383,6 +578,7 @@ def write_rig_metadata(
     options: PanoramaRenderOptions,
     camera: ColmapCamera,
     views: Sequence[PanoramaRigView],
+    masks_report: dict[str, dict[str, float | int]],
     *,
     image_limit: int | None,
 ) -> None:
@@ -399,6 +595,7 @@ def write_rig_metadata(
             "interpolation": options.interpolation,
         },
         "camera": camera.report(),
+        "masks": masks_report,
         "views": [
             {
                 "index": view.index,
@@ -423,11 +620,22 @@ def build_panorama_report(
     panorama_count: int,
     matcher: str,
     overlap: int,
+    loop_detection: bool,
+    vocab_tree_path: Path | None,
+    ssl_cert_file: Path | None,
+    feature_options: FeaturePipelineOptions,
+    masks_report: dict[str, dict[str, float | int]],
+    feature_report: dict[str, dict[str, float | int]],
+    feature_health: dict[str, Any],
     image_limit: int | None,
     reconstructions: dict[int, Any],
     best_model_id: int,
     best_reconstruction: Any,
 ) -> dict[str, Any]:
+    model_stats = {
+        str(model_id): panorama_reconstruction_stats(reconstruction)
+        for model_id, reconstruction in sorted(reconstructions.items())
+    }
     return {
         "status": "raw_colmap_panorama_rig_unscaled",
         "warning": (
@@ -449,6 +657,19 @@ def build_panorama_report(
         "options": {
             "matcher": matcher,
             "sequential_overlap": overlap,
+            "loop_detection": loop_detection,
+            "vocab_tree_path": (
+                None if vocab_tree_path is None else str(vocab_tree_path)
+            ),
+            "ssl_cert_file": (
+                os.environ.get("SSL_CERT_FILE")
+                if ssl_cert_file is None
+                else str(ssl_cert_file)
+            ),
+            "feature_extractor": feature_options.extractor,
+            "feature_matcher": feature_options.matcher,
+            "max_num_features": feature_options.max_num_features,
+            "guided_matching": feature_options.guided_matching,
             "image_limit": image_limit,
             "use_gpu": False,
             "camera_mode": "PER_FOLDER",
@@ -462,14 +683,75 @@ def build_panorama_report(
         "panorama_count": panorama_count,
         "virtual_camera_count": len(views),
         "generated_image_count": panorama_count * len(views),
+        "masks": masks_report,
+        "features_by_virtual_camera": feature_report,
+        "feature_health": feature_health,
         "database": read_database_stats(paths["database"]),
         "model_count": len(reconstructions),
         "best_model_id": best_model_id,
-        "models": {
-            str(model_id): reconstruction_stats(reconstruction)
-            for model_id, reconstruction in sorted(reconstructions.items())
-        },
-        "best_model": reconstruction_stats(best_reconstruction),
+        "models": model_stats,
+        "best_model": panorama_reconstruction_stats(best_reconstruction),
+    }
+
+
+def panorama_reconstruction_stats(reconstruction: Any) -> dict[str, Any]:
+    stats = reconstruction_stats(reconstruction)
+    stats["num_frames"] = reconstruction.num_frames()
+    stats["num_registered_frames"] = reconstruction.num_reg_frames()
+    return stats
+
+
+def read_feature_stats_by_camera(
+    database_path: Path,
+) -> dict[str, dict[str, float | int]]:
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                substr(images.name, 1, instr(images.name, '/') - 1) AS folder,
+                COUNT(*) AS image_count,
+                SUM(keypoints.rows) AS total_features,
+                AVG(keypoints.rows) AS mean_features,
+                MIN(keypoints.rows) AS min_features,
+                MAX(keypoints.rows) AS max_features
+            FROM images
+            JOIN keypoints USING(image_id)
+            GROUP BY folder
+            ORDER BY folder
+            """
+        ).fetchall()
+    return {
+        str(folder): {
+            "image_count": int(image_count),
+            "total_features": int(total_features),
+            "mean_features": float(mean_features),
+            "min_features": int(min_features),
+            "max_features": int(max_features),
+        }
+        for folder, image_count, total_features, mean_features, min_features, max_features
+        in rows
+    }
+
+
+def feature_health_summary(
+    views: Sequence[PanoramaRigView],
+    feature_report: dict[str, dict[str, float | int]],
+) -> dict[str, Any]:
+    expected = [view.image_prefix.rstrip("/") for view in views]
+    missing = [name for name in expected if name not in feature_report]
+    if missing:
+        raise RuntimeError(
+            f"Feature extraction did not create statistics for virtual cameras: {missing}"
+        )
+    zero_feature_cameras = [
+        name
+        for name in expected
+        if int(feature_report[name]["total_features"]) == 0
+    ]
+    return {
+        "virtual_camera_count": len(expected),
+        "virtual_cameras_with_features": len(expected) - len(zero_feature_cameras),
+        "zero_feature_virtual_cameras": zero_feature_cameras,
     }
 
 
@@ -535,7 +817,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--matcher",
-        choices=("sequential", "exhaustive"),
+        choices=("sequential", "exhaustive", "vocabtree"),
         default="sequential",
         help="Feature matching strategy.",
     )
@@ -544,6 +826,53 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=15,
         help="Sequential matcher overlap in neighboring frames.",
+    )
+    parser.add_argument(
+        "--loop-detection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable vocabulary-tree loop detection during sequential matching.",
+    )
+    parser.add_argument(
+        "--vocab-tree-path",
+        type=Path,
+        default=None,
+        help=(
+            "Local COLMAP vocabulary tree for loop detection or vocabtree "
+            "matching. If omitted, COLMAP may download its default tree."
+        ),
+    )
+    parser.add_argument(
+        "--ssl-cert-file",
+        type=Path,
+        default=None,
+        help=(
+            "CA certificate bundle for COLMAP downloads. Defaults to "
+            "$SSL_CERT_FILE or /etc/ssl/certs/ca-certificates.crt."
+        ),
+    )
+    parser.add_argument(
+        "--feature-extractor",
+        choices=("sift",),
+        default="sift",
+        help="Local feature extractor. The pipeline is structured for future backends.",
+    )
+    parser.add_argument(
+        "--feature-matcher",
+        choices=("sift-bruteforce",),
+        default="sift-bruteforce",
+        help="Local feature matcher. The pipeline is structured for future backends.",
+    )
+    parser.add_argument(
+        "--max-num-features",
+        type=int,
+        default=8192,
+        help="Maximum SIFT features per virtual camera image.",
+    )
+    parser.add_argument(
+        "--guided-matching",
+        action="store_true",
+        help="Enable guided feature matching after geometric verification.",
     )
     parser.add_argument(
         "--image-limit",
@@ -571,6 +900,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--fov-y must be greater than 0 and less than pi radians")
     if args.image_limit is not None and args.image_limit <= 0:
         parser.error("--image-limit must be positive")
+    if args.max_num_features <= 0:
+        parser.error("--max-num-features must be positive")
+    if args.vocab_tree_path is not None and not args.vocab_tree_path.is_file():
+        parser.error(f"--vocab-tree-path does not exist: {args.vocab_tree_path}")
+    if args.ssl_cert_file is not None and not args.ssl_cert_file.is_file():
+        parser.error(f"--ssl-cert-file does not exist: {args.ssl_cert_file}")
     return args
 
 
@@ -597,12 +932,27 @@ def main(argv: list[str] | None = None) -> int:
         render_options=render_options_from_args(args),
         matcher=args.matcher,
         overlap=args.overlap,
+        loop_detection=args.loop_detection,
+        vocab_tree_path=args.vocab_tree_path,
+        ssl_cert_file=args.ssl_cert_file,
+        feature_options=FeaturePipelineOptions(
+            extractor=args.feature_extractor,
+            matcher=args.feature_matcher,
+            max_num_features=args.max_num_features,
+            guided_matching=args.guided_matching,
+        ),
         image_limit=args.image_limit,
         overwrite=args.overwrite,
     )
     print(f"panoramas: {report['panorama_count']}")
     print(f"virtual cameras: {report['virtual_camera_count']}")
     print(f"generated images: {report['generated_image_count']}")
+    print(
+        "virtual cameras with features: "
+        f"{report['feature_health']['virtual_cameras_with_features']}/"
+        f"{report['feature_health']['virtual_camera_count']}"
+    )
+    print(f"best registered frames: {report['best_model']['num_registered_frames']}")
     print(f"best registered images: {report['best_model']['num_registered_images']}")
     print(f"best sparse points: {report['best_model']['num_points3D']}")
     print(f"report: {report['workspace']}/panorama_rig_report.json")
