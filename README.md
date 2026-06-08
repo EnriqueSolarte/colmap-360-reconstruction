@@ -36,14 +36,6 @@ For COLMAP reconstruction support:
 
 ```bash
 python -m pip install -e '.[colmap]'
-```
-
-For CUDA 12-enabled pycolmap on Linux, use the GPU extra instead:
-
-```bash
-sudo apt-get install -y libsm6 libice6
-python -m pip uninstall -y pycolmap
-python -m pip install -e '.[colmap-cuda12]'
 python -c "import pycolmap; print(pycolmap.has_cuda)"
 ```
 
