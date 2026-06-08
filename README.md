@@ -38,6 +38,19 @@ For COLMAP reconstruction support:
 python -m pip install -e '.[colmap]'
 ```
 
+For CUDA 12-enabled pycolmap on Linux, use the GPU extra instead:
+
+```bash
+sudo apt-get install -y libsm6 libice6
+python -m pip uninstall -y pycolmap
+python -m pip install -e '.[colmap-cuda12]'
+python -c "import pycolmap; print(pycolmap.has_cuda)"
+```
+
+The final command must print `True`. Installing the CUDA wheel alongside the
+ordinary `pycolmap` wheel is not sufficient because both packages provide the
+same Python module.
+
 For Open3D visualization support:
 
 ```bash
@@ -198,6 +211,34 @@ For substantially faster and smaller, but lossy, virtual images:
 --virtual-image-format jpeg \
 --jpeg-quality 95
 ```
+
+COLMAP feature extraction, matching, and bundle adjustment use CUDA
+automatically when the installed pycolmap build supports it:
+
+```bash
+--device auto \
+--gpu-index -1
+```
+
+To require CUDA and fail instead of falling back to CPU:
+
+```bash
+--device cuda \
+--gpu-index 0
+```
+
+Multiple GPU indices distribute feature extraction and matching across GPUs.
+Bundle adjustment requests the first selected GPU:
+
+```bash
+--device cuda \
+--gpu-index 0,1,2,3
+```
+
+Disable GPU bundle adjustment while retaining GPU SIFT with
+`--no-gpu-bundle-adjustment`. Some CUDA pycolmap wheels are built with a
+CPU-only Ceres solver. In that case, COLMAP logs a warning and automatically
+falls back to CPU bundle adjustment.
 
 Start with a small smoke reconstruction before a full run:
 

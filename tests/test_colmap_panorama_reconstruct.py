@@ -9,12 +9,14 @@ from colmap.camera import camera_from_fov
 from colmap.panorama_reconstruct import (
     FeaturePipelineOptions,
     PanoramaRenderOptions,
+    PipelineExecutionOptions,
     VirtualImageOutputOptions,
     build_rig_remap_maps,
     build_rig_views,
     configure_ssl_cert_file,
     create_feature_extraction_options,
     create_feature_matching_options,
+    create_mapper_options,
     create_rig_config,
     default_render_options,
     feature_health_summary,
@@ -25,6 +27,7 @@ from colmap.panorama_reconstruct import (
     read_rendered_rig_masks,
     render_remapped_view,
     render_panorama_rig_images,
+    resolve_pipeline_execution,
     rig_view_masks,
     validate_rig_masks,
 )
@@ -166,6 +169,99 @@ def test_sift_feature_options_preserve_rig_matching_constraints() -> None:
     assert matching.skip_image_pairs_in_same_frame is True
 
 
+def test_gpu_feature_options_propagate_multi_gpu_indices() -> None:
+    pycolmap = pytest.importorskip("pycolmap")
+    options = FeaturePipelineOptions()
+
+    extraction = create_feature_extraction_options(
+        pycolmap,
+        options,
+        use_gpu=True,
+        gpu_index="0,1",
+    )
+    matching = create_feature_matching_options(
+        pycolmap,
+        options,
+        use_gpu=True,
+        gpu_index="0,1",
+    )
+
+    assert extraction.use_gpu is True
+    assert extraction.gpu_index == "0,1"
+    assert matching.use_gpu is True
+    assert matching.gpu_index == "0,1"
+
+
+def test_resolve_pipeline_execution_uses_cpu_fallback() -> None:
+    class FakePycolmap:
+        has_cuda = False
+
+        class Device:
+            cpu = "cpu"
+            cuda = "cuda"
+
+    execution = resolve_pipeline_execution(
+        FakePycolmap,
+        PipelineExecutionOptions(device="auto", gpu_index="0,1"),
+    )
+
+    assert execution["resolved_device"] == "cpu"
+    assert execution["device"] == "cpu"
+    assert execution["cuda_available"] is False
+    assert execution["gpu_bundle_adjustment"] is False
+    assert execution["bundle_adjustment_gpu_index"] == "0"
+
+
+def test_resolve_pipeline_execution_rejects_unavailable_cuda() -> None:
+    class FakePycolmap:
+        has_cuda = False
+
+        class Device:
+            cpu = "cpu"
+            cuda = "cuda"
+
+    with pytest.raises(RuntimeError, match="pycolmap build has no CUDA support"):
+        resolve_pipeline_execution(
+            FakePycolmap,
+            PipelineExecutionOptions(device="cuda"),
+        )
+
+
+def test_resolve_pipeline_execution_uses_cuda_bundle_adjustment() -> None:
+    class FakePycolmap:
+        has_cuda = True
+
+        class Device:
+            cpu = "cpu"
+            cuda = "cuda"
+
+    execution = resolve_pipeline_execution(
+        FakePycolmap,
+        PipelineExecutionOptions(device="cuda", gpu_index="2,3"),
+    )
+
+    assert execution["resolved_device"] == "cuda"
+    assert execution["device"] == "cuda"
+    assert execution["gpu_index"] == "2,3"
+    assert execution["gpu_bundle_adjustment"] is True
+    assert execution["bundle_adjustment_gpu_index"] == "2"
+
+
+def test_mapper_options_enable_gpu_bundle_adjustment() -> None:
+    pycolmap = pytest.importorskip("pycolmap")
+    execution = {
+        "gpu_bundle_adjustment": True,
+        "bundle_adjustment_gpu_index": "2",
+    }
+
+    options = create_mapper_options(pycolmap, execution)
+
+    assert options.ba_use_gpu is True
+    assert options.ba_gpu_index == "2"
+    assert options.ba_refine_sensor_from_rig is False
+    assert options.ba_refine_focal_length is False
+
+
 def test_precomputed_rig_remaps_match_existing_renderer() -> None:
     height, width = 24, 48
     image = np.arange(height * width * 3, dtype=np.uint8).reshape(height, width, 3)
@@ -258,6 +354,9 @@ def test_parse_args_accepts_image_limit(tmp_path) -> None:
     assert args.png_compression == 1
     assert args.jpeg_quality == 95
     assert args.image_save_workers == 12
+    assert args.device == "auto"
+    assert args.gpu_index == "-1"
+    assert args.gpu_bundle_adjustment is True
 
 
 def test_render_panorama_rig_images_respects_image_limit(tmp_path, monkeypatch) -> None:

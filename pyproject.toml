@@ -18,9 +18,9 @@ dependencies = [
 test = [
     "pytest",
 ]
-colmap = [
+colmap= [
     "opencv-python-headless",
-    "pycolmap",
+    "pycolmap-cuda12",
 ]
 visualize = [
     "open3d",

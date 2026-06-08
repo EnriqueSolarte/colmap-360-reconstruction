@@ -74,6 +74,13 @@ class VirtualImageOutputOptions:
     save_workers: int = 12
 
 
+@dataclass(frozen=True)
+class PipelineExecutionOptions:
+    device: str = "auto"
+    gpu_index: str = "-1"
+    gpu_bundle_adjustment: bool = True
+
+
 def default_render_options(render_type: str) -> PanoramaRenderOptions:
     if render_type == "overlapping":
         return PanoramaRenderOptions(
@@ -500,12 +507,16 @@ def create_rig_config(
 def create_feature_extraction_options(
     pycolmap_module: Any,
     options: FeaturePipelineOptions,
+    *,
+    use_gpu: bool = False,
+    gpu_index: str = "-1",
 ) -> Any:
     if options.extractor != "sift":
         raise ValueError(f"Unsupported feature extractor: {options.extractor}")
     extraction_options = pycolmap_module.FeatureExtractionOptions()
     extraction_options.type = pycolmap_module.FeatureExtractorType.SIFT
-    extraction_options.use_gpu = False
+    extraction_options.use_gpu = use_gpu
+    extraction_options.gpu_index = gpu_index
     extraction_options.sift.max_num_features = options.max_num_features
     return extraction_options
 
@@ -513,21 +524,90 @@ def create_feature_extraction_options(
 def create_feature_matching_options(
     pycolmap_module: Any,
     options: FeaturePipelineOptions,
+    *,
+    use_gpu: bool = False,
+    gpu_index: str = "-1",
 ) -> Any:
     if options.matcher != "sift-bruteforce":
         raise ValueError(f"Unsupported feature matcher: {options.matcher}")
     matching_options = pycolmap_module.FeatureMatchingOptions()
     matching_options.type = pycolmap_module.FeatureMatcherType.SIFT_BRUTEFORCE
-    matching_options.use_gpu = False
+    matching_options.use_gpu = use_gpu
+    matching_options.gpu_index = gpu_index
     matching_options.guided_matching = options.guided_matching
     matching_options.rig_verification = True
     matching_options.skip_image_pairs_in_same_frame = True
     return matching_options
 
 
+def create_mapper_options(pycolmap_module: Any, execution: dict[str, Any]) -> Any:
+    mapper_options = pycolmap_module.IncrementalPipelineOptions()
+    mapper_options.ba_refine_sensor_from_rig = False
+    mapper_options.ba_refine_focal_length = False
+    mapper_options.ba_refine_principal_point = False
+    mapper_options.ba_refine_extra_params = False
+    mapper_options.ba_use_gpu = execution["gpu_bundle_adjustment"]
+    mapper_options.ba_gpu_index = execution["bundle_adjustment_gpu_index"]
+    return mapper_options
+
+
 def validate_vocab_tree_path(vocab_tree_path: Path | None) -> None:
     if vocab_tree_path is not None and not vocab_tree_path.is_file():
         raise FileNotFoundError(f"Vocabulary tree not found: {vocab_tree_path}")
+
+
+def resolve_pipeline_execution(
+    pycolmap_module: Any,
+    options: PipelineExecutionOptions,
+) -> dict[str, Any]:
+    if options.device not in {"auto", "cpu", "cuda"}:
+        raise ValueError("device must be 'auto', 'cpu', or 'cuda'")
+    validate_gpu_index(options.gpu_index)
+
+    cuda_available = bool(pycolmap_module.has_cuda)
+    if options.device == "cuda" and not cuda_available:
+        raise RuntimeError(
+            "CUDA was requested, but this pycolmap build has no CUDA support. "
+            "Replace the CPU wheel with the CUDA wheel using "
+            "`python -m pip uninstall -y pycolmap` followed by "
+            "`python -m pip install -e '.[colmap-cuda12]'`, or install another "
+            "CUDA-enabled pycolmap build."
+        )
+    use_gpu = cuda_available and options.device != "cpu"
+    resolved_device_name = "cuda" if use_gpu else "cpu"
+    return {
+        "requested_device": options.device,
+        "resolved_device": resolved_device_name,
+        "device": getattr(pycolmap_module.Device, resolved_device_name),
+        "cuda_available": cuda_available,
+        "gpu_index": options.gpu_index,
+        "gpu_bundle_adjustment": use_gpu and options.gpu_bundle_adjustment,
+        "bundle_adjustment_gpu_index": first_gpu_index(options.gpu_index),
+    }
+
+
+def validate_gpu_index(value: str) -> None:
+    if value == "-1":
+        return
+    parts = value.split(",")
+    if not parts or any(not part.isdigit() for part in parts):
+        raise ValueError(
+            "gpu_index must be -1 or comma-separated non-negative indices"
+        )
+
+
+def parse_gpu_index(value: str) -> str:
+    try:
+        validate_gpu_index(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    if value == "-1":
+        return value
+    return ",".join(str(int(part)) for part in value.split(","))
+
+
+def first_gpu_index(value: str) -> str:
+    return value if value == "-1" else value.split(",", maxsplit=1)[0]
 
 
 def match_features(
@@ -539,8 +619,11 @@ def match_features(
     overlap: int,
     loop_detection: bool,
     vocab_tree_path: Path | None,
+    device: Any | None = None,
 ) -> None:
     validate_vocab_tree_path(vocab_tree_path)
+    if device is None:
+        device = pycolmap_module.Device.cpu
     if matcher == "sequential":
         pairing_options = pycolmap_module.SequentialPairingOptions()
         pairing_options.overlap = overlap
@@ -552,13 +635,13 @@ def match_features(
             database_path,
             matching_options=matching_options,
             pairing_options=pairing_options,
-            device=pycolmap_module.Device.cpu,
+            device=device,
         )
     elif matcher == "exhaustive":
         pycolmap_module.match_exhaustive(
             database_path,
             matching_options=matching_options,
-            device=pycolmap_module.Device.cpu,
+            device=device,
         )
     elif matcher == "vocabtree":
         pairing_options = pycolmap_module.VocabTreePairingOptions()
@@ -568,7 +651,7 @@ def match_features(
             database_path,
             matching_options=matching_options,
             pairing_options=pairing_options,
-            device=pycolmap_module.Device.cpu,
+            device=device,
         )
     else:
         raise ValueError("matcher must be 'sequential', 'exhaustive', or 'vocabtree'")
@@ -586,12 +669,14 @@ def run_panorama_reconstruction(
     ssl_cert_file: Path | None = None,
     feature_options: FeaturePipelineOptions = FeaturePipelineOptions(),
     output_options: VirtualImageOutputOptions = VirtualImageOutputOptions(),
+    execution_options: PipelineExecutionOptions = PipelineExecutionOptions(),
     image_limit: int | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     pycolmap_module = require_pycolmap()
     pycolmap_module.set_random_seed(0)
     configure_ssl_cert_file(ssl_cert_file)
+    execution = resolve_pipeline_execution(pycolmap_module, execution_options)
     paths = panorama_workspace_paths(workspace)
     if workspace.exists() and overwrite:
         shutil.rmtree(workspace)
@@ -631,7 +716,10 @@ def run_panorama_reconstruction(
     )
 
     extraction_options = create_feature_extraction_options(
-        pycolmap_module, feature_options
+        pycolmap_module,
+        feature_options,
+        use_gpu=execution["resolved_device"] == "cuda",
+        gpu_index=execution["gpu_index"],
     )
     pycolmap_module.extract_features(
         paths["database"],
@@ -639,7 +727,7 @@ def run_panorama_reconstruction(
         reader_options=pycolmap_module.ImageReaderOptions(mask_path=paths["mask_dir"]),
         camera_mode=pycolmap_module.CameraMode.PER_FOLDER,
         extraction_options=extraction_options,
-        device=pycolmap_module.Device.cpu,
+        device=execution["device"],
     )
     feature_report = read_feature_stats_by_camera(paths["database"])
     feature_health = feature_health_summary(views, feature_report)
@@ -648,7 +736,10 @@ def run_panorama_reconstruction(
         pycolmap_module.apply_rig_config([rig_config], database)
 
     matching_options = create_feature_matching_options(
-        pycolmap_module, feature_options
+        pycolmap_module,
+        feature_options,
+        use_gpu=execution["resolved_device"] == "cuda",
+        gpu_index=execution["gpu_index"],
     )
     match_features(
         pycolmap_module,
@@ -658,14 +749,10 @@ def run_panorama_reconstruction(
         overlap=overlap,
         loop_detection=loop_detection,
         vocab_tree_path=vocab_tree_path,
+        device=execution["device"],
     )
 
-    mapper_options = pycolmap_module.IncrementalPipelineOptions()
-    mapper_options.ba_refine_sensor_from_rig = False
-    mapper_options.ba_refine_focal_length = False
-    mapper_options.ba_refine_principal_point = False
-    mapper_options.ba_refine_extra_params = False
-    mapper_options.ba_use_gpu = False
+    mapper_options = create_mapper_options(pycolmap_module, execution)
     reconstructions = pycolmap_module.incremental_mapping(
         paths["database"],
         paths["image_dir"],
@@ -694,6 +781,7 @@ def run_panorama_reconstruction(
         ssl_cert_file=ssl_cert_file,
         feature_options=feature_options,
         output_options=output_options,
+        execution=execution,
         masks_report=masks_report,
         feature_report=feature_report,
         feature_health=feature_health,
@@ -779,6 +867,7 @@ def build_panorama_report(
     ssl_cert_file: Path | None,
     feature_options: FeaturePipelineOptions,
     output_options: VirtualImageOutputOptions,
+    execution: dict[str, Any],
     masks_report: dict[str, dict[str, float | int]],
     feature_report: dict[str, dict[str, float | int]],
     feature_health: dict[str, Any],
@@ -831,7 +920,14 @@ def build_panorama_report(
             "image_save_workers": output_options.save_workers,
             "render_backend": "precomputed_opencv_remap",
             "image_limit": image_limit,
-            "use_gpu": False,
+            "requested_device": execution["requested_device"],
+            "resolved_device": execution["resolved_device"],
+            "cuda_available": execution["cuda_available"],
+            "gpu_index": execution["gpu_index"],
+            "gpu_bundle_adjustment": execution["gpu_bundle_adjustment"],
+            "bundle_adjustment_gpu_index": execution[
+                "bundle_adjustment_gpu_index"
+            ],
             "camera_mode": "PER_FOLDER",
             "ba_refine_sensor_from_rig": False,
             "ba_refine_focal_length": False,
@@ -1059,6 +1155,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Concurrent workers used to encode virtual images (default: 12).",
     )
     parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="COLMAP compute device. Auto uses CUDA when pycolmap supports it.",
+    )
+    parser.add_argument(
+        "--gpu-index",
+        type=parse_gpu_index,
+        default="-1",
+        help=(
+            "CUDA GPU index, or comma-separated indices for multi-GPU feature "
+            "extraction and matching (default: -1, all GPUs)."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-bundle-adjustment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use GPU bundle adjustment when CUDA is selected. Bundle adjustment "
+            "uses the first selected GPU."
+        ),
+    )
+    parser.add_argument(
         "--image-limit",
         type=int,
         default=None,
@@ -1137,12 +1257,18 @@ def main(argv: list[str] | None = None) -> int:
             jpeg_quality=args.jpeg_quality,
             save_workers=args.image_save_workers,
         ),
+        execution_options=PipelineExecutionOptions(
+            device=args.device,
+            gpu_index=args.gpu_index,
+            gpu_bundle_adjustment=args.gpu_bundle_adjustment,
+        ),
         image_limit=args.image_limit,
         overwrite=args.overwrite,
     )
     print(f"panoramas: {report['panorama_count']}")
     print(f"virtual cameras: {report['virtual_camera_count']}")
     print(f"generated images: {report['generated_image_count']}")
+    print(f"compute device: {report['options']['resolved_device']}")
     print(
         "virtual cameras with features: "
         f"{report['feature_health']['virtual_cameras_with_features']}/"
