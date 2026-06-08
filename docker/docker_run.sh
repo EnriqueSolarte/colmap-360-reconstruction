@@ -1,7 +1,7 @@
 #!/bin/bash
 xhost +local:
 
-CONTAINER_NAME="scene-reconstruction"
+CONTAINER_NAME="scene-reconstruction-colmap"
 
 # this directory
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -37,5 +37,5 @@ else
         --volume="${DIR}/../:/workspace" \
         --volume="${ITRI_3D_RECONSTRUCTION}:/data/itri-3d-reconstruction" \
         -e QT_XCB_GL_INTEGRATION=xcb_egl \
-        scene-reconstruction:dev
+        scene-reconstruction-colmap:dev
 fi

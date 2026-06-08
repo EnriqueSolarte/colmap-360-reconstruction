@@ -31,6 +31,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb-randr0 \
     libxcb-render-util0 \
     libxcb-xinerama0 \
+    libsm6 \
+    libice6 \
     libxcb-util1 && \
     rm -rf /var/lib/apt/lists/*
 
