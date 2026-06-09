@@ -68,6 +68,26 @@ def camera_from_resolution_guess(width: int, height: int) -> ColmapCamera:
     )
 
 
+def camera_from_intrinsics(
+    width: int,
+    height: int,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+) -> ColmapCamera:
+    validate_positive_int(width, "width")
+    validate_positive_int(height, "height")
+    validate_positive_float(fx, "fx")
+    validate_positive_float(fy, "fy")
+    return ColmapCamera(
+        model="PINHOLE",
+        width=width,
+        height=height,
+        params=(fx, fy, cx, cy),
+    )
+
+
 def validate_positive_int(value: int, name: str) -> None:
     if value <= 0:
         raise ValueError(f"{name} must be positive")
@@ -76,3 +96,8 @@ def validate_positive_int(value: int, name: str) -> None:
 def validate_fov(value: float, name: str) -> None:
     if not 0.0 < value < pi:
         raise ValueError(f"{name} must be greater than 0 and less than pi radians")
+
+
+def validate_positive_float(value: float, name: str) -> None:
+    if value <= 0.0:
+        raise ValueError(f"{name} must be positive")
