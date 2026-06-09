@@ -42,6 +42,12 @@ if [ -z "${VIDEO}" ]; then
     return 1
 fi
 
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "ffmpeg is required but was not found on PATH." >&2
+    echo "Install it with your system package manager, for example: apt-get install ffmpeg" >&2
+    return 1 2>/dev/null || exit 1
+fi
+
 # VIDEO=$1
 # compute base name without extension
 BASENAME="${VIDEO%.*}"

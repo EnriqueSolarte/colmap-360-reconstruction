@@ -36,6 +36,7 @@ else
         --volume="${AGENT_SKILLS}:/agent-skills" \
         --volume="${DIR}/../:/workspace" \
         --volume="${ITRI_3D_RECONSTRUCTION}:/data/itri-3d-reconstruction" \
+        --volume='/media/datasets/hm_semantic_maps/map_free_navigation/real_scenes:/real_scenes' \
         -e QT_XCB_GL_INTEGRATION=xcb_egl \
         scene-reconstruction-colmap:dev
 fi
