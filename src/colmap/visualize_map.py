@@ -539,7 +539,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--min-track-length",
         type=int,
         default=3,
-        help="Minimum COLMAP track length for displayed 3D points (default: 3)",
+        help=(
+            "Minimum COLMAP track length for displayed 3D points; use 0 to "
+            "show untracked/synthetic points (default: 3)"
+        ),
+    )
+    parser.add_argument(
+        "--show-untracked-points",
+        action="store_true",
+        help=(
+            "Show 3D points with no COLMAP observations, such as DA3-derived "
+            "XYZ/RGB initialization clouds."
+        ),
     )
     parser.add_argument(
         "--max-reprojection-error",
@@ -568,8 +579,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--camera-scale must be >= 0")
     if args.max_cameras < 0:
         parser.error("--max-cameras must be >= 0")
-    if args.min_track_length < 1:
-        parser.error("--min-track-length must be >= 1")
+    if args.min_track_length < 0:
+        parser.error("--min-track-length must be >= 0")
+    if args.show_untracked_points:
+        args.min_track_length = 0
     if args.max_reprojection_error < 0.0:
         parser.error("--max-reprojection-error must be >= 0")
     if args.point_size <= 0.0:

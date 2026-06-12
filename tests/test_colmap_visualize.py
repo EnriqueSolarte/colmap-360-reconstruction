@@ -3,9 +3,42 @@ import pytest
 import colmap.visualize_map as visualize_map
 
 
+class FakeTrack:
+    def __init__(self, length):
+        self._length = length
+
+    def length(self):
+        return self._length
+
+
+class FakePoint3D:
+    def __init__(self, track_length):
+        self.track = FakeTrack(track_length)
+        self.error = 0.0
+        self.xyz = [1.0, 2.0, 3.0]
+        self.color = [255, 128, 0]
+
+
+class FakePointCloud:
+    def __init__(self):
+        self.points = []
+        self.colors = []
+
+
+class FakeOpen3D:
+    class geometry:
+        PointCloud = FakePointCloud
+
+    class utility:
+        @staticmethod
+        def Vector3dVector(values):
+            return list(values)
+
+
 class FakeReconstruction:
     def __init__(self, model_path):
         self.model_path = model_path
+        self.points3D = {}
 
     def summary(self) -> str:
         return "fake reconstruction summary"
@@ -19,6 +52,34 @@ class FakeReconstruction:
 
 class FakePycolmap:
     Reconstruction = FakeReconstruction
+
+
+def test_point_cloud_can_include_untracked_points(monkeypatch):
+    reconstruction = FakeReconstruction("model")
+    reconstruction.points3D = {1: FakePoint3D(track_length=0)}
+    monkeypatch.setattr(visualize_map, "o3d", FakeOpen3D)
+
+    filtered_cloud = visualize_map.point_cloud_from_reconstruction(
+        reconstruction,
+        min_track_length=3,
+        max_reprojection_error=0.0,
+        remove_outliers=False,
+    )
+    untracked_cloud = visualize_map.point_cloud_from_reconstruction(
+        reconstruction,
+        min_track_length=0,
+        max_reprojection_error=0.0,
+        remove_outliers=False,
+    )
+
+    assert len(filtered_cloud.points) == 0
+    assert len(untracked_cloud.points) == 1
+
+
+def test_show_untracked_points_sets_track_length_zero():
+    args = visualize_map.parse_args(["--show-untracked-points"])
+
+    assert args.min_track_length == 0
 
 
 def test_visualize_summary_only_does_not_require_open3d(tmp_path, monkeypatch, capsys):
