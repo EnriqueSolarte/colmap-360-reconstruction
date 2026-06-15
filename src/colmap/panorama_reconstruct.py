@@ -1529,7 +1529,7 @@ def build_initial_session_report(
         ),
         "copied_model_path": str(paths["initial_sparse"]),
         "copied_model_preserves_rig_frames": True,
-        "existing_camera_poses_refinable": True,
+        "existing_camera_poses_refinable": False,
         "intrinsics_refinable": False,
         "virtual_camera_count": len(previous_views),
     }

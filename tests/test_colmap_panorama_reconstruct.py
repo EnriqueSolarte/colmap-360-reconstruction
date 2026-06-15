@@ -16,6 +16,7 @@ from colmap.panorama_reconstruct import (
     VirtualImageOutputOptions,
     assign_camera_ids_by_prefix,
     build_rig_remap_maps,
+    build_initial_session_report,
     build_rig_views,
     configure_ssl_cert_file,
     copy_initial_panorama_session,
@@ -165,6 +166,25 @@ def test_initial_panorama_session_must_match_current_render_options(tmp_path) ->
             current_options,
             VirtualImageOutputOptions(save_workers=1),
         )
+
+
+def test_initial_session_report_marks_existing_poses_fixed(tmp_path) -> None:
+    workspace = tmp_path / "previous"
+    create_previous_panorama_session(workspace)
+    session = resolve_initial_panorama_session(workspace)
+    paths = {"initial_sparse": tmp_path / "continued" / "initial_sparse"}
+    metadata = {
+        "views": [
+            {"index": view.index, "image_prefix": view.image_prefix}
+            for view in build_rig_views(default_render_options("non-overlapping"))
+        ],
+    }
+
+    report = build_initial_session_report(session, paths, metadata)
+
+    assert report["copied_model_preserves_rig_frames"] is True
+    assert report["existing_camera_poses_refinable"] is False
+    assert report["intrinsics_refinable"] is False
 
 
 def test_overlapping_preset_builds_fixed_virtual_camera_rig() -> None:
