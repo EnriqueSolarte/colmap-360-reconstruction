@@ -93,6 +93,20 @@ class InitialPanoramaSession:
     report_path: Path | None = None
 
 
+@dataclass(frozen=True)
+class GeneratedVirtualImageBatch:
+    names: tuple[str, ...]
+    records_by_name: dict[str, tuple[int, int]]
+
+    @property
+    def image_ids(self) -> list[int]:
+        return [self.records_by_name[name][0] for name in self.names]
+
+    @property
+    def camera_ids(self) -> list[int]:
+        return [self.records_by_name[name][1] for name in self.names]
+
+
 def default_render_options(render_type: str) -> PanoramaRenderOptions:
     if render_type == "overlapping":
         return PanoramaRenderOptions(
@@ -359,6 +373,16 @@ def read_image_records_by_name(
                 raise ValueError(f"Expected image in database: {image_name}")
             records[image_name] = (int(row[0]), int(row[1]))
     return records
+
+
+def read_generated_virtual_image_batch(
+    database_path: Path,
+    image_names: Sequence[str],
+) -> GeneratedVirtualImageBatch:
+    return GeneratedVirtualImageBatch(
+        names=tuple(image_names),
+        records_by_name=read_image_records_by_name(database_path, image_names),
+    )
 
 
 def generated_virtual_image_names(
@@ -1273,6 +1297,13 @@ def run_panorama_reconstruction(
         "render_virtual_views",
         stage_started_at,
     )
+    generated_image_names = generated_virtual_image_names(
+        input_image_path,
+        panorama_paths,
+        views,
+        output_options,
+        new_image_prefix,
+    )
 
     stage_started_at = time.perf_counter()
     seed_camera_ids = (
@@ -1308,19 +1339,9 @@ def run_panorama_reconstruction(
     )
 
     stage_started_at = time.perf_counter()
-    generated_records = (
-        None
-        if seed_camera_ids is None
-        else read_image_records_by_name(
-            paths["database"],
-            generated_virtual_image_names(
-                input_image_path,
-                panorama_paths,
-                views,
-                output_options,
-                new_image_prefix,
-            ),
-        )
+    generated_image_batch = read_generated_virtual_image_batch(
+        paths["database"],
+        generated_image_names,
     )
     if seed_camera_ids is not None:
         assign_camera_ids_by_prefix(paths["database"], seed_camera_ids)
@@ -1331,7 +1352,7 @@ def run_panorama_reconstruction(
         with pycolmap_module.Database.open(paths["database"]) as database:
             pycolmap_module.apply_rig_config([rig_config], database)
     else:
-        if generated_records is None or seed_camera_ids is None:
+        if seed_camera_ids is None:
             raise AssertionError(
                 "seeded reconstruction is missing generated image data"
             )
@@ -1343,7 +1364,11 @@ def run_panorama_reconstruction(
             output_options=output_options,
             relative_name_prefix=new_image_prefix,
             seed_camera_ids=seed_camera_ids,
-            generated_records=generated_records,
+            generated_records=generated_image_batch.records_by_name,
+        )
+        generated_image_batch = read_generated_virtual_image_batch(
+            paths["database"],
+            generated_image_names,
         )
     record_elapsed_stage(
         elapsed_seconds_by_stage,
@@ -1430,6 +1455,7 @@ def run_panorama_reconstruction(
         feature_health=feature_health,
         image_limit=image_limit,
         new_image_prefix=new_image_prefix,
+        generated_image_batch=generated_image_batch,
         initial_session=initial_session,
         initial_metadata=initial_metadata,
         reconstructions=reconstructions,
@@ -1541,12 +1567,15 @@ def build_panorama_report(
     feature_health: dict[str, Any],
     image_limit: int | None,
     new_image_prefix: Path | None,
+    generated_image_batch: GeneratedVirtualImageBatch,
     initial_session: InitialPanoramaSession | None,
     initial_metadata: dict[str, Any] | None,
     reconstructions: dict[int, Any],
     best_model_id: int,
     best_reconstruction: Any,
 ) -> dict[str, Any]:
+    database_report = read_database_stats(paths["database"])
+    new_database_image_count = len(generated_image_batch.names)
     model_stats = {
         str(model_id): panorama_reconstruction_stats(reconstruction)
         for model_id, reconstruction in sorted(reconstructions.items())
@@ -1625,10 +1654,19 @@ def build_panorama_report(
         "panorama_count": panorama_count,
         "virtual_camera_count": len(views),
         "generated_image_count": panorama_count * len(views),
+        "database_image_count": database_report["images"],
+        "new_database_image_count": new_database_image_count,
+        "old_database_image_count": max(
+            0,
+            database_report["images"] - new_database_image_count,
+        ),
+        "new_database_image_ids": generated_image_batch.image_ids,
+        "new_database_camera_ids": generated_image_batch.camera_ids,
+        "new_database_image_names": list(generated_image_batch.names),
         "masks": masks_report,
         "features_by_virtual_camera": feature_report,
         "feature_health": feature_health,
-        "database": read_database_stats(paths["database"]),
+        "database": database_report,
         "model_count": len(reconstructions),
         "best_model_id": best_model_id,
         "models": model_stats,

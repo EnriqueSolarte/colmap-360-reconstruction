@@ -11,12 +11,14 @@ from PIL import Image
 from colmap.camera import camera_from_fov
 from colmap.panorama_reconstruct import (
     FeaturePipelineOptions,
+    GeneratedVirtualImageBatch,
     PanoramaRenderOptions,
     PipelineExecutionOptions,
     VirtualImageOutputOptions,
     assign_camera_ids_by_prefix,
     build_rig_remap_maps,
     build_initial_session_report,
+    build_panorama_report,
     build_rig_views,
     configure_ssl_cert_file,
     copy_initial_panorama_session,
@@ -33,6 +35,7 @@ from colmap.panorama_reconstruct import (
     mask_statistics,
     match_features,
     read_camera_ids_by_prefix,
+    read_generated_virtual_image_batch,
     read_image_records_by_name,
     resolve_initial_panorama_session,
     run_incremental_mapping,
@@ -360,6 +363,157 @@ def test_seeded_camera_ids_are_reused_by_virtual_camera_prefix(tmp_path) -> None
         ("pano_camera01/old.png", 2),
         ("pano_camera00/img-0002_new.png", 1),
         ("pano_camera01/img-0002_new.png", 2),
+    ]
+
+
+def test_generated_virtual_image_batch_preserves_database_identity(tmp_path) -> None:
+    database_path = tmp_path / "database.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
+            [
+                (7, "pano_camera00/img-0002_shelf.png", 1),
+                (9, "pano_camera01/img-0002_shelf.png", 2),
+                (3, "pano_camera00/old.png", 1),
+            ],
+        )
+
+    batch = read_generated_virtual_image_batch(
+        database_path,
+        (
+            "pano_camera00/img-0002_shelf.png",
+            "pano_camera01/img-0002_shelf.png",
+        ),
+    )
+
+    assert batch.names == (
+        "pano_camera00/img-0002_shelf.png",
+        "pano_camera01/img-0002_shelf.png",
+    )
+    assert batch.image_ids == [7, 9]
+    assert batch.camera_ids == [1, 2]
+
+
+def test_panorama_report_includes_new_database_images(tmp_path) -> None:
+    class FakeReconstruction:
+        def num_images(self):
+            return 2
+
+        def num_reg_images(self):
+            return 2
+
+        def num_points3D(self):
+            return 5
+
+        def compute_num_observations(self):
+            return 10
+
+        def compute_mean_observations_per_reg_image(self):
+            return 5.0
+
+        def compute_mean_track_length(self):
+            return 2.0
+
+        def compute_mean_reprojection_error(self):
+            return 0.5
+
+        def num_frames(self):
+            return 1
+
+        def num_reg_frames(self):
+            return 1
+
+    database_path = tmp_path / "database.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
+            [
+                (1, "pano_camera00/old.png", 1),
+                (2, "pano_camera01/old.png", 2),
+                (7, "pano_camera00/img-0002_shelf.png", 1),
+                (9, "pano_camera01/img-0002_shelf.png", 2),
+            ],
+        )
+    paths = {
+        "workspace": tmp_path,
+        "image_dir": tmp_path / "images",
+        "mask_dir": tmp_path / "masks",
+        "database": database_path,
+        "sparse": tmp_path / "sparse",
+        "initial_sparse": tmp_path / "initial_sparse",
+        "best_sparse": tmp_path / "sparse_best",
+        "raw_ply": tmp_path / "cloud_colmap_raw.ply",
+        "rig_metadata": tmp_path / "panorama_rig_config.json",
+    }
+    options = PanoramaRenderOptions(
+        num_yaw_steps=2,
+        pitches=(0.0,),
+        width=8,
+        height=8,
+        fov_x=pi / 2,
+        fov_y=pi / 2,
+    )
+    views = build_rig_views(options)
+    batch = GeneratedVirtualImageBatch(
+        names=(
+            "pano_camera00/img-0002_shelf.png",
+            "pano_camera01/img-0002_shelf.png",
+        ),
+        records_by_name={
+            "pano_camera00/img-0002_shelf.png": (7, 1),
+            "pano_camera01/img-0002_shelf.png": (9, 2),
+        },
+    )
+
+    report = build_panorama_report(
+        pycolmap_version="test",
+        input_image_path=tmp_path / "img-0002",
+        paths=paths,
+        camera=camera_from_fov(8, 8, pi / 2, pi / 2),
+        views=views,
+        panorama_count=1,
+        matcher="sequential",
+        overlap=15,
+        loop_detection=True,
+        vocab_tree_path=None,
+        ssl_cert_file=None,
+        feature_options=FeaturePipelineOptions(),
+        output_options=VirtualImageOutputOptions(save_workers=1),
+        execution={
+            "requested_device": "auto",
+            "resolved_device": "cpu",
+            "cuda_available": False,
+            "gpu_index": "-1",
+            "gpu_bundle_adjustment": False,
+            "bundle_adjustment_gpu_index": "-1",
+        },
+        masks_report={},
+        feature_report={},
+        feature_health={},
+        image_limit=None,
+        new_image_prefix=Path("img-0002"),
+        generated_image_batch=batch,
+        initial_session=None,
+        initial_metadata=None,
+        reconstructions={0: FakeReconstruction()},
+        best_model_id=0,
+        best_reconstruction=FakeReconstruction(),
+    )
+
+    assert report["database_image_count"] == 4
+    assert report["old_database_image_count"] == 2
+    assert report["new_database_image_count"] == 2
+    assert report["new_database_image_ids"] == [7, 9]
+    assert report["new_database_camera_ids"] == [1, 2]
+    assert report["new_database_image_names"] == [
+        "pano_camera00/img-0002_shelf.png",
+        "pano_camera01/img-0002_shelf.png",
     ]
 
 
