@@ -81,6 +81,17 @@ class PipelineExecutionOptions:
     gpu_bundle_adjustment: bool = True
 
 
+@dataclass(frozen=True)
+class InitialPanoramaSession:
+    workspace: Path
+    model_path: Path
+    image_dir: Path
+    mask_dir: Path
+    database_path: Path
+    rig_metadata_path: Path
+    report_path: Path | None = None
+
+
 def default_render_options(render_type: str) -> PanoramaRenderOptions:
     if render_type == "overlapping":
         return PanoramaRenderOptions(
@@ -132,6 +143,357 @@ def configure_ssl_cert_file(ssl_cert_file: Path | None = None) -> None:
     default_cert_file = Path("/etc/ssl/certs/ca-certificates.crt")
     if default_cert_file.is_file():
         os.environ["SSL_CERT_FILE"] = str(default_cert_file)
+
+
+def resolve_initial_panorama_session(path: Path) -> InitialPanoramaSession:
+    if not path.is_dir():
+        raise FileNotFoundError(
+            f"Initial panorama session path is not a directory: {path}"
+        )
+
+    if (path / "panorama_rig_config.json").is_file():
+        workspace = path
+        model_path = workspace / "sparse_best"
+    elif (path.parent / "panorama_rig_config.json").is_file():
+        workspace = path.parent
+        model_path = path
+    else:
+        raise ValueError(
+            "Initial model must come from a previous colmap-panorama-reconstruct "
+            "workspace, or its sparse_best model directory."
+        )
+
+    session = InitialPanoramaSession(
+        workspace=workspace,
+        model_path=model_path,
+        image_dir=workspace / "images",
+        mask_dir=workspace / "masks",
+        database_path=workspace / "database.db",
+        rig_metadata_path=workspace / "panorama_rig_config.json",
+        report_path=workspace / "panorama_rig_report.json",
+    )
+    validate_initial_panorama_session(session)
+    return session
+
+
+def validate_initial_panorama_session(session: InitialPanoramaSession) -> None:
+    if not session.rig_metadata_path.is_file():
+        raise FileNotFoundError(
+            "Initial panorama session is missing panorama_rig_config.json: "
+            f"{session.rig_metadata_path}"
+        )
+    if not session.database_path.is_file():
+        raise FileNotFoundError(
+            f"Initial panorama session is missing database.db: {session.database_path}"
+        )
+    if not session.image_dir.is_dir():
+        raise FileNotFoundError(
+            f"Initial panorama session is missing images/: {session.image_dir}"
+        )
+    if not session.mask_dir.is_dir():
+        raise FileNotFoundError(
+            f"Initial panorama session is missing masks/: {session.mask_dir}"
+        )
+    if not is_colmap_model_dir(session.model_path):
+        raise FileNotFoundError(
+            "Initial panorama session is missing a readable COLMAP model at "
+            f"{session.model_path}"
+        )
+
+
+def is_colmap_model_dir(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    required_names = ("cameras", "images", "points3D")
+    return all(
+        any((path / f"{name}.{extension}").is_file() for extension in ("bin", "txt"))
+        for name in required_names
+    )
+
+
+def validate_initial_session_compatible(
+    session: InitialPanoramaSession,
+    render_options: PanoramaRenderOptions,
+    output_options: VirtualImageOutputOptions,
+) -> dict[str, Any]:
+    metadata = json.loads(session.rig_metadata_path.read_text(encoding="utf-8"))
+    previous_render = metadata.get("render_options", {})
+    expected = {
+        "num_yaw_steps": render_options.num_yaw_steps,
+        "pitches": list(render_options.pitches),
+        "width": render_options.width,
+        "height": render_options.height,
+        "fov_x": render_options.fov_x,
+        "fov_y": render_options.fov_y,
+        "interpolation": render_options.interpolation,
+        "virtual_image_format": output_options.image_format,
+    }
+    mismatches = {
+        key: {"previous": previous_render.get(key), "current": value}
+        for key, value in expected.items()
+        if not metadata_values_match(previous_render.get(key), value)
+    }
+    if mismatches:
+        raise ValueError(
+            "Initial panorama session render settings do not match the current "
+            f"run: {mismatches}"
+        )
+    return metadata
+
+
+def metadata_values_match(previous: Any, current: Any) -> bool:
+    if isinstance(current, float):
+        return previous is not None and abs(float(previous) - current) <= 1e-12
+    if isinstance(current, list) and all(isinstance(value, float) for value in current):
+        if previous is None or len(previous) != len(current):
+            return False
+        return all(
+            abs(float(left) - right) <= 1e-12
+            for left, right in zip(previous, current)
+        )
+    return previous == current
+
+
+def copy_initial_panorama_session(
+    session: InitialPanoramaSession,
+    paths: dict[str, Path],
+    _pycolmap_module: Any | None = None,
+) -> None:
+    shutil.copytree(session.image_dir, paths["image_dir"], dirs_exist_ok=True)
+    shutil.copytree(session.mask_dir, paths["mask_dir"], dirs_exist_ok=True)
+    shutil.copy2(session.database_path, paths["database"])
+    if paths["initial_sparse"].exists():
+        shutil.rmtree(paths["initial_sparse"])
+    copy_colmap_model(session.model_path, paths["initial_sparse"])
+
+
+def copy_colmap_model(source: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in ("cameras", "images", "points3D", "rigs", "frames"):
+        for extension in ("bin", "txt"):
+            source_file = source / f"{name}.{extension}"
+            if source_file.is_file():
+                shutil.copy2(source_file, destination / source_file.name)
+
+
+def read_camera_ids_by_prefix(
+    database_path: Path,
+    views: Sequence[PanoramaRigView],
+) -> dict[str, int]:
+    camera_ids: dict[str, int] = {}
+    with sqlite3.connect(database_path) as connection:
+        for view in views:
+            prefix = view.image_prefix
+            rows = connection.execute(
+                """
+                SELECT DISTINCT camera_id
+                FROM images
+                WHERE name LIKE ?
+                ORDER BY camera_id
+                """,
+                (f"{prefix}%",),
+            ).fetchall()
+            if len(rows) != 1:
+                raise ValueError(
+                    f"Expected one existing camera_id for prefix {prefix}, "
+                    f"found {[row[0] for row in rows]}"
+                )
+            camera_ids[prefix] = int(rows[0][0])
+    return camera_ids
+
+
+def assign_camera_ids_by_prefix(
+    database_path: Path,
+    camera_ids: dict[str, int],
+) -> None:
+    with sqlite3.connect(database_path) as connection:
+        for prefix, camera_id in camera_ids.items():
+            connection.execute(
+                """
+                UPDATE images
+                SET camera_id = ?
+                WHERE name LIKE ?
+                """,
+                (camera_id, f"{prefix}%"),
+            )
+
+
+def read_image_records_by_name(
+    database_path: Path,
+    image_names: Sequence[str],
+) -> dict[str, tuple[int, int]]:
+    records: dict[str, tuple[int, int]] = {}
+    with sqlite3.connect(database_path) as connection:
+        for image_name in image_names:
+            row = connection.execute(
+                """
+                SELECT image_id, camera_id
+                FROM images
+                WHERE name = ?
+                """,
+                (image_name,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Expected image in database: {image_name}")
+            records[image_name] = (int(row[0]), int(row[1]))
+    return records
+
+
+def generated_virtual_image_names(
+    input_image_path: Path,
+    panorama_paths: Sequence[Path],
+    views: Sequence[PanoramaRigView],
+    output_options: VirtualImageOutputOptions,
+    relative_name_prefix: Path | None,
+) -> list[str]:
+    names: list[str] = []
+    for panorama_path in panorama_paths:
+        relative_name = prefixed_virtual_image_relative_name(
+            input_image_path,
+            panorama_path,
+            output_options.image_format,
+            relative_name_prefix,
+        ).as_posix()
+        names.extend(f"{view.image_prefix}{relative_name}" for view in views)
+    return names
+
+
+def replace_generated_frames_with_seed_rig_frames(
+    database_path: Path,
+    *,
+    input_image_path: Path,
+    panorama_paths: Sequence[Path],
+    views: Sequence[PanoramaRigView],
+    output_options: VirtualImageOutputOptions,
+    relative_name_prefix: Path | None,
+    seed_camera_ids: dict[str, int],
+    generated_records: dict[str, tuple[int, int]],
+) -> None:
+    generated_image_ids = {
+        image_id for image_id, _camera_id in generated_records.values()
+    }
+    generated_camera_ids = {
+        camera_id for _image_id, camera_id in generated_records.values()
+    } - set(seed_camera_ids.values())
+    with sqlite3.connect(database_path) as connection:
+        seed_rig_id = find_seed_rig_id(connection, set(seed_camera_ids.values()))
+        cleanup_generated_singleton_rigs(
+            connection,
+            generated_image_ids,
+            generated_camera_ids,
+            seed_rig_id,
+        )
+        for panorama_path in panorama_paths:
+            relative_name = prefixed_virtual_image_relative_name(
+                input_image_path,
+                panorama_path,
+                output_options.image_format,
+                relative_name_prefix,
+            ).as_posix()
+            frame_images = []
+            for view in views:
+                image_name = f"{view.image_prefix}{relative_name}"
+                image_id, _camera_id = generated_records[image_name]
+                frame_images.append((image_id, seed_camera_ids[view.image_prefix]))
+            cursor = connection.execute(
+                "INSERT INTO frames(rig_id) VALUES (?)",
+                (seed_rig_id,),
+            )
+            frame_id = int(cursor.lastrowid)
+            connection.executemany(
+                """
+                INSERT INTO frame_data(frame_id, data_id, sensor_id, sensor_type)
+                VALUES (?, ?, ?, 0)
+                """,
+                [
+                    (frame_id, image_id, camera_id)
+                    for image_id, camera_id in frame_images
+                ],
+            )
+
+
+def find_seed_rig_id(
+    connection: sqlite3.Connection,
+    seed_camera_ids: set[int],
+) -> int:
+    rows = connection.execute(
+        """
+        SELECT rig_id, ref_sensor_id
+        FROM rigs
+        WHERE ref_sensor_type = 0
+        ORDER BY rig_id
+        """
+    ).fetchall()
+    for rig_id, ref_sensor_id in rows:
+        sensor_rows = connection.execute(
+            """
+            SELECT sensor_id
+            FROM rig_sensors
+            WHERE rig_id = ? AND sensor_type = 0
+            """,
+            (rig_id,),
+        ).fetchall()
+        sensor_ids = {int(ref_sensor_id)} | {int(row[0]) for row in sensor_rows}
+        if sensor_ids == seed_camera_ids:
+            return int(rig_id)
+    raise ValueError(
+        "Initial session database does not contain a rig matching the seed cameras"
+    )
+
+
+def cleanup_generated_singleton_rigs(
+    connection: sqlite3.Connection,
+    generated_image_ids: set[int],
+    generated_camera_ids: set[int],
+    seed_rig_id: int,
+) -> None:
+    if not generated_image_ids:
+        return
+    placeholders = ",".join("?" for _value in generated_image_ids)
+    frame_rows = connection.execute(
+        f"""
+        SELECT DISTINCT frame_id
+        FROM frame_data
+        WHERE data_id IN ({placeholders})
+        """,
+        tuple(generated_image_ids),
+    ).fetchall()
+    frame_ids = {int(row[0]) for row in frame_rows}
+    if frame_ids:
+        frame_placeholders = ",".join("?" for _value in frame_ids)
+        rig_rows = connection.execute(
+            f"""
+            SELECT DISTINCT rig_id
+            FROM frames
+            WHERE frame_id IN ({frame_placeholders})
+            """,
+            tuple(frame_ids),
+        ).fetchall()
+        rig_ids = {int(row[0]) for row in rig_rows} - {seed_rig_id}
+        connection.execute(
+            f"DELETE FROM frame_data WHERE frame_id IN ({frame_placeholders})",
+            tuple(frame_ids),
+        )
+        connection.execute(
+            f"DELETE FROM frames WHERE frame_id IN ({frame_placeholders})",
+            tuple(frame_ids),
+        )
+        if rig_ids:
+            rig_placeholders = ",".join("?" for _value in rig_ids)
+            connection.execute(
+                f"DELETE FROM rig_sensors WHERE rig_id IN ({rig_placeholders})",
+                tuple(rig_ids),
+            )
+            connection.execute(
+                f"DELETE FROM rigs WHERE rig_id IN ({rig_placeholders})",
+                tuple(rig_ids),
+            )
+    if generated_camera_ids:
+        camera_placeholders = ",".join("?" for _value in generated_camera_ids)
+        connection.execute(
+            f"DELETE FROM cameras WHERE camera_id IN ({camera_placeholders})",
+            tuple(generated_camera_ids),
+        )
 
 
 def panorama_image_paths(input_image_path: Path) -> list[Path]:
@@ -199,6 +561,8 @@ def render_panorama_rig_images(
     *,
     output_options: VirtualImageOutputOptions = VirtualImageOutputOptions(),
     image_limit: int | None = None,
+    fail_on_existing: bool = False,
+    relative_name_prefix: Path | None = None,
 ) -> tuple[list[Path], ColmapCamera, list[PanoramaRigView]]:
     validate_virtual_image_output_options(output_options)
     panorama_paths = panorama_image_paths(input_image_path)
@@ -211,6 +575,16 @@ def render_panorama_rig_images(
     camera = camera_from_fov(options.width, options.height, options.fov_x, options.fov_y)
     masks = rig_view_masks(camera, views)
     validate_rig_masks(camera, views, masks)
+    if fail_on_existing:
+        validate_virtual_views_do_not_exist(
+            input_image_path,
+            output_image_dir,
+            mask_dir,
+            panorama_paths,
+            views,
+            output_options,
+            relative_name_prefix,
+        )
 
     first_panorama = read_panorama_image(panorama_paths[0])
     source_shape = first_panorama.shape[:2]
@@ -237,9 +611,11 @@ def render_panorama_rig_images(
                     f"{panorama.shape[0]}; expected {source_shape[1]}x{source_shape[0]}"
                 )
             padded_panorama = pad_equirectangular_image(panorama)
-            relative_name = virtual_image_relative_name(
-                panorama_path.relative_to(input_image_path),
+            relative_name = prefixed_virtual_image_relative_name(
+                input_image_path,
+                panorama_path,
                 output_options.image_format,
+                relative_name_prefix,
             )
             futures = []
             for view in views:
@@ -265,6 +641,42 @@ def render_panorama_rig_images(
                 progress.update()
 
     return panorama_paths, camera, views
+
+
+def validate_virtual_views_do_not_exist(
+    input_image_path: Path,
+    output_image_dir: Path,
+    mask_dir: Path,
+    panorama_paths: Sequence[Path],
+    views: Sequence[PanoramaRigView],
+    output_options: VirtualImageOutputOptions,
+    relative_name_prefix: Path | None = None,
+) -> None:
+    collisions = []
+    for panorama_path in panorama_paths:
+        relative_name = prefixed_virtual_image_relative_name(
+            input_image_path,
+            panorama_path,
+            output_options.image_format,
+            relative_name_prefix,
+        )
+        for view in views:
+            image_path = output_image_dir / view.image_prefix / relative_name
+            mask_path = mask_dir / f"{view.image_prefix}{relative_name}.png"
+            if image_path.exists():
+                collisions.append(str(image_path))
+            if mask_path.exists():
+                collisions.append(str(mask_path))
+            if len(collisions) >= 5:
+                raise FileExistsError(
+                    "New panorama views would overwrite previous session files: "
+                    f"{collisions}"
+                )
+    if collisions:
+        raise FileExistsError(
+            "New panorama views would overwrite previous session files: "
+            f"{collisions}"
+        )
 
 
 def validate_virtual_image_output_options(options: VirtualImageOutputOptions) -> None:
@@ -346,6 +758,22 @@ def virtual_image_relative_name(relative_path: Path, image_format: str) -> Path:
     return relative_path.with_suffix(suffix)
 
 
+def prefixed_virtual_image_relative_name(
+    input_image_path: Path,
+    panorama_path: Path,
+    image_format: str,
+    relative_name_prefix: Path | None = None,
+) -> Path:
+    relative_name = virtual_image_relative_name(
+        panorama_path.relative_to(input_image_path),
+        image_format,
+    )
+    if relative_name_prefix is None:
+        return relative_name
+    prefix = relative_name_prefix.as_posix().strip("/").replace("/", "_")
+    return relative_name.with_name(f"{prefix}_{relative_name.name}")
+
+
 def save_virtual_view(
     image: np.ndarray,
     output_path: Path,
@@ -375,11 +803,14 @@ def read_rendered_rig_masks(
     panorama_path: Path,
     views: Sequence[PanoramaRigView],
     output_options: VirtualImageOutputOptions = VirtualImageOutputOptions(),
+    relative_name_prefix: Path | None = None,
 ) -> dict[int, np.ndarray]:
-    relative_name = virtual_image_relative_name(
-        panorama_path.relative_to(input_image_path),
+    relative_name = prefixed_virtual_image_relative_name(
+        input_image_path,
+        panorama_path,
         output_options.image_format,
-    ).as_posix()
+        relative_name_prefix,
+    )
     masks: dict[int, np.ndarray] = {}
     for view in views:
         path = mask_dir / f"{view.image_prefix}{relative_name}.png"
@@ -540,8 +971,18 @@ def create_feature_matching_options(
     return matching_options
 
 
-def create_mapper_options(pycolmap_module: Any, execution: dict[str, Any]) -> Any:
+def create_mapper_options(
+    pycolmap_module: Any,
+    execution: dict[str, Any],
+    *,
+    continue_existing_model: bool = False,
+) -> Any:
     mapper_options = pycolmap_module.IncrementalPipelineOptions()
+    if continue_existing_model:
+        mapper_options.multiple_models = False
+        mapper_options.max_num_models = 1
+        mapper_options.fix_existing_frames = True
+        mapper_options.mapper.fix_existing_frames = True
     mapper_options.ba_refine_sensor_from_rig = False
     mapper_options.ba_refine_focal_length = False
     mapper_options.ba_refine_principal_point = False
@@ -657,6 +1098,25 @@ def match_features(
         raise ValueError("matcher must be 'sequential', 'exhaustive', or 'vocabtree'")
 
 
+def run_incremental_mapping(
+    pycolmap_module: Any,
+    paths: dict[str, Path],
+    *,
+    image_dir: Path,
+    mapper_options: Any,
+    initial_model_path: Path | None = None,
+) -> dict[int, Any]:
+    kwargs: dict[str, Any] = {"options": mapper_options}
+    if initial_model_path is not None:
+        kwargs["input_path"] = initial_model_path
+    return pycolmap_module.incremental_mapping(
+        paths["database"],
+        image_dir,
+        paths["sparse"],
+        **kwargs,
+    )
+
+
 def run_panorama_reconstruction(
     input_image_path: Path,
     workspace: Path,
@@ -671,13 +1131,33 @@ def run_panorama_reconstruction(
     output_options: VirtualImageOutputOptions = VirtualImageOutputOptions(),
     execution_options: PipelineExecutionOptions = PipelineExecutionOptions(),
     image_limit: int | None = None,
+    initial_session_path: Path | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     pycolmap_module = require_pycolmap()
     pycolmap_module.set_random_seed(0)
     configure_ssl_cert_file(ssl_cert_file)
     execution = resolve_pipeline_execution(pycolmap_module, execution_options)
+    initial_session = (
+        None
+        if initial_session_path is None
+        else resolve_initial_panorama_session(initial_session_path)
+    )
+    initial_metadata = (
+        None
+        if initial_session is None
+        else validate_initial_session_compatible(
+            initial_session,
+            render_options,
+            output_options,
+        )
+    )
     paths = panorama_workspace_paths(workspace)
+    if (
+        initial_session is not None
+        and workspace.resolve() == initial_session.workspace.resolve()
+    ):
+        raise ValueError("Workspace must be different from the initial session workspace")
     if workspace.exists() and overwrite:
         shutil.rmtree(workspace)
     workspace.mkdir(parents=True, exist_ok=True)
@@ -686,6 +1166,11 @@ def run_panorama_reconstruction(
     paths["sparse"].mkdir(parents=True, exist_ok=True)
     if paths["database"].exists():
         raise FileExistsError(f"{paths['database']} already exists. Pass --overwrite.")
+    if initial_session is not None:
+        copy_initial_panorama_session(initial_session, paths, pycolmap_module)
+    new_image_prefix = (
+        None if initial_session is None else Path(input_image_path.resolve().name)
+    )
 
     panorama_paths, camera, views = render_panorama_rig_images(
         input_image_path=input_image_path,
@@ -694,6 +1179,8 @@ def run_panorama_reconstruction(
         options=render_options,
         output_options=output_options,
         image_limit=image_limit,
+        fail_on_existing=initial_session is not None,
+        relative_name_prefix=new_image_prefix,
     )
     masks = read_rendered_rig_masks(
         paths["mask_dir"],
@@ -701,6 +1188,7 @@ def run_panorama_reconstruction(
         panorama_paths[0],
         views,
         output_options,
+        relative_name_prefix=new_image_prefix,
     )
     validate_rig_masks(camera, views, masks)
     masks_report = mask_statistics(masks)
@@ -713,6 +1201,11 @@ def run_panorama_reconstruction(
         masks_report,
         output_options,
         image_limit=image_limit,
+    )
+    seed_camera_ids = (
+        None
+        if initial_session is None
+        else read_camera_ids_by_prefix(paths["database"], views)
     )
 
     extraction_options = create_feature_extraction_options(
@@ -729,11 +1222,43 @@ def run_panorama_reconstruction(
         extraction_options=extraction_options,
         device=execution["device"],
     )
+    generated_records = (
+        None
+        if seed_camera_ids is None
+        else read_image_records_by_name(
+            paths["database"],
+            generated_virtual_image_names(
+                input_image_path,
+                panorama_paths,
+                views,
+                output_options,
+                new_image_prefix,
+            ),
+        )
+    )
+    if seed_camera_ids is not None:
+        assign_camera_ids_by_prefix(paths["database"], seed_camera_ids)
     feature_report = read_feature_stats_by_camera(paths["database"])
     feature_health = feature_health_summary(views, feature_report)
     rig_config = create_rig_config(pycolmap_module, camera, views)
-    with pycolmap_module.Database.open(paths["database"]) as database:
-        pycolmap_module.apply_rig_config([rig_config], database)
+    if initial_session is None:
+        with pycolmap_module.Database.open(paths["database"]) as database:
+            pycolmap_module.apply_rig_config([rig_config], database)
+    else:
+        if generated_records is None or seed_camera_ids is None:
+            raise AssertionError(
+                "seeded reconstruction is missing generated image data"
+            )
+        replace_generated_frames_with_seed_rig_frames(
+            paths["database"],
+            input_image_path=input_image_path,
+            panorama_paths=panorama_paths,
+            views=views,
+            output_options=output_options,
+            relative_name_prefix=new_image_prefix,
+            seed_camera_ids=seed_camera_ids,
+            generated_records=generated_records,
+        )
 
     matching_options = create_feature_matching_options(
         pycolmap_module,
@@ -752,12 +1277,19 @@ def run_panorama_reconstruction(
         device=execution["device"],
     )
 
-    mapper_options = create_mapper_options(pycolmap_module, execution)
-    reconstructions = pycolmap_module.incremental_mapping(
-        paths["database"],
-        paths["image_dir"],
-        paths["sparse"],
-        options=mapper_options,
+    mapper_options = create_mapper_options(
+        pycolmap_module,
+        execution,
+        continue_existing_model=initial_session is not None,
+    )
+    reconstructions = run_incremental_mapping(
+        pycolmap_module,
+        paths,
+        image_dir=paths["image_dir"],
+        mapper_options=mapper_options,
+        initial_model_path=None
+        if initial_session is None
+        else paths["initial_sparse"],
     )
     if not reconstructions:
         raise RuntimeError("COLMAP did not produce any sparse reconstruction")
@@ -786,6 +1318,9 @@ def run_panorama_reconstruction(
         feature_report=feature_report,
         feature_health=feature_health,
         image_limit=image_limit,
+        new_image_prefix=new_image_prefix,
+        initial_session=initial_session,
+        initial_metadata=initial_metadata,
         reconstructions=reconstructions,
         best_model_id=best_model_id,
         best_reconstruction=best_reconstruction,
@@ -801,6 +1336,7 @@ def panorama_workspace_paths(workspace: Path) -> dict[str, Path]:
         "mask_dir": workspace / "masks",
         "database": workspace / "database.db",
         "sparse": workspace / "sparse",
+        "initial_sparse": workspace / "initial_sparse",
         "best_sparse": workspace / "sparse_best",
         "raw_ply": workspace / "cloud_colmap_raw.ply",
         "report": workspace / "panorama_rig_report.json",
@@ -872,6 +1408,9 @@ def build_panorama_report(
     feature_report: dict[str, dict[str, float | int]],
     feature_health: dict[str, Any],
     image_limit: int | None,
+    new_image_prefix: Path | None,
+    initial_session: InitialPanoramaSession | None,
+    initial_metadata: dict[str, Any] | None,
     reconstructions: dict[int, Any],
     best_model_id: int,
     best_reconstruction: Any,
@@ -894,9 +1433,17 @@ def build_panorama_report(
         "mask_dir": str(paths["mask_dir"]),
         "database_path": str(paths["database"]),
         "sparse_path": str(paths["sparse"]),
+        "initial_sparse_path": (
+            None if initial_session is None else str(paths["initial_sparse"])
+        ),
         "best_sparse_path": str(paths["best_sparse"]),
         "raw_ply_path": str(paths["raw_ply"]),
         "rig_metadata_path": str(paths["rig_metadata"]),
+        "initial_session": build_initial_session_report(
+            initial_session,
+            paths,
+            initial_metadata,
+        ),
         "camera": camera.report(),
         "options": {
             "matcher": matcher,
@@ -920,6 +1467,9 @@ def build_panorama_report(
             "image_save_workers": output_options.save_workers,
             "render_backend": "precomputed_opencv_remap",
             "image_limit": image_limit,
+            "new_virtual_image_prefix": (
+                None if new_image_prefix is None else new_image_prefix.as_posix()
+            ),
             "requested_device": execution["requested_device"],
             "resolved_device": execution["resolved_device"],
             "cuda_available": execution["cuda_available"],
@@ -929,6 +1479,10 @@ def build_panorama_report(
                 "bundle_adjustment_gpu_index"
             ],
             "camera_mode": "PER_FOLDER",
+            "reuse_initial_camera_ids_by_prefix": initial_session is not None,
+            "continue_existing_model": initial_session is not None,
+            "multiple_models": initial_session is None,
+            "fix_existing_frames": initial_session is not None,
             "ba_refine_sensor_from_rig": False,
             "ba_refine_focal_length": False,
             "ba_refine_principal_point": False,
@@ -947,6 +1501,37 @@ def build_panorama_report(
         "best_model_id": best_model_id,
         "models": model_stats,
         "best_model": panorama_reconstruction_stats(best_reconstruction),
+    }
+
+
+def build_initial_session_report(
+    initial_session: InitialPanoramaSession | None,
+    paths: dict[str, Path],
+    initial_metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if initial_session is None:
+        return {"enabled": False}
+    previous_views = [] if initial_metadata is None else initial_metadata.get("views", [])
+    return {
+        "enabled": True,
+        "mode": "previous_colmap_panorama_reconstruct_session",
+        "workspace": str(initial_session.workspace),
+        "model_path": str(initial_session.model_path),
+        "database_path": str(initial_session.database_path),
+        "image_dir": str(initial_session.image_dir),
+        "mask_dir": str(initial_session.mask_dir),
+        "rig_metadata_path": str(initial_session.rig_metadata_path),
+        "report_path": (
+            None
+            if initial_session.report_path is None
+            or not initial_session.report_path.is_file()
+            else str(initial_session.report_path)
+        ),
+        "copied_model_path": str(paths["initial_sparse"]),
+        "copied_model_preserves_rig_frames": True,
+        "existing_camera_poses_refinable": True,
+        "intrinsics_refinable": False,
+        "virtual_camera_count": len(previous_views),
     }
 
 
@@ -1185,6 +1770,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Use only the first N sorted panoramas for smoke testing.",
     )
     parser.add_argument(
+        "--initial-session",
+        type=Path,
+        default=None,
+        help=(
+            "Previous colmap-panorama-reconstruct workspace, or its sparse_best "
+            "model directory, to use as the initial map."
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Delete and rebuild the panorama-rig workspace.",
@@ -1212,6 +1806,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--jpeg-quality must be between 1 and 100")
     if args.image_save_workers <= 0:
         parser.error("--image-save-workers must be positive")
+    if args.initial_session is not None and not args.initial_session.is_dir():
+        parser.error(
+            f"--initial-session must be an existing directory: {args.initial_session}"
+        )
     if args.vocab_tree_path is not None and not args.vocab_tree_path.is_file():
         parser.error(f"--vocab-tree-path does not exist: {args.vocab_tree_path}")
     if args.ssl_cert_file is not None and not args.ssl_cert_file.is_file():
@@ -1263,11 +1861,14 @@ def main(argv: list[str] | None = None) -> int:
             gpu_bundle_adjustment=args.gpu_bundle_adjustment,
         ),
         image_limit=args.image_limit,
+        initial_session_path=args.initial_session,
         overwrite=args.overwrite,
     )
     print(f"panoramas: {report['panorama_count']}")
     print(f"virtual cameras: {report['virtual_camera_count']}")
     print(f"generated images: {report['generated_image_count']}")
+    if report["initial_session"]["enabled"]:
+        print(f"initial session: {report['initial_session']['workspace']}")
     print(f"compute device: {report['options']['resolved_device']}")
     print(
         "virtual cameras with features: "

@@ -243,6 +243,26 @@ colmap-panorama-reconstruct \
   --overwrite
 ```
 
+Continue from a previous `colmap-panorama-reconstruct` session by passing the
+previous workspace, or its `sparse_best` model directory, as the initial map:
+
+```bash
+colmap-panorama-reconstruct \
+  --input-image-path /path/to/new-panoramas \
+  --workspace /workspace/data/colmap-panorama-continued \
+  --initial-session /workspace/data/colmap-panorama-rig \
+  --matcher sequential \
+  --overlap 15
+```
+
+The initial session must be a prior panorama-rig workspace from this command,
+not an arbitrary COLMAP or VSLAM export. The new input directory should contain
+additional panoramas. During seeded runs, newly generated virtual images are
+namespaced by the input folder name, such as `img-0001_shelf.png`, so repeated
+camera filenames from different capture folders can coexist. The current
+panorama-rig pipeline keeps virtual camera intrinsics fixed while COLMAP
+continues optimizing poses and sparse points from the previous model.
+
 Loop detection may download COLMAP's default vocabulary tree. To avoid that
 download and make runs reproducible, pass a local tree with
 `--vocab-tree-path /path/to/vocab_tree.bin`. The command automatically points

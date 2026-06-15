@@ -1,5 +1,8 @@
+import json
 import os
+import sqlite3
 from math import pi
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -11,27 +14,77 @@ from colmap.panorama_reconstruct import (
     PanoramaRenderOptions,
     PipelineExecutionOptions,
     VirtualImageOutputOptions,
+    assign_camera_ids_by_prefix,
     build_rig_remap_maps,
     build_rig_views,
     configure_ssl_cert_file,
+    copy_initial_panorama_session,
     create_feature_extraction_options,
     create_feature_matching_options,
     create_mapper_options,
     create_rig_config,
     default_render_options,
     feature_health_summary,
+    generated_virtual_image_names,
     mask_statistics,
     match_features,
+    read_camera_ids_by_prefix,
+    read_image_records_by_name,
+    resolve_initial_panorama_session,
+    run_incremental_mapping,
     parse_args,
     pad_equirectangular_image,
     read_rendered_rig_masks,
     render_remapped_view,
     render_panorama_rig_images,
+    replace_generated_frames_with_seed_rig_frames,
     resolve_pipeline_execution,
     rig_view_masks,
+    validate_initial_session_compatible,
     validate_rig_masks,
 )
 from ep_pinhole import EquirectangularToPinhole
+
+
+def create_previous_panorama_session(
+    workspace,
+    *,
+    options=None,
+    output_options=None,
+) -> None:
+    options = default_render_options("non-overlapping") if options is None else options
+    output_options = (
+        VirtualImageOutputOptions(save_workers=1)
+        if output_options is None
+        else output_options
+    )
+    workspace.mkdir()
+    (workspace / "images" / "pano_camera00").mkdir(parents=True)
+    (workspace / "masks" / "pano_camera00").mkdir(parents=True)
+    (workspace / "sparse_best").mkdir()
+    (workspace / "database.db").write_bytes(b"database")
+    for stem in ("cameras", "images", "points3D"):
+        (workspace / "sparse_best" / f"{stem}.bin").write_bytes(b"model")
+    metadata = {
+        "render_options": {
+            "num_yaw_steps": options.num_yaw_steps,
+            "pitches": list(options.pitches),
+            "width": options.width,
+            "height": options.height,
+            "fov_x": options.fov_x,
+            "fov_y": options.fov_y,
+            "interpolation": options.interpolation,
+            "virtual_image_format": output_options.image_format,
+        },
+        "views": [
+            {"index": view.index, "image_prefix": view.image_prefix}
+            for view in build_rig_views(options)
+        ],
+    }
+    (workspace / "panorama_rig_config.json").write_text(
+        json.dumps(metadata),
+        encoding="utf-8",
+    )
 
 
 def test_configure_ssl_cert_file_uses_explicit_bundle(tmp_path, monkeypatch) -> None:
@@ -42,6 +95,76 @@ def test_configure_ssl_cert_file_uses_explicit_bundle(tmp_path, monkeypatch) -> 
     configure_ssl_cert_file(cert_file)
 
     assert os.environ["SSL_CERT_FILE"] == str(cert_file)
+
+
+def test_resolve_initial_panorama_session_accepts_workspace_or_model_path(tmp_path) -> None:
+    workspace = tmp_path / "previous"
+    create_previous_panorama_session(workspace)
+
+    from_workspace = resolve_initial_panorama_session(workspace)
+    from_model = resolve_initial_panorama_session(workspace / "sparse_best")
+
+    assert from_workspace.workspace == workspace
+    assert from_workspace.model_path == workspace / "sparse_best"
+    assert from_model.workspace == workspace
+    assert from_model.model_path == workspace / "sparse_best"
+
+
+def test_resolve_initial_panorama_session_rejects_non_panorama_workspace(tmp_path) -> None:
+    model = tmp_path / "sparse_best"
+    model.mkdir()
+    for stem in ("cameras", "images", "points3D"):
+        (model / f"{stem}.bin").write_bytes(b"model")
+
+    with pytest.raises(ValueError, match="previous colmap-panorama-reconstruct"):
+        resolve_initial_panorama_session(model)
+
+
+def test_initial_session_copy_preserves_rig_and_frame_model_files(tmp_path) -> None:
+    previous = tmp_path / "previous"
+    create_previous_panorama_session(previous)
+    (previous / "sparse_best" / "rigs.bin").write_bytes(b"rigs")
+    (previous / "sparse_best" / "frames.bin").write_bytes(b"frames")
+    output = tmp_path / "output"
+    paths = {
+        "image_dir": output / "images",
+        "mask_dir": output / "masks",
+        "database": output / "database.db",
+        "initial_sparse": output / "initial_sparse",
+    }
+    paths["image_dir"].mkdir(parents=True)
+    paths["mask_dir"].mkdir(parents=True)
+    session = resolve_initial_panorama_session(previous)
+
+    copy_initial_panorama_session(session, paths)
+
+    assert (paths["initial_sparse"] / "cameras.bin").is_file()
+    assert (paths["initial_sparse"] / "images.bin").is_file()
+    assert (paths["initial_sparse"] / "points3D.bin").is_file()
+    assert (paths["initial_sparse"] / "rigs.bin").read_bytes() == b"rigs"
+    assert (paths["initial_sparse"] / "frames.bin").read_bytes() == b"frames"
+
+
+def test_initial_panorama_session_must_match_current_render_options(tmp_path) -> None:
+    workspace = tmp_path / "previous"
+    previous_options = default_render_options("non-overlapping")
+    create_previous_panorama_session(workspace, options=previous_options)
+    session = resolve_initial_panorama_session(workspace)
+    current_options = PanoramaRenderOptions(
+        num_yaw_steps=previous_options.num_yaw_steps,
+        pitches=previous_options.pitches,
+        width=previous_options.width + 1,
+        height=previous_options.height,
+        fov_x=previous_options.fov_x,
+        fov_y=previous_options.fov_y,
+    )
+
+    with pytest.raises(ValueError, match="render settings do not match"):
+        validate_initial_session_compatible(
+            session,
+            current_options,
+            VirtualImageOutputOptions(save_workers=1),
+        )
 
 
 def test_overlapping_preset_builds_fixed_virtual_camera_rig() -> None:
@@ -134,6 +257,194 @@ def test_feature_health_summary_identifies_zero_feature_camera() -> None:
     assert health["virtual_camera_count"] == 4
     assert health["virtual_cameras_with_features"] == 3
     assert health["zero_feature_virtual_cameras"] == ["pano_camera02"]
+
+
+def test_seeded_camera_ids_are_reused_by_virtual_camera_prefix(tmp_path) -> None:
+    database_path = tmp_path / "database.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
+            [
+                (1, "pano_camera00/old.png", 1),
+                (2, "pano_camera01/old.png", 2),
+            ],
+        )
+    views = build_rig_views(
+        PanoramaRenderOptions(
+            num_yaw_steps=2,
+            pitches=(0.0,),
+            width=8,
+            height=8,
+            fov_x=pi / 2,
+            fov_y=pi / 2,
+        )
+    )
+
+    camera_ids = read_camera_ids_by_prefix(database_path, views)
+    with sqlite3.connect(database_path) as connection:
+        connection.executemany(
+            "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
+            [
+                (3, "pano_camera00/img-0002_new.png", 13),
+                (4, "pano_camera01/img-0002_new.png", 14),
+            ],
+        )
+    assign_camera_ids_by_prefix(database_path, camera_ids)
+
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            "SELECT name, camera_id FROM images ORDER BY image_id"
+        ).fetchall()
+    assert rows == [
+        ("pano_camera00/old.png", 1),
+        ("pano_camera01/old.png", 2),
+        ("pano_camera00/img-0002_new.png", 1),
+        ("pano_camera01/img-0002_new.png", 2),
+    ]
+
+
+def test_seeded_generated_frames_are_moved_into_existing_rig(tmp_path) -> None:
+    database_path = tmp_path / "database.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE cameras(camera_id INTEGER PRIMARY KEY)")
+        connection.execute(
+            """
+            CREATE TABLE images(
+                image_id INTEGER PRIMARY KEY,
+                name TEXT,
+                camera_id INTEGER
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE rigs(
+                rig_id INTEGER PRIMARY KEY,
+                ref_sensor_id INTEGER,
+                ref_sensor_type INTEGER
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE rig_sensors(
+                rig_id INTEGER,
+                sensor_id INTEGER,
+                sensor_type INTEGER,
+                sensor_from_rig BLOB
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE frames(
+                frame_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rig_id INTEGER
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE frame_data(
+                frame_id INTEGER,
+                data_id INTEGER,
+                sensor_id INTEGER,
+                sensor_type INTEGER
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO cameras(camera_id) VALUES (?)",
+            [(1,), (2,), (13,), (14,)],
+        )
+        connection.executemany(
+            "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
+            [
+                (1, "pano_camera00/old.png", 1),
+                (2, "pano_camera01/old.png", 2),
+                (3, "pano_camera00/img-0001_shelf.png", 13),
+                (4, "pano_camera01/img-0001_shelf.png", 14),
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO rigs(rig_id, ref_sensor_id, ref_sensor_type) VALUES (?, ?, 0)",
+            [(13, 1), (14, 13), (15, 14)],
+        )
+        connection.execute(
+            "INSERT INTO rig_sensors(rig_id, sensor_id, sensor_type) VALUES (13, 2, 0)"
+        )
+        connection.executemany(
+            "INSERT INTO frames(frame_id, rig_id) VALUES (?, ?)",
+            [(577, 13), (625, 14), (626, 15)],
+        )
+        connection.executemany(
+            """
+            INSERT INTO frame_data(frame_id, data_id, sensor_id, sensor_type)
+            VALUES (?, ?, ?, 0)
+            """,
+            [(577, 1, 1), (577, 2, 2), (625, 3, 13), (626, 4, 14)],
+        )
+    input_dir = tmp_path / "img-0001"
+    panorama_path = input_dir / "shelf.png"
+    input_dir.mkdir()
+    panorama_path.write_bytes(b"image")
+    views = build_rig_views(
+        PanoramaRenderOptions(
+            num_yaw_steps=2,
+            pitches=(0.0,),
+            width=8,
+            height=8,
+            fov_x=pi / 2,
+            fov_y=pi / 2,
+        )
+    )
+    output_options = VirtualImageOutputOptions(save_workers=1)
+    image_names = generated_virtual_image_names(
+        input_dir,
+        [panorama_path],
+        views,
+        output_options,
+        Path("img-0001"),
+    )
+    generated_records = read_image_records_by_name(database_path, image_names)
+    assign_camera_ids_by_prefix(
+        database_path,
+        {"pano_camera00/": 1, "pano_camera01/": 2},
+    )
+
+    replace_generated_frames_with_seed_rig_frames(
+        database_path,
+        input_image_path=input_dir,
+        panorama_paths=[panorama_path],
+        views=views,
+        output_options=output_options,
+        relative_name_prefix=Path("img-0001"),
+        seed_camera_ids={"pano_camera00/": 1, "pano_camera01/": 2},
+        generated_records=generated_records,
+    )
+
+    with sqlite3.connect(database_path) as connection:
+        camera_rows = connection.execute(
+            "SELECT camera_id FROM cameras ORDER BY camera_id"
+        ).fetchall()
+        rig_rows = connection.execute(
+            "SELECT rig_id FROM rigs ORDER BY rig_id"
+        ).fetchall()
+        rows = connection.execute(
+            """
+            SELECT frames.rig_id, frame_data.data_id, frame_data.sensor_id
+            FROM frames
+            JOIN frame_data USING(frame_id)
+            WHERE frame_data.data_id IN (3, 4)
+            ORDER BY frame_data.data_id
+            """
+        ).fetchall()
+    assert camera_rows == [(1,), (2,)]
+    assert rig_rows == [(13,)]
+    assert rows == [(13, 3, 1), (13, 4, 2)]
 
 
 def test_create_rig_config_uses_pinhole_cameras() -> None:
@@ -262,6 +573,25 @@ def test_mapper_options_enable_gpu_bundle_adjustment() -> None:
     assert options.ba_refine_focal_length is False
 
 
+def test_mapper_options_disable_multiple_models_when_continuing_seed() -> None:
+    pycolmap = pytest.importorskip("pycolmap")
+    execution = {
+        "gpu_bundle_adjustment": False,
+        "bundle_adjustment_gpu_index": "-1",
+    }
+
+    options = create_mapper_options(
+        pycolmap,
+        execution,
+        continue_existing_model=True,
+    )
+
+    assert options.multiple_models is False
+    assert options.max_num_models == 1
+    assert options.fix_existing_frames is True
+    assert options.mapper.fix_existing_frames is True
+
+
 def test_precomputed_rig_remaps_match_existing_renderer() -> None:
     height, width = 24, 48
     image = np.arange(height * width * 3, dtype=np.uint8).reshape(height, width, 3)
@@ -343,10 +673,53 @@ def test_sequential_matching_expands_rig_and_enables_loop_detection(
     assert device == "cpu"
 
 
+def test_run_incremental_mapping_passes_initial_model_path(tmp_path) -> None:
+    class FakePycolmap:
+        calls = []
+
+        @classmethod
+        def incremental_mapping(cls, database_path, image_dir, sparse_dir, **kwargs):
+            cls.calls.append((database_path, image_dir, sparse_dir, kwargs))
+            return {"ok": True}
+
+    paths = {
+        "database": tmp_path / "database.db",
+        "sparse": tmp_path / "sparse",
+    }
+    initial_model = tmp_path / "initial_sparse"
+    mapper_options = object()
+
+    result = run_incremental_mapping(
+        FakePycolmap,
+        paths,
+        image_dir=tmp_path / "images",
+        mapper_options=mapper_options,
+        initial_model_path=initial_model,
+    )
+
+    assert result == {"ok": True}
+    _database, _images, _sparse, kwargs = FakePycolmap.calls[0]
+    assert kwargs["options"] is mapper_options
+    assert kwargs["input_path"] == initial_model
+
+
 def test_parse_args_accepts_image_limit(tmp_path) -> None:
-    args = parse_args(["--input-image-path", str(tmp_path), "--image-limit", "3"])
+    previous = tmp_path / "previous"
+    previous.mkdir()
+
+    args = parse_args(
+        [
+            "--input-image-path",
+            str(tmp_path),
+            "--image-limit",
+            "3",
+            "--initial-session",
+            str(previous),
+        ]
+    )
 
     assert args.image_limit == 3
+    assert args.initial_session == previous
     assert args.loop_detection is True
     assert args.feature_extractor == "sift"
     assert args.feature_matcher == "sift-bruteforce"
@@ -415,6 +788,75 @@ def test_render_panorama_rig_images_respects_image_limit(tmp_path, monkeypatch) 
         "unit": "view",
         "updates": 1,
     }
+
+
+def test_render_panorama_rig_images_rejects_existing_seeded_views(tmp_path) -> None:
+    input_dir = tmp_path / "panos"
+    image_dir = tmp_path / "images"
+    mask_dir = tmp_path / "masks"
+    input_dir.mkdir()
+    (image_dir / "pano_camera00").mkdir(parents=True)
+    (mask_dir / "pano_camera00").mkdir(parents=True)
+    image = np.zeros((16, 32, 3), dtype=np.uint8)
+    Image.fromarray(image).save(input_dir / "pano.png")
+    (image_dir / "pano_camera00" / "pano.png").write_bytes(b"old")
+    options = PanoramaRenderOptions(
+        num_yaw_steps=1,
+        pitches=(0.0,),
+        width=8,
+        height=8,
+        fov_x=pi / 2,
+        fov_y=pi / 2,
+    )
+
+    with pytest.raises(FileExistsError, match="overwrite previous session files"):
+        render_panorama_rig_images(
+            input_image_path=input_dir,
+            output_image_dir=image_dir,
+            mask_dir=mask_dir,
+            options=options,
+            fail_on_existing=True,
+        )
+
+
+def test_render_panorama_rig_images_can_namespace_seeded_views(tmp_path) -> None:
+    input_dir = tmp_path / "img-0001"
+    image_dir = tmp_path / "images"
+    mask_dir = tmp_path / "masks"
+    input_dir.mkdir()
+    (image_dir / "pano_camera00").mkdir(parents=True)
+    (mask_dir / "pano_camera00").mkdir(parents=True)
+    image = np.zeros((16, 32, 3), dtype=np.uint8)
+    Image.fromarray(image).save(input_dir / "shelf.png")
+    (image_dir / "pano_camera00" / "shelf.png").write_bytes(b"old")
+    options = PanoramaRenderOptions(
+        num_yaw_steps=1,
+        pitches=(0.0,),
+        width=8,
+        height=8,
+        fov_x=pi / 2,
+        fov_y=pi / 2,
+    )
+
+    panorama_paths, _camera, views = render_panorama_rig_images(
+        input_image_path=input_dir,
+        output_image_dir=image_dir,
+        mask_dir=mask_dir,
+        options=options,
+        fail_on_existing=True,
+        relative_name_prefix=Path(input_dir.name),
+    )
+
+    assert (image_dir / "pano_camera00" / "shelf.png").read_bytes() == b"old"
+    assert (image_dir / "pano_camera00" / "img-0001_shelf.png").exists()
+    masks = read_rendered_rig_masks(
+        mask_dir,
+        input_dir,
+        panorama_paths[0],
+        views,
+        relative_name_prefix=Path(input_dir.name),
+    )
+    assert masks[0].shape == (8, 8)
 
 
 def test_render_panorama_rig_images_supports_jpeg_output(tmp_path) -> None:
