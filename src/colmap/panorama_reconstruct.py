@@ -259,12 +259,33 @@ def copy_initial_panorama_session(
     paths: dict[str, Path],
     _pycolmap_module: Any | None = None,
 ) -> None:
-    shutil.copytree(session.image_dir, paths["image_dir"], dirs_exist_ok=True)
-    shutil.copytree(session.mask_dir, paths["mask_dir"], dirs_exist_ok=True)
+    copytree_hardlink_or_copy(session.image_dir, paths["image_dir"])
+    copytree_hardlink_or_copy(session.mask_dir, paths["mask_dir"])
     shutil.copy2(session.database_path, paths["database"])
     if paths["initial_sparse"].exists():
         shutil.rmtree(paths["initial_sparse"])
     copy_colmap_model(session.model_path, paths["initial_sparse"])
+
+
+def copytree_hardlink_or_copy(source: Path, destination: Path) -> None:
+    shutil.copytree(
+        source,
+        destination,
+        copy_function=hardlink_or_copy_file,
+        dirs_exist_ok=True,
+    )
+
+
+def hardlink_or_copy_file(source: str, destination: str) -> str:
+    try:
+        os.link(source, destination)
+    except FileExistsError:
+        if os.path.samefile(source, destination):
+            return destination
+        shutil.copy2(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+    return destination
 
 
 def copy_colmap_model(source: Path, destination: Path) -> None:

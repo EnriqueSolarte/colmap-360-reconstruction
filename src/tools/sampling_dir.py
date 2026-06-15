@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterable, List
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Create a sampled subset of images by linking files from the source "
@@ -32,10 +32,17 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help=(
             "Number of images to skip between each link. "
-            "For example, --skip 2 links every third image. Default: 0 (link every image)."
+            "For example, --skip 2 links every third image. Default: 4."
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "-i",
+        "--idx",
+        type=int,
+        default=0,
+        help="Initial image index to start sampling from. Default: 0.",
+    )
+    return parser.parse_args(argv)
 
 
 def list_images(directory: Path) -> List[Path]:
@@ -60,8 +67,8 @@ def create_symlink(src: Path, dst: Path) -> None:
         raise
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
 
     source_dir = Path(args.source).expanduser().resolve()
     dest_dir = Path(args.destination).expanduser()
@@ -72,6 +79,9 @@ def main() -> None:
     if args.skip < 0:
         raise SystemExit("--skip must be >= 0")
 
+    if args.idx < 0:
+        raise SystemExit("--idx must be >= 0")
+
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     image_files = list_images(source_dir)
@@ -79,7 +89,7 @@ def main() -> None:
         raise SystemExit(f"No files found in {source_dir}")
 
     step = args.skip + 1
-    sampled_files = image_files[::step]
+    sampled_files = image_files[args.idx::step]
 
     created = 0
     for file in sampled_files:
@@ -89,9 +99,10 @@ def main() -> None:
 
     print(
         f"Linked {created} file(s) from {source_dir} "
-        f"into {dest_dir.resolve()} with skip={args.skip}"
+        f"into {dest_dir.resolve()} with skip={args.skip}, idx={args.idx}"
     )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

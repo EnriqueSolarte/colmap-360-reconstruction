@@ -20,6 +20,7 @@ from colmap.panorama_reconstruct import (
     build_rig_views,
     configure_ssl_cert_file,
     copy_initial_panorama_session,
+    copytree_hardlink_or_copy,
     create_feature_extraction_options,
     create_feature_matching_options,
     create_mapper_options,
@@ -124,6 +125,10 @@ def test_resolve_initial_panorama_session_rejects_non_panorama_workspace(tmp_pat
 def test_initial_session_copy_preserves_rig_and_frame_model_files(tmp_path) -> None:
     previous = tmp_path / "previous"
     create_previous_panorama_session(previous)
+    previous_image = previous / "images" / "pano_camera00" / "old.png"
+    previous_mask = previous / "masks" / "pano_camera00" / "old.png.png"
+    previous_image.write_bytes(b"image")
+    previous_mask.write_bytes(b"mask")
     (previous / "sparse_best" / "rigs.bin").write_bytes(b"rigs")
     (previous / "sparse_best" / "frames.bin").write_bytes(b"frames")
     output = tmp_path / "output"
@@ -144,6 +149,36 @@ def test_initial_session_copy_preserves_rig_and_frame_model_files(tmp_path) -> N
     assert (paths["initial_sparse"] / "points3D.bin").is_file()
     assert (paths["initial_sparse"] / "rigs.bin").read_bytes() == b"rigs"
     assert (paths["initial_sparse"] / "frames.bin").read_bytes() == b"frames"
+    assert os.path.samefile(
+        previous_image,
+        paths["image_dir"] / "pano_camera00" / "old.png",
+    )
+    assert os.path.samefile(
+        previous_mask,
+        paths["mask_dir"] / "pano_camera00" / "old.png.png",
+    )
+
+
+def test_initial_session_tree_copy_falls_back_when_hardlink_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    source_file = source / "image.png"
+    source_file.write_bytes(b"image")
+
+    def raise_cross_device_link(_source, _destination):
+        raise OSError("cross-device link")
+
+    monkeypatch.setattr("colmap.panorama_reconstruct.os.link", raise_cross_device_link)
+
+    copytree_hardlink_or_copy(source, destination)
+
+    destination_file = destination / "image.png"
+    assert destination_file.read_bytes() == b"image"
+    assert not os.path.samefile(source_file, destination_file)
 
 
 def test_initial_panorama_session_must_match_current_render_options(tmp_path) -> None:

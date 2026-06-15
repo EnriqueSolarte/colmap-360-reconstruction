@@ -262,6 +262,10 @@ namespaced by the input folder name, such as `img-0001_shelf.png`, so repeated
 camera filenames from different capture folders can coexist. The current
 panorama-rig pipeline keeps virtual camera intrinsics fixed while COLMAP
 continues optimizing poses and sparse points from the previous model.
+Previous virtual images and masks are hardlinked into the new workspace by
+default to avoid duplicating large files. If hardlinks are not supported between
+the two workspace locations, the command falls back to normal copies. The
+database is always copied because continuation runs mutate it.
 
 Loop detection may download COLMAP's default vocabulary tree. To avoid that
 download and make runs reproducible, pass a local tree with
