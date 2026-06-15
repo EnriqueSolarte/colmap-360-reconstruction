@@ -1084,6 +1084,26 @@ def format_elapsed_seconds(seconds: float) -> str:
     return f"{minutes_part}m {seconds_part:02d}s"
 
 
+def record_elapsed_stage(
+    elapsed_seconds_by_stage: dict[str, float],
+    stage: str,
+    stage_started_at: float,
+) -> None:
+    elapsed_seconds_by_stage[stage] = elapsed_seconds_by_stage.get(
+        stage,
+        0.0,
+    ) + (time.perf_counter() - stage_started_at)
+
+
+def format_elapsed_seconds_by_stage(
+    elapsed_seconds_by_stage: dict[str, float],
+) -> dict[str, str]:
+    return {
+        stage: format_elapsed_seconds(seconds)
+        for stage, seconds in elapsed_seconds_by_stage.items()
+    }
+
+
 def match_features(
     pycolmap_module: Any,
     database_path: Path,
@@ -1168,6 +1188,8 @@ def run_panorama_reconstruction(
     overwrite: bool = False,
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
+    elapsed_seconds_by_stage: dict[str, float] = {}
+    stage_started_at = started_at
     pycolmap_module = require_pycolmap()
     pycolmap_module.set_random_seed(0)
     configure_ssl_cert_file(ssl_cert_file)
@@ -1200,12 +1222,22 @@ def run_panorama_reconstruction(
     paths["sparse"].mkdir(parents=True, exist_ok=True)
     if paths["database"].exists():
         raise FileExistsError(f"{paths['database']} already exists. Pass --overwrite.")
+    record_elapsed_stage(elapsed_seconds_by_stage, "setup", stage_started_at)
     if initial_session is not None:
+        stage_started_at = time.perf_counter()
         copy_initial_panorama_session(initial_session, paths, pycolmap_module)
+        record_elapsed_stage(
+            elapsed_seconds_by_stage,
+            "initial_session_copy",
+            stage_started_at,
+        )
+    else:
+        elapsed_seconds_by_stage["initial_session_copy"] = 0.0
     new_image_prefix = (
         None if initial_session is None else Path(input_image_path.resolve().name)
     )
 
+    stage_started_at = time.perf_counter()
     panorama_paths, camera, views = render_panorama_rig_images(
         input_image_path=input_image_path,
         output_image_dir=paths["image_dir"],
@@ -1236,12 +1268,25 @@ def run_panorama_reconstruction(
         output_options,
         image_limit=image_limit,
     )
+    record_elapsed_stage(
+        elapsed_seconds_by_stage,
+        "render_virtual_views",
+        stage_started_at,
+    )
+
+    stage_started_at = time.perf_counter()
     seed_camera_ids = (
         None
         if initial_session is None
         else read_camera_ids_by_prefix(paths["database"], views)
     )
+    record_elapsed_stage(
+        elapsed_seconds_by_stage,
+        "initial_camera_lookup",
+        stage_started_at,
+    )
 
+    stage_started_at = time.perf_counter()
     extraction_options = create_feature_extraction_options(
         pycolmap_module,
         feature_options,
@@ -1256,6 +1301,13 @@ def run_panorama_reconstruction(
         extraction_options=extraction_options,
         device=execution["device"],
     )
+    record_elapsed_stage(
+        elapsed_seconds_by_stage,
+        "feature_extraction",
+        stage_started_at,
+    )
+
+    stage_started_at = time.perf_counter()
     generated_records = (
         None
         if seed_camera_ids is None
@@ -1293,7 +1345,13 @@ def run_panorama_reconstruction(
             seed_camera_ids=seed_camera_ids,
             generated_records=generated_records,
         )
+    record_elapsed_stage(
+        elapsed_seconds_by_stage,
+        "seed_camera_frame_database_rewrite",
+        stage_started_at,
+    )
 
+    stage_started_at = time.perf_counter()
     matching_options = create_feature_matching_options(
         pycolmap_module,
         feature_options,
@@ -1310,7 +1368,13 @@ def run_panorama_reconstruction(
         vocab_tree_path=vocab_tree_path,
         device=execution["device"],
     )
+    record_elapsed_stage(
+        elapsed_seconds_by_stage,
+        "matching_and_rig_verification",
+        stage_started_at,
+    )
 
+    stage_started_at = time.perf_counter()
     mapper_options = create_mapper_options(
         pycolmap_module,
         execution,
@@ -1325,14 +1389,27 @@ def run_panorama_reconstruction(
         if initial_session is None
         else paths["initial_sparse"],
     )
+    record_elapsed_stage(
+        elapsed_seconds_by_stage,
+        "incremental_mapping",
+        stage_started_at,
+    )
     if not reconstructions:
         raise RuntimeError("COLMAP did not produce any sparse reconstruction")
 
+    stage_started_at = time.perf_counter()
     best_model_id, best_reconstruction = max(
         reconstructions.items(),
         key=lambda item: (item[1].num_reg_images(), item[1].num_points3D()),
     )
     write_best_model(best_reconstruction, paths)
+    record_elapsed_stage(
+        elapsed_seconds_by_stage,
+        "best_model_write",
+        stage_started_at,
+    )
+
+    stage_started_at = time.perf_counter()
     report = build_panorama_report(
         pycolmap_version=pycolmap_module.__version__,
         input_image_path=input_image_path,
@@ -1359,9 +1436,27 @@ def run_panorama_reconstruction(
         best_model_id=best_model_id,
         best_reconstruction=best_reconstruction,
     )
+    elapsed_seconds_by_stage["report_writing"] = 0.0
     elapsed_seconds = time.perf_counter() - started_at
     report["elapsed_seconds"] = elapsed_seconds
     report["elapsed_time"] = format_elapsed_seconds(elapsed_seconds)
+    report["elapsed_seconds_by_stage"] = elapsed_seconds_by_stage
+    report["elapsed_time_by_stage"] = format_elapsed_seconds_by_stage(
+        elapsed_seconds_by_stage,
+    )
+    json.dumps(report, indent=2)
+    record_elapsed_stage(
+        elapsed_seconds_by_stage,
+        "report_writing",
+        stage_started_at,
+    )
+    elapsed_seconds = time.perf_counter() - started_at
+    report["elapsed_seconds"] = elapsed_seconds
+    report["elapsed_time"] = format_elapsed_seconds(elapsed_seconds)
+    report["elapsed_seconds_by_stage"] = elapsed_seconds_by_stage
+    report["elapsed_time_by_stage"] = format_elapsed_seconds_by_stage(
+        elapsed_seconds_by_stage,
+    )
     paths["report"].write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report
 
