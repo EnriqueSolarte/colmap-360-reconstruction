@@ -27,6 +27,7 @@ from colmap.panorama_reconstruct import (
     create_rig_config,
     default_render_options,
     feature_health_summary,
+    format_elapsed_seconds,
     generated_virtual_image_names,
     mask_statistics,
     match_features,
@@ -556,6 +557,12 @@ def test_gpu_feature_options_propagate_multi_gpu_indices() -> None:
     assert extraction.gpu_index == "0,1"
     assert matching.use_gpu is True
     assert matching.gpu_index == "0,1"
+
+
+def test_format_elapsed_seconds_uses_readable_units() -> None:
+    assert format_elapsed_seconds(12.34) == "12.3s"
+    assert format_elapsed_seconds(125.2) == "2m 05s"
+    assert format_elapsed_seconds(3725.2) == "1h 02m 05s"
 
 
 def test_resolve_pipeline_execution_uses_cpu_fallback() -> None:

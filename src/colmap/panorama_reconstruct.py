@@ -8,6 +8,7 @@ import os
 import shutil
 import sqlite3
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from math import cos, pi, radians, sin, tan
@@ -1072,6 +1073,17 @@ def first_gpu_index(value: str) -> str:
     return value if value == "-1" else value.split(",", maxsplit=1)[0]
 
 
+def format_elapsed_seconds(seconds: float) -> str:
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    rounded_seconds = int(round(seconds))
+    minutes, seconds_part = divmod(rounded_seconds, 60)
+    hours, minutes_part = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes_part:02d}m {seconds_part:02d}s"
+    return f"{minutes_part}m {seconds_part:02d}s"
+
+
 def match_features(
     pycolmap_module: Any,
     database_path: Path,
@@ -1155,6 +1167,7 @@ def run_panorama_reconstruction(
     initial_session_path: Path | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
+    started_at = time.perf_counter()
     pycolmap_module = require_pycolmap()
     pycolmap_module.set_random_seed(0)
     configure_ssl_cert_file(ssl_cert_file)
@@ -1346,6 +1359,9 @@ def run_panorama_reconstruction(
         best_model_id=best_model_id,
         best_reconstruction=best_reconstruction,
     )
+    elapsed_seconds = time.perf_counter() - started_at
+    report["elapsed_seconds"] = elapsed_seconds
+    report["elapsed_time"] = format_elapsed_seconds(elapsed_seconds)
     paths["report"].write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report
 
@@ -1899,6 +1915,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"best registered frames: {report['best_model']['num_registered_frames']}")
     print(f"best registered images: {report['best_model']['num_registered_images']}")
     print(f"best sparse points: {report['best_model']['num_points3D']}")
+    print(f"elapsed time: {report['elapsed_time']}")
     print(f"report: {report['workspace']}/panorama_rig_report.json")
     return 0
 
