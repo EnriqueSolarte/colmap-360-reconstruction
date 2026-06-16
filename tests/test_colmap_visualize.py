@@ -1,4 +1,5 @@
 import pytest
+import numpy as np
 
 import colmap.visualize_map as visualize_map
 
@@ -17,6 +18,32 @@ class FakePoint3D:
         self.error = 0.0
         self.xyz = [1.0, 2.0, 3.0]
         self.color = [255, 128, 0]
+
+
+class FakeImage:
+    def __init__(self, name, center, rotation=None):
+        self.name = name
+        self._center = center
+        self._rotation = np.eye(3) if rotation is None else np.asarray(rotation)
+
+    def projection_center(self):
+        return self._center
+
+    def cam_from_world(self):
+        return FakePose(self._rotation)
+
+
+class FakePose:
+    def __init__(self, rotation):
+        self.rotation = FakeRotation(rotation)
+
+
+class FakeRotation:
+    def __init__(self, rotation):
+        self._rotation = rotation
+
+    def matrix(self):
+        return self._rotation
 
 
 class FakePointCloud:
@@ -82,6 +109,107 @@ def test_show_untracked_points_sets_track_length_zero():
     assert args.min_track_length == 0
 
 
+def test_camera_style_defaults_to_auto():
+    args = visualize_map.parse_args([])
+
+    assert args.camera_style == "auto"
+
+
+def test_camera_style_accepts_sphere():
+    args = visualize_map.parse_args(["--camera-style", "sphere"])
+
+    assert args.camera_style == "sphere"
+
+
+def test_auto_camera_style_uses_nearby_panorama_metadata(tmp_path):
+    model_path = tmp_path / "sparse_best"
+    model_path.mkdir()
+    (tmp_path / "panorama_rig_config.json").write_text(
+        '{"views": [{"image_prefix": "pano_camera00/"}]}\n',
+        encoding="utf-8",
+    )
+
+    style, metadata_path = visualize_map.resolve_camera_style(model_path, "auto")
+
+    assert style == "sphere"
+    assert metadata_path == tmp_path / "panorama_rig_config.json"
+
+
+def test_panorama_frame_groups_collapse_virtual_camera_images():
+    images = [
+        FakeImage("pano_camera00/a.png", [0.0, 0.0, 0.0]),
+        FakeImage("pano_camera01/a.png", [0.0, 0.0, 0.0]),
+        FakeImage("pano_camera00/b.png", [1.0, 2.0, 3.0]),
+        FakeImage("pano_camera01/b.png", [1.0, 2.0, 3.0]),
+    ]
+
+    groups = visualize_map.panorama_frame_groups(
+        images,
+        ("pano_camera00/", "pano_camera01/"),
+    )
+
+    assert [group.name for group in groups] == ["a.png", "b.png"]
+    assert [len(group.images) for group in groups] == [2, 2]
+    assert groups[0].center.tolist() == [0.0, 0.0, 0.0]
+    assert groups[1].center.tolist() == [1.0, 2.0, 3.0]
+
+
+def test_panorama_sphere_radius_is_one_quarter_of_reference_frame():
+    camera_scale = 8.0
+
+    reference_frame_size = visualize_map.panorama_reference_frame_size(camera_scale)
+    sphere_radius = visualize_map.panorama_sphere_radius(camera_scale)
+
+    assert reference_frame_size == 6.0
+    assert sphere_radius == 1.5
+    assert sphere_radius == reference_frame_size / 4.0
+
+
+def test_panorama_coordinate_frame_transform_uses_pano_axes_and_center():
+    rotation = np.array(
+        [
+            [0.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    transform = visualize_map.panorama_coordinate_frame_transform(
+        np.array([10.0, 20.0, 30.0]),
+        rotation,
+    )
+
+    assert np.allclose(transform[:3, :3], rotation)
+    assert transform[:3, 3].tolist() == [10.0, 20.0, 30.0]
+    assert transform[3].tolist() == [0.0, 0.0, 0.0, 1.0]
+
+
+def test_panorama_rotation_world_from_group_undoes_virtual_camera_rotation():
+    cam_from_pano = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    group = visualize_map.PanoramaFrameGroup(
+        name="a.png",
+        images=[FakeImage("pano_camera00/a.png", [0.0, 0.0, 0.0], cam_from_pano)],
+        center=np.zeros(3),
+    )
+    views = (
+        visualize_map.PanoramaRigViewMetadata(
+            image_prefix="pano_camera00/",
+            cam_from_pano_rotation=cam_from_pano,
+        ),
+    )
+
+    rotation = visualize_map.panorama_rotation_world_from_group(group, views)
+
+    assert np.allclose(rotation, np.eye(3))
+
+
 def test_visualize_summary_only_does_not_require_open3d(tmp_path, monkeypatch, capsys):
     model_path = tmp_path / "sparse_best"
     model_path.mkdir()
@@ -94,6 +222,7 @@ def test_visualize_summary_only_does_not_require_open3d(tmp_path, monkeypatch, c
         save_image=None,
         camera_scale=0.0,
         max_cameras=120,
+        camera_style="auto",
         min_track_length=3,
         max_reprojection_error=0.0,
         point_size=2.0,
@@ -121,6 +250,7 @@ def test_visualize_requires_open3d_for_geometry(tmp_path, monkeypatch):
             save_image=None,
             camera_scale=0.0,
             max_cameras=120,
+            camera_style="auto",
             min_track_length=3,
             max_reprojection_error=0.0,
             point_size=2.0,

@@ -223,6 +223,19 @@ colmap-visualize \
   --model /workspace/data/colmap-panorama-rig/sparse_best
 ```
 
+For panorama-rig workspaces, the visualizer automatically draws each panorama
+frame as a small surface sphere with a local RGB arrow coordinate frame instead
+of drawing every virtual pinhole camera frustum. The sphere radius is one
+quarter of the local frame size. The local frame is centered at the panorama
+view center: +x points right, +y points down, and +z points through the
+panorama center direction. You can override this if needed:
+
+```bash
+colmap-visualize \
+  --model /workspace/data/colmap-panorama-rig/sparse_best \
+  --camera-style sphere
+```
+
 To save a preview image:
 
 ```bash

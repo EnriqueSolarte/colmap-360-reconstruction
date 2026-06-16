@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 os.environ.setdefault("XDG_RUNTIME_DIR", "/tmp/open3d-runtime")
@@ -31,6 +32,22 @@ except ImportError:  # pragma: no cover - environment dependent
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WORKSPACE = PROJECT_ROOT / "data" / "colmap-panorama-rig"
 DEFAULT_MODEL = DEFAULT_WORKSPACE / "sparse_best"
+CAMERA_STYLES = ("auto", "frustum", "sphere")
+PANORAMA_REFERENCE_FRAME_SCALE = 0.75
+PANORAMA_SPHERE_RADIUS_RATIO = 0.25
+
+
+@dataclass(frozen=True)
+class PanoramaFrameGroup:
+    name: str
+    images: list[pycolmap.Image]
+    center: np.ndarray
+
+
+@dataclass(frozen=True)
+class PanoramaRigViewMetadata:
+    image_prefix: str
+    cam_from_pano_rotation: np.ndarray
 
 
 def require_pycolmap():
@@ -87,8 +104,46 @@ def camera_geometries_from_reconstruction(
     *,
     scale: float,
     max_cameras: int,
+    camera_style: str,
+    panorama_views: tuple[PanoramaRigViewMetadata, ...] = (),
 ) -> tuple[list[o3d.geometry.Geometry], np.ndarray]:
     images = registered_images(reconstruction)
+    if camera_style == "sphere":
+        groups = panorama_frame_groups(images, panorama_prefixes_from_views(panorama_views))
+        if max_cameras > 0 and len(groups) > max_cameras:
+            sample_idxs = np.linspace(0, len(groups) - 1, max_cameras, dtype=int)
+            sphere_groups = [groups[i] for i in sample_idxs]
+        else:
+            sphere_groups = groups
+
+        geometries: list[o3d.geometry.Geometry] = []
+        centers = panorama_group_centers(groups)
+        for group in sphere_groups:
+            rotation_world_from_pano = panorama_rotation_world_from_group(
+                group,
+                panorama_views,
+            )
+            reference_frame_size = panorama_reference_frame_size(scale)
+            geometries.append(
+                draw_sphere_surface(
+                    group.center,
+                    radius=panorama_sphere_radius(scale),
+                )
+            )
+            if rotation_world_from_pano is not None:
+                geometries.append(
+                    draw_panorama_coordinate_frame(
+                        group.center,
+                        rotation_world_from_pano,
+                        scale=reference_frame_size,
+                    )
+                )
+
+        if centers.shape[0] >= 2:
+            geometries.append(make_trajectory_lineset(centers))
+
+        return geometries, centers
+
     if max_cameras > 0 and len(images) > max_cameras:
         sample_idxs = np.linspace(0, len(images) - 1, max_cameras, dtype=int)
         frustum_images = [images[i] for i in sample_idxs]
@@ -106,6 +161,127 @@ def camera_geometries_from_reconstruction(
         geometries.append(make_trajectory_lineset(centers))
 
     return geometries, centers
+
+
+def panorama_rig_metadata_path(model_path: Path) -> Path | None:
+    """Return the nearby panorama-rig metadata path when this is our workspace."""
+    candidates = (
+        model_path / "panorama_rig_config.json",
+        model_path.parent / "panorama_rig_config.json",
+        model_path.parent.parent / "panorama_rig_config.json",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def panorama_views_from_metadata(path: Path | None) -> tuple[PanoramaRigViewMetadata, ...]:
+    if path is None:
+        return ()
+    with path.open("r", encoding="utf-8") as metadata_file:
+        metadata = json.load(metadata_file)
+    views: list[PanoramaRigViewMetadata] = []
+    for view in metadata.get("views", []):
+        prefix = view.get("image_prefix")
+        rotation = view.get("cam_from_pano_rotation")
+        if not isinstance(prefix, str) or not prefix or rotation is None:
+            continue
+        try:
+            rotation_array = np.asarray(rotation, dtype=np.float64)
+        except (TypeError, ValueError):
+            continue
+        if rotation_array.shape == (3, 3):
+            views.append(
+                PanoramaRigViewMetadata(
+                    image_prefix=prefix,
+                    cam_from_pano_rotation=rotation_array,
+                )
+            )
+    return tuple(sorted(views, key=lambda view: len(view.image_prefix), reverse=True))
+
+
+def panorama_prefixes_from_views(
+    panorama_views: tuple[PanoramaRigViewMetadata, ...],
+) -> tuple[str, ...]:
+    return tuple(view.image_prefix for view in panorama_views)
+
+
+def resolve_camera_style(model_path: Path, requested_style: str) -> tuple[str, Path | None]:
+    metadata_path = panorama_rig_metadata_path(model_path)
+    if requested_style == "auto":
+        return ("sphere" if metadata_path is not None else "frustum"), metadata_path
+    return requested_style, metadata_path
+
+
+def panorama_frame_groups(
+    images: list[pycolmap.Image],
+    panorama_prefixes: tuple[str, ...],
+) -> list[PanoramaFrameGroup]:
+    grouped: dict[str, list[pycolmap.Image]] = {}
+    order: list[str] = []
+    for image in images:
+        name = panorama_frame_name(image.name, panorama_prefixes)
+        if name not in grouped:
+            grouped[name] = []
+            order.append(name)
+        grouped[name].append(image)
+
+    groups: list[PanoramaFrameGroup] = []
+    for name in order:
+        frame_images = grouped[name]
+        centers = camera_centers(frame_images)
+        groups.append(
+            PanoramaFrameGroup(
+                name=name,
+                images=frame_images,
+                center=centers.mean(axis=0),
+            )
+        )
+    return groups
+
+
+def panorama_frame_name(image_name: str, panorama_prefixes: tuple[str, ...]) -> str:
+    for prefix in panorama_prefixes:
+        if image_name.startswith(prefix):
+            return image_name[len(prefix) :]
+    return image_name
+
+
+def panorama_group_centers(groups: list[PanoramaFrameGroup]) -> np.ndarray:
+    if not groups:
+        return np.empty((0, 3), dtype=np.float64)
+    return np.vstack([group.center for group in groups])
+
+
+def panorama_rotation_world_from_group(
+    group: PanoramaFrameGroup,
+    panorama_views: tuple[PanoramaRigViewMetadata, ...],
+) -> np.ndarray | None:
+    for image in group.images:
+        view = panorama_view_for_image(image.name, panorama_views)
+        if view is None:
+            continue
+        pose_cam_from_world = image.cam_from_world()
+        rotation_cam_from_world = np.asarray(
+            pose_cam_from_world.rotation.matrix(),
+            dtype=np.float64,
+        )
+        rotation_pano_from_world = (
+            view.cam_from_pano_rotation.T @ rotation_cam_from_world
+        )
+        return rotation_pano_from_world.T
+    return None
+
+
+def panorama_view_for_image(
+    image_name: str,
+    panorama_views: tuple[PanoramaRigViewMetadata, ...],
+) -> PanoramaRigViewMetadata | None:
+    for view in panorama_views:
+        if image_name.startswith(view.image_prefix):
+            return view
+    return None
 
 
 def registered_images(reconstruction: pycolmap.Reconstruction) -> list[pycolmap.Image]:
@@ -181,6 +357,56 @@ def draw_camera(
     axis.transform(transform)
 
     return [frustum, axis]
+
+
+def panorama_reference_frame_size(camera_scale: float) -> float:
+    return float(camera_scale * PANORAMA_REFERENCE_FRAME_SCALE)
+
+
+def panorama_sphere_radius(camera_scale: float) -> float:
+    return float(
+        panorama_reference_frame_size(camera_scale) * PANORAMA_SPHERE_RADIUS_RATIO
+    )
+
+
+def draw_sphere_surface(
+    center: np.ndarray,
+    *,
+    radius: float,
+) -> o3d.geometry.TriangleMesh:
+    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius, resolution=16)
+    sphere.paint_uniform_color([1.0, 0.7, 0.15])
+    sphere.compute_vertex_normals()
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, 3] = np.asarray(center, dtype=np.float64)
+    sphere.transform(transform)
+    return sphere
+
+
+def draw_panorama_coordinate_frame(
+    center: np.ndarray,
+    rotation_world_from_pano: np.ndarray,
+    *,
+    scale: float,
+) -> o3d.geometry.TriangleMesh:
+    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=scale)
+    frame.transform(
+        panorama_coordinate_frame_transform(
+            center,
+            rotation_world_from_pano,
+        )
+    )
+    return frame
+
+
+def panorama_coordinate_frame_transform(
+    center: np.ndarray,
+    rotation_world_from_pano: np.ndarray,
+) -> np.ndarray:
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = np.asarray(rotation_world_from_pano, dtype=np.float64)
+    transform[:3, 3] = np.asarray(center, dtype=np.float64)
+    return transform
 
 
 def pinhole_params(camera: pycolmap.Camera) -> tuple[float, float, float, float]:
@@ -366,6 +592,7 @@ def visualize(
     save_image: Path | None,
     camera_scale: float,
     max_cameras: int,
+    camera_style: str,
     min_track_length: int,
     max_reprojection_error: float,
     point_size: float,
@@ -398,6 +625,8 @@ def visualize(
         return
 
     open3d_module = require_open3d()
+    resolved_camera_style, metadata_path = resolve_camera_style(model_path, camera_style)
+    panorama_views = panorama_views_from_metadata(metadata_path)
     point_cloud = point_cloud_from_reconstruction(
         reconstruction,
         min_track_length=min_track_length,
@@ -410,6 +639,8 @@ def visualize(
         reconstruction,
         scale=scale,
         max_cameras=max_cameras,
+        camera_style=resolved_camera_style,
+        panorama_views=panorama_views,
     )
     geometries: list[o3d.geometry.Geometry] = [point_cloud]
     geometries.extend(camera_geometries)
@@ -429,6 +660,7 @@ def visualize(
         visualized_points=len(point_cloud.points),
         registered_cameras=centers.shape[0],
         camera_scale=scale,
+        camera_style=resolved_camera_style,
         metric_scale=metric_scale,
         marker_frame_applied=marker_frame_applied,
     )
@@ -470,6 +702,7 @@ def summarize_reconstruction(
     visualized_points: int | None = None,
     registered_cameras: int | None = None,
     camera_scale: float | None = None,
+    camera_style: str | None = None,
     metric_scale: float | None,
     marker_frame_applied: bool,
 ) -> None:
@@ -480,10 +713,14 @@ def summarize_reconstruction(
         print(f"visualized points: {visualized_points}")
     if registered_cameras is None:
         print(f"registered cameras: {reconstruction.num_reg_images()}")
+    elif camera_style == "sphere":
+        print(f"visualized panorama frames: {registered_cameras}")
     else:
         print(f"registered cameras: {registered_cameras}")
     if camera_scale is not None:
-        print(f"camera frustum scale: {camera_scale:.6g}")
+        print(f"camera glyph scale: {camera_scale:.6g}")
+    if camera_style is not None:
+        print(f"camera style: {camera_style}")
     if metric_scale is None:
         print("warning: raw monocular COLMAP model is not metric.")
     else:
@@ -527,13 +764,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--camera-scale",
         type=float,
         default=0.0,
-        help="Camera frustum scale; 0 chooses an automatic scale (default: 0)",
+        help="Camera glyph scale; 0 chooses an automatic scale (default: 0)",
     )
     parser.add_argument(
         "--max-cameras",
         type=int,
         default=120,
-        help="Maximum camera frustums to draw; 0 draws all cameras (default: 120)",
+        help="Maximum camera glyphs to draw; 0 draws all cameras (default: 120)",
+    )
+    parser.add_argument(
+        "--camera-style",
+        choices=CAMERA_STYLES,
+        default="auto",
+        help=(
+            "Camera glyph style: auto uses panorama spheres when "
+            "panorama_rig_config.json is found, frustum draws pinhole cameras, "
+            "sphere draws one surface sphere per panorama frame (default: auto)"
+        ),
     )
     parser.add_argument(
         "--min-track-length",
@@ -598,6 +845,7 @@ def main(argv: list[str] | None = None) -> int:
         save_image=args.save_image,
         camera_scale=args.camera_scale,
         max_cameras=args.max_cameras,
+        camera_style=args.camera_style,
         min_track_length=args.min_track_length,
         max_reprojection_error=args.max_reprojection_error,
         point_size=args.point_size,
