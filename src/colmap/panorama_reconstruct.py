@@ -35,6 +35,8 @@ except ImportError:  # pragma: no cover - environment dependent
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WORKSPACE = PROJECT_ROOT / "data" / "colmap-panorama-rig"
 COLMAP_IMAGE_PAIR_ID_PRIME = 2_147_483_647
+IMPORTED_PAIR_MATCH_SCOPES = {"last-k", "top-k", "hybrid-k"}
+MATCH_SCOPES = {"all"} | IMPORTED_PAIR_MATCH_SCOPES
 
 
 @dataclass(frozen=True)
@@ -584,6 +586,99 @@ def build_last_k_match_pairs(
         for old_frame in selected_old_frames:
             add_frame_image_pairs(pairs, seen_pair_keys, old_frame, new_frame)
     return pairs
+
+
+def combine_anchor_frame_sets(
+    recent_frames: Sequence[RigFrameImageSet],
+    keyframe_frames: Sequence[RigFrameImageSet],
+) -> list[RigFrameImageSet]:
+    combined = []
+    seen_frame_ids = set()
+    for frame_set in [*recent_frames, *keyframe_frames]:
+        if frame_set.frame_id in seen_frame_ids:
+            continue
+        seen_frame_ids.add(frame_set.frame_id)
+        combined.append(frame_set)
+    return combined
+
+
+def keyframe_score_sort_key(score_report: dict[str, Any]) -> tuple[float, int, int, int]:
+    return (
+        float(score_report.get("anchor_score", 0.0)),
+        int(score_report.get("connected_frame_count", 0)),
+        int(score_report.get("triangulated_point_count", 0)),
+        -int(score_report.get("frame_id", 0)),
+    )
+
+
+def read_keyframe_score_reports(report_path: Path | None) -> list[dict[str, Any]]:
+    if report_path is None or not report_path.is_file():
+        return []
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    scores = report.get("keyframe_scores")
+    if not isinstance(scores, list):
+        return []
+    valid_scores = [
+        score
+        for score in scores
+        if isinstance(score, dict) and isinstance(score.get("frame_id"), int)
+    ]
+    return sorted(valid_scores, key=keyframe_score_sort_key, reverse=True)
+
+
+def select_top_keyframe_frame_sets(
+    database_path: Path,
+    score_reports: Sequence[dict[str, Any]],
+    *,
+    excluded_image_ids: Sequence[int],
+    limit: int,
+) -> tuple[list[RigFrameImageSet], list[dict[str, Any]]]:
+    if limit <= 0:
+        return [], []
+    excluded_image_id_set = {int(image_id) for image_id in excluded_image_ids}
+    candidate_frame_ids = []
+    seen_frame_ids = set()
+    for score in score_reports:
+        frame_id = int(score["frame_id"])
+        if frame_id in seen_frame_ids:
+            continue
+        seen_frame_ids.add(frame_id)
+        candidate_frame_ids.append(frame_id)
+    frame_sets_by_id = {
+        frame_set.frame_id: frame_set
+        for frame_set in read_rig_frame_image_sets(database_path, candidate_frame_ids)
+    }
+    selected_frames = []
+    selected_scores = []
+    for score in score_reports:
+        frame_set = frame_sets_by_id.get(int(score["frame_id"]))
+        if frame_set is None:
+            continue
+        if excluded_image_id_set.intersection(frame_set.image_ids):
+            continue
+        selected_frames.append(frame_set)
+        selected_scores.append(score)
+        if len(selected_frames) >= limit:
+            break
+    return selected_frames, selected_scores
+
+
+def keyframe_scores_from_initial_session(
+    pycolmap_module: Any,
+    database_path: Path,
+    initial_model_path: Path,
+    *,
+    total_virtual_camera_count: int,
+) -> list[dict[str, Any]]:
+    reconstruction = pycolmap_module.Reconstruction(initial_model_path)
+    return [
+        score.report()
+        for score in score_keyframe_anchors(
+            database_path,
+            reconstruction,
+            total_virtual_camera_count=total_virtual_camera_count,
+        )
+    ]
 
 
 def write_image_pair_list(
@@ -1565,9 +1660,9 @@ def match_features(
     validate_vocab_tree_path(vocab_tree_path)
     if device is None:
         device = pycolmap_module.Device.cpu
-    if match_scope == "last-k":
+    if match_scope in IMPORTED_PAIR_MATCH_SCOPES:
         if image_pairs_path is None:
-            raise ValueError("image_pairs_path is required for last-k matching")
+            raise ValueError(f"image_pairs_path is required for {match_scope} matching")
         pairing_options = pycolmap_module.ImportedPairingOptions()
         pairing_options.match_list_path = image_pairs_path
         pycolmap_module.match_image_pairs(
@@ -1577,8 +1672,10 @@ def match_features(
             device=device,
         )
         return
-    if match_scope != "all":
-        raise ValueError("match_scope must be 'all' or 'last-k'")
+    if match_scope not in MATCH_SCOPES:
+        raise ValueError(
+            "match_scope must be 'all', 'last-k', 'top-k', or 'hybrid-k'"
+        )
     if matcher == "sequential":
         pairing_options = pycolmap_module.SequentialPairingOptions()
         pairing_options.overlap = overlap
@@ -1639,6 +1736,7 @@ def run_panorama_reconstruction(
     matcher: str = "sequential",
     match_scope: str = "all",
     last_k_frames: int = 20,
+    top_k_frames: int = 0,
     overlap: int = 15,
     loop_detection: bool = True,
     vocab_tree_path: Path | None = None,
@@ -1816,26 +1914,87 @@ def run_panorama_reconstruction(
     )
 
     stage_started_at = time.perf_counter()
-    if match_scope == "last-k" and initial_session is None:
-        raise ValueError("--match-scope last-k requires --initial-session")
-    if match_scope not in {"all", "last-k"}:
-        raise ValueError("match_scope must be 'all' or 'last-k'")
+    if match_scope in IMPORTED_PAIR_MATCH_SCOPES and initial_session is None:
+        raise ValueError(f"--match-scope {match_scope} requires --initial-session")
+    if match_scope not in MATCH_SCOPES:
+        raise ValueError(
+            "match_scope must be 'all', 'last-k', 'top-k', or 'hybrid-k'"
+        )
+    if last_k_frames < 0:
+        raise ValueError("last_k_frames must be non-negative")
+    if top_k_frames < 0:
+        raise ValueError("top_k_frames must be non-negative")
+    if match_scope == "last-k" and last_k_frames <= 0:
+        raise ValueError("--match-scope last-k requires --last-k-frames > 0")
+    if match_scope == "top-k" and top_k_frames <= 0:
+        raise ValueError("--match-scope top-k requires --top-k-frames > 0")
+    if match_scope == "hybrid-k" and last_k_frames <= 0 and top_k_frames <= 0:
+        raise ValueError(
+            "--match-scope hybrid-k requires last_k_frames > 0 or top_k_frames > 0"
+        )
     new_frame_sets = read_rig_frame_image_sets_for_images(
         paths["database"],
         generated_image_batch.image_ids,
     )
+    selected_recent_frame_sets: list[RigFrameImageSet] = []
+    selected_keyframe_frame_sets: list[RigFrameImageSet] = []
     selected_old_frame_sets: list[RigFrameImageSet] = []
+    selected_keyframe_score_reports: list[dict[str, Any]] = []
+    keyframe_score_source: str | None = None
     match_pairs: list[tuple[str, str]] = []
-    if match_scope == "last-k":
-        selected_old_frame_sets = read_last_old_rig_frame_image_sets(
+    if match_scope in {"last-k", "hybrid-k"} and last_k_frames > 0:
+        selected_recent_frame_sets = read_last_old_rig_frame_image_sets(
             paths["database"],
             excluded_image_ids=generated_image_batch.image_ids,
             limit=last_k_frames,
         )
-        if not selected_old_frame_sets:
+        if match_scope == "last-k" and not selected_recent_frame_sets:
             raise RuntimeError(
                 "--match-scope last-k could not find old rig frames in the "
                 "initial session database"
+            )
+    if match_scope in {"top-k", "hybrid-k"} and top_k_frames > 0:
+        top_k_excluded_image_ids = [
+            *generated_image_batch.image_ids,
+            *[
+                image_id
+                for frame_set in selected_recent_frame_sets
+                for image_id in frame_set.image_ids
+            ],
+        ]
+        previous_score_reports = read_keyframe_score_reports(
+            None if initial_session is None else initial_session.report_path,
+        )
+        if previous_score_reports:
+            keyframe_score_source = "initial_session_report"
+        else:
+            previous_score_reports = keyframe_scores_from_initial_session(
+                pycolmap_module,
+                paths["database"],
+                paths["initial_sparse"],
+                total_virtual_camera_count=len(views),
+            )
+            keyframe_score_source = "recomputed_initial_model"
+        selected_keyframe_frame_sets, selected_keyframe_score_reports = (
+            select_top_keyframe_frame_sets(
+                paths["database"],
+                previous_score_reports,
+                excluded_image_ids=top_k_excluded_image_ids,
+                limit=top_k_frames,
+            )
+        )
+        if match_scope == "top-k" and not selected_keyframe_frame_sets:
+            raise RuntimeError(
+                "--match-scope top-k could not find scored keyframe anchors"
+            )
+    if match_scope in IMPORTED_PAIR_MATCH_SCOPES:
+        selected_old_frame_sets = combine_anchor_frame_sets(
+            selected_recent_frame_sets,
+            selected_keyframe_frame_sets,
+        )
+        if not selected_old_frame_sets:
+            raise RuntimeError(
+                f"--match-scope {match_scope} did not select any old anchor frames"
             )
         match_pairs = build_last_k_match_pairs(
             new_frame_sets,
@@ -1843,7 +2002,7 @@ def run_panorama_reconstruction(
             new_frame_overlap=overlap,
         )
         if not match_pairs:
-            raise RuntimeError("--match-scope last-k produced no image pairs")
+            raise RuntimeError(f"--match-scope {match_scope} produced no image pairs")
         write_image_pair_list(paths["match_pairs"], match_pairs)
 
     matching_options = create_feature_matching_options(
@@ -1861,7 +2020,11 @@ def run_panorama_reconstruction(
         overlap=overlap,
         loop_detection=loop_detection,
         vocab_tree_path=vocab_tree_path,
-        image_pairs_path=paths["match_pairs"] if match_scope == "last-k" else None,
+        image_pairs_path=(
+            paths["match_pairs"]
+            if match_scope in IMPORTED_PAIR_MATCH_SCOPES
+            else None
+        ),
         device=execution["device"],
     )
     record_elapsed_stage(
@@ -1928,6 +2091,7 @@ def run_panorama_reconstruction(
         matcher=matcher,
         match_scope=match_scope,
         last_k_frames=last_k_frames,
+        top_k_frames=top_k_frames,
         overlap=overlap,
         loop_detection=loop_detection,
         vocab_tree_path=vocab_tree_path,
@@ -1942,9 +2106,21 @@ def run_panorama_reconstruction(
         new_image_prefix=new_image_prefix,
         generated_image_batch=generated_image_batch,
         new_frame_sets=new_frame_sets,
+        selected_recent_frame_sets=selected_recent_frame_sets,
+        selected_keyframe_frame_sets=selected_keyframe_frame_sets,
         selected_old_frame_sets=selected_old_frame_sets,
-        matching_pair_count=len(match_pairs) if match_scope == "last-k" else None,
-        match_pairs_path=paths["match_pairs"] if match_scope == "last-k" else None,
+        selected_keyframe_score_reports=selected_keyframe_score_reports,
+        keyframe_score_source=keyframe_score_source,
+        matching_pair_count=(
+            len(match_pairs)
+            if match_scope in IMPORTED_PAIR_MATCH_SCOPES
+            else None
+        ),
+        match_pairs_path=(
+            paths["match_pairs"]
+            if match_scope in IMPORTED_PAIR_MATCH_SCOPES
+            else None
+        ),
         initial_session=initial_session,
         initial_metadata=initial_metadata,
         reconstructions=reconstructions,
@@ -1989,7 +2165,7 @@ def panorama_workspace_paths(workspace: Path) -> dict[str, Path]:
         "raw_ply": workspace / "cloud_colmap_raw.ply",
         "report": workspace / "panorama_rig_report.json",
         "rig_metadata": workspace / "panorama_rig_config.json",
-        "match_pairs": workspace / "last_k_match_pairs.txt",
+        "match_pairs": workspace / "scoped_match_pairs.txt",
     }
 
 
@@ -2048,6 +2224,7 @@ def build_panorama_report(
     matcher: str,
     match_scope: str,
     last_k_frames: int,
+    top_k_frames: int,
     overlap: int,
     loop_detection: bool,
     vocab_tree_path: Path | None,
@@ -2062,7 +2239,11 @@ def build_panorama_report(
     new_image_prefix: Path | None,
     generated_image_batch: GeneratedVirtualImageBatch,
     new_frame_sets: Sequence[RigFrameImageSet],
+    selected_recent_frame_sets: Sequence[RigFrameImageSet],
+    selected_keyframe_frame_sets: Sequence[RigFrameImageSet],
     selected_old_frame_sets: Sequence[RigFrameImageSet],
+    selected_keyframe_score_reports: Sequence[dict[str, Any]],
+    keyframe_score_source: str | None,
     matching_pair_count: int | None,
     match_pairs_path: Path | None,
     initial_session: InitialPanoramaSession | None,
@@ -2108,9 +2289,12 @@ def build_panorama_report(
             "matcher": matcher,
             "match_scope": match_scope,
             "effective_pairing": (
-                "imported_last_k" if match_scope == "last-k" else matcher
+                f"imported_{match_scope}"
+                if match_scope in IMPORTED_PAIR_MATCH_SCOPES
+                else matcher
             ),
             "last_k_frames": last_k_frames,
+            "top_k_frames": top_k_frames,
             "sequential_overlap": overlap,
             "loop_detection": loop_detection,
             "vocab_tree_path": (
@@ -2168,6 +2352,16 @@ def build_panorama_report(
         "new_database_image_names": list(generated_image_batch.names),
         "new_frame_count": len(new_frame_sets),
         "new_frame_ids": [frame.frame_id for frame in new_frame_sets],
+        "selected_recent_frame_count": len(selected_recent_frame_sets),
+        "selected_recent_frame_ids": [
+            frame.frame_id for frame in selected_recent_frame_sets
+        ],
+        "selected_keyframe_count": len(selected_keyframe_frame_sets),
+        "selected_keyframe_ids": [
+            frame.frame_id for frame in selected_keyframe_frame_sets
+        ],
+        "selected_keyframe_score_source": keyframe_score_source,
+        "selected_keyframe_scores": list(selected_keyframe_score_reports),
         "selected_old_frame_count": len(selected_old_frame_sets),
         "selected_old_frame_ids": [
             frame.frame_id for frame in selected_old_frame_sets
@@ -2380,12 +2574,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--match-scope",
-        choices=("all", "last-k"),
+        choices=("all", "last-k", "top-k", "hybrid-k"),
         default="all",
         help=(
             "Image-pair scope. 'all' uses the selected matcher over the full "
-            "database. 'last-k' matches current images against current images "
-            "and the last K old rig frames from --initial-session."
+            "database. Scoped modes match current images against current images "
+            "and selected old rig frames from --initial-session."
         ),
     )
     parser.add_argument(
@@ -2393,6 +2587,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=20,
         help="Number of old rig frames to anchor when --match-scope=last-k.",
+    )
+    parser.add_argument(
+        "--top-k-frames",
+        type=int,
+        default=0,
+        help=(
+            "Number of scored old rig frames to anchor when "
+            "--match-scope=top-k or hybrid-k."
+        ),
     )
     parser.add_argument(
         "--overlap",
@@ -2530,10 +2733,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--fov-y must be greater than 0 and less than pi radians")
     if args.image_limit is not None and args.image_limit <= 0:
         parser.error("--image-limit must be positive")
-    if args.last_k_frames <= 0:
-        parser.error("--last-k-frames must be positive")
-    if args.match_scope == "last-k" and args.initial_session is None:
-        parser.error("--match-scope last-k requires --initial-session")
+    if args.last_k_frames < 0:
+        parser.error("--last-k-frames must be non-negative")
+    if args.top_k_frames < 0:
+        parser.error("--top-k-frames must be non-negative")
+    if args.match_scope in IMPORTED_PAIR_MATCH_SCOPES and args.initial_session is None:
+        parser.error(f"--match-scope {args.match_scope} requires --initial-session")
+    if args.match_scope == "last-k" and args.last_k_frames <= 0:
+        parser.error("--match-scope last-k requires --last-k-frames > 0")
+    if args.match_scope == "top-k" and args.top_k_frames <= 0:
+        parser.error("--match-scope top-k requires --top-k-frames > 0")
+    if (
+        args.match_scope == "hybrid-k"
+        and args.last_k_frames <= 0
+        and args.top_k_frames <= 0
+    ):
+        parser.error(
+            "--match-scope hybrid-k requires --last-k-frames > 0 "
+            "or --top-k-frames > 0"
+        )
     if args.max_num_features <= 0:
         parser.error("--max-num-features must be positive")
     if not 0 <= args.png_compression <= 9:
@@ -2577,6 +2795,7 @@ def main(argv: list[str] | None = None) -> int:
         matcher=args.matcher,
         match_scope=args.match_scope,
         last_k_frames=args.last_k_frames,
+        top_k_frames=args.top_k_frames,
         overlap=args.overlap,
         loop_detection=args.loop_detection,
         vocab_tree_path=args.vocab_tree_path,

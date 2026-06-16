@@ -21,6 +21,7 @@ from colmap.panorama_reconstruct import (
     build_rig_remap_maps,
     build_initial_session_report,
     build_panorama_report,
+    combine_anchor_frame_sets,
     build_rig_views,
     configure_ssl_cert_file,
     copy_initial_panorama_session,
@@ -38,6 +39,7 @@ from colmap.panorama_reconstruct import (
     match_features,
     read_camera_ids_by_prefix,
     read_generated_virtual_image_batch,
+    read_keyframe_score_reports,
     read_image_records_by_name,
     read_last_old_rig_frame_image_sets,
     read_rig_frame_image_sets_for_images,
@@ -53,6 +55,7 @@ from colmap.panorama_reconstruct import (
     resolve_pipeline_execution,
     rig_view_masks,
     score_keyframe_anchors,
+    select_top_keyframe_frame_sets,
     validate_initial_session_compatible,
     validate_rig_masks,
 )
@@ -487,6 +490,7 @@ def test_panorama_report_includes_new_database_images(tmp_path) -> None:
         matcher="sequential",
         match_scope="all",
         last_k_frames=20,
+        top_k_frames=0,
         overlap=15,
         loop_detection=True,
         vocab_tree_path=None,
@@ -508,7 +512,11 @@ def test_panorama_report_includes_new_database_images(tmp_path) -> None:
         new_image_prefix=Path("img-0002"),
         generated_image_batch=batch,
         new_frame_sets=[],
+        selected_recent_frame_sets=[],
+        selected_keyframe_frame_sets=[],
         selected_old_frame_sets=[],
+        selected_keyframe_score_reports=[],
+        keyframe_score_source=None,
         matching_pair_count=None,
         match_pairs_path=None,
         initial_session=None,
@@ -522,6 +530,9 @@ def test_panorama_report_includes_new_database_images(tmp_path) -> None:
     assert report["database_image_count"] == 4
     assert report["options"]["match_scope"] == "all"
     assert report["options"]["effective_pairing"] == "sequential"
+    assert report["options"]["top_k_frames"] == 0
+    assert report["selected_recent_frame_ids"] == []
+    assert report["selected_keyframe_ids"] == []
     assert report["keyframe_score_count"] == 0
     assert report["keyframe_scores"] == []
     assert report["old_database_image_count"] == 2
@@ -704,6 +715,88 @@ def test_last_k_match_pairs_use_new_overlap_and_old_anchors() -> None:
     assert ("new-a-0.png", "new-c-0.png") not in pairs
     assert ("old-a-0.png", "new-a-0.png") in pairs
     assert ("old-a-1.png", "new-c-1.png") in pairs
+
+
+def test_top_keyframe_selection_uses_score_order_and_database_frames(tmp_path) -> None:
+    database_path = tmp_path / "database.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE frames(frame_id INTEGER PRIMARY KEY, rig_id INTEGER)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE frame_data(
+                frame_id INTEGER,
+                data_id INTEGER,
+                sensor_id INTEGER,
+                sensor_type INTEGER
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
+            [
+                (1, "pano_camera00/old-a.png", 1),
+                (2, "pano_camera01/old-a.png", 2),
+                (3, "pano_camera00/old-b.png", 1),
+                (4, "pano_camera01/old-b.png", 2),
+                (5, "pano_camera00/new.png", 1),
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO frames(frame_id, rig_id) VALUES (?, 13)",
+            [(10,), (11,), (12,)],
+        )
+        connection.executemany(
+            """
+            INSERT INTO frame_data(frame_id, data_id, sensor_id, sensor_type)
+            VALUES (?, ?, ?, 0)
+            """,
+            [(10, 1, 1), (10, 2, 2), (11, 3, 1), (11, 4, 2), (12, 5, 1)],
+        )
+    report_path = tmp_path / "panorama_rig_report.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "keyframe_scores": [
+                    {"frame_id": 11, "anchor_score": 0.4},
+                    {"frame_id": 10, "anchor_score": 0.9},
+                    {"frame_id": 12, "anchor_score": 1.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    score_reports = read_keyframe_score_reports(report_path)
+    selected_frames, selected_scores = select_top_keyframe_frame_sets(
+        database_path,
+        score_reports,
+        excluded_image_ids=[5],
+        limit=2,
+    )
+
+    assert [score["frame_id"] for score in score_reports] == [12, 10, 11]
+    assert [frame.frame_id for frame in selected_frames] == [10, 11]
+    assert [score["frame_id"] for score in selected_scores] == [10, 11]
+
+
+def test_combine_anchor_frame_sets_keeps_recent_order_and_deduplicates() -> None:
+    recent_frames = [
+        RigFrameImageSet(12, (12,), ("recent-a.png",)),
+        RigFrameImageSet(13, (13,), ("recent-b.png",)),
+    ]
+    keyframe_frames = [
+        RigFrameImageSet(13, (13,), ("recent-b.png",)),
+        RigFrameImageSet(4, (4,), ("keyframe.png",)),
+    ]
+
+    combined = combine_anchor_frame_sets(recent_frames, keyframe_frames)
+
+    assert [frame.frame_id for frame in combined] == [12, 13, 4]
 
 
 def test_seeded_generated_frames_are_moved_into_existing_rig(tmp_path) -> None:
@@ -1101,7 +1194,6 @@ def test_last_k_matching_uses_imported_image_pairs(tmp_path) -> None:
         class Device:
             cpu = "cpu"
 
-        ImportedPairingOptions = ImportedPairingOptions
         calls = []
 
         @classmethod
@@ -1115,6 +1207,7 @@ def test_last_k_matching_uses_imported_image_pairs(tmp_path) -> None:
         ):
             cls.calls.append((database_path, matching_options, pairing_options, device))
 
+    FakePycolmap.ImportedPairingOptions = ImportedPairingOptions
     pair_list = tmp_path / "pairs.txt"
     pair_list.write_text("a.png b.png\n", encoding="utf-8")
     matching_options = object()
@@ -1186,6 +1279,7 @@ def test_parse_args_accepts_image_limit(tmp_path) -> None:
     assert args.initial_session == previous
     assert args.match_scope == "all"
     assert args.last_k_frames == 20
+    assert args.top_k_frames == 0
     assert args.loop_detection is True
     assert args.feature_extractor == "sift"
     assert args.feature_matcher == "sift-bruteforce"
@@ -1219,6 +1313,66 @@ def test_parse_args_accepts_last_k_match_scope(tmp_path) -> None:
     assert args.last_k_frames == 7
 
 
+def test_parse_args_accepts_top_k_match_scope(tmp_path) -> None:
+    previous = tmp_path / "previous"
+    previous.mkdir()
+
+    args = parse_args(
+        [
+            "--input-image-path",
+            str(tmp_path),
+            "--initial-session",
+            str(previous),
+            "--match-scope",
+            "top-k",
+            "--top-k-frames",
+            "5",
+        ]
+    )
+
+    assert args.match_scope == "top-k"
+    assert args.top_k_frames == 5
+
+
+def test_parse_args_accepts_hybrid_k_with_disabled_recent_or_top_k(tmp_path) -> None:
+    previous = tmp_path / "previous"
+    previous.mkdir()
+
+    top_only = parse_args(
+        [
+            "--input-image-path",
+            str(tmp_path),
+            "--initial-session",
+            str(previous),
+            "--match-scope",
+            "hybrid-k",
+            "--last-k-frames",
+            "0",
+            "--top-k-frames",
+            "3",
+        ]
+    )
+    recent_only = parse_args(
+        [
+            "--input-image-path",
+            str(tmp_path),
+            "--initial-session",
+            str(previous),
+            "--match-scope",
+            "hybrid-k",
+            "--last-k-frames",
+            "3",
+            "--top-k-frames",
+            "0",
+        ]
+    )
+
+    assert top_only.last_k_frames == 0
+    assert top_only.top_k_frames == 3
+    assert recent_only.last_k_frames == 3
+    assert recent_only.top_k_frames == 0
+
+
 def test_parse_args_rejects_last_k_without_initial_session(tmp_path) -> None:
     with pytest.raises(SystemExit):
         parse_args(
@@ -1227,6 +1381,38 @@ def test_parse_args_rejects_last_k_without_initial_session(tmp_path) -> None:
                 str(tmp_path),
                 "--match-scope",
                 "last-k",
+            ]
+        )
+
+
+def test_parse_args_rejects_empty_top_k_and_hybrid_k(tmp_path) -> None:
+    previous = tmp_path / "previous"
+    previous.mkdir()
+
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--input-image-path",
+                str(tmp_path),
+                "--initial-session",
+                str(previous),
+                "--match-scope",
+                "top-k",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--input-image-path",
+                str(tmp_path),
+                "--initial-session",
+                str(previous),
+                "--match-scope",
+                "hybrid-k",
+                "--last-k-frames",
+                "0",
+                "--top-k-frames",
+                "0",
             ]
         )
 
