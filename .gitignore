@@ -30,7 +30,7 @@ ENV/
 .vscode/
 .idea/
 *.code-workspace
-.agent-workspace
+# .agent-workspace
 .DS_Store
 Thumbs.db
 
