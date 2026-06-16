@@ -668,6 +668,111 @@ def test_manual_render_filename_uses_pm_angle_convention() -> None:
     )
 
 
+def test_manual_render_cli_renders_existing_metadata_selections(tmp_path) -> None:
+    source_path = tmp_path / "pano.png"
+    output_dir = tmp_path / "pinhole-renders"
+    output_dir.mkdir()
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(source_path)
+    metadata = {
+        "schema_version": 1,
+        "render_defaults": {
+            "width": 10,
+            "height": 8,
+            "fov_x": pi / 2,
+            "fov_y": pi / 3,
+            "interpolation": "nearest",
+            "output_extension": ".png",
+        },
+        "panoramas": [
+            {
+                "pano_index": 0,
+                "pano_filename": source_path.name,
+                "pano_stem": source_path.stem,
+                "pano_path": str(source_path),
+                "source_pano_path": str(source_path),
+                "source_status": "matched",
+                "pano_camera_pose": {
+                    "coordinate_frame": "colmap_world_unscaled",
+                    "center_world": [1.0, 2.0, 3.0],
+                    "rotation_world_from_pano": np.eye(3).tolist(),
+                },
+                "selections": [
+                    {
+                        "selection_index": 0,
+                        "longitude": pi / 4,
+                        "latitude": -pi / 6,
+                    },
+                ],
+            }
+        ],
+    }
+    (output_dir / "metadata.json").write_text(
+        json.dumps(metadata),
+        encoding="utf-8",
+    )
+
+    exit_code = manual_render_main(["-o", str(output_dir), "--render-selections"])
+
+    updated = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    selection = updated["panoramas"][0]["selections"][0]
+    rendered_path = output_dir / selection["rendered_filename"]
+
+    assert exit_code == 0
+    assert selection["render_status"] == "rendered"
+    assert selection["rendered_filename"] == "pano__sel-000__lon-p045.0__lat-m030.0__w10_h8.png"
+    assert selection["rendered_path"] == str(rendered_path)
+    assert selection["longitude_degrees"] == 45.0
+    assert selection["latitude_degrees"] == -29.999999999999996
+    assert selection["pinhole_camera_pose"]["center_world"] == [1.0, 2.0, 3.0]
+    assert (
+        selection["pinhole_camera_pose"]["coordinate_frame"]
+        == "colmap_world_unscaled"
+    )
+    assert len(selection["pinhole_camera_pose"]["transform_world_from_pinhole"]) == 4
+    assert np.asarray(Image.open(rendered_path)).shape == (8, 10, 3)
+    assert updated["render_summary"] == {
+        "status": "rendered_selections",
+        "selection_count": 1,
+        "rendered_selection_count": 1,
+    }
+
+
+def test_manual_render_cli_rejects_invalid_selection_latitude(tmp_path) -> None:
+    source_path = tmp_path / "pano.png"
+    output_dir = tmp_path / "pinhole-renders"
+    output_dir.mkdir()
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(source_path)
+    metadata = {
+        "render_defaults": {
+            "width": 10,
+            "height": 8,
+            "fov_x": pi / 2,
+            "fov_y": pi / 3,
+            "interpolation": "nearest",
+            "output_extension": ".png",
+        },
+        "panoramas": [
+            {
+                "pano_stem": source_path.stem,
+                "source_pano_path": str(source_path),
+                "source_status": "matched",
+                "selections": [{"longitude": 0.0, "latitude": pi}],
+            }
+        ],
+    }
+    (output_dir / "metadata.json").write_text(
+        json.dumps(metadata),
+        encoding="utf-8",
+    )
+
+    exit_code = manual_render_main(["-o", str(output_dir), "--render-selections"])
+
+    assert exit_code == 1
+    assert not list(output_dir.glob("*.png"))
+
+
 def test_manual_render_scene_metadata_uses_registered_colmap_panoramas(tmp_path) -> None:
     source_path = tmp_path / "shelf-0001.png"
     source_path.write_bytes(b"placeholder")

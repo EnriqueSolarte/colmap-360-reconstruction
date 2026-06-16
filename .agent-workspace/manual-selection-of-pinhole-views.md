@@ -30,7 +30,6 @@ The repo does not yet have:
 
 - A manual review UI or command loop.
 - A populated selection workflow for hand-picked longitude/latitude pairs.
-- A render command that consumes saved selections.
 - A clear mapping from reconstructed panorama records back to manually selected
   pinhole outputs.
 
@@ -39,6 +38,8 @@ The repo now has:
 - A `manual-pinhole-render` metadata initializer.
 - Scene-aware filtering so the COLMAP scene defines the panorama subset.
 - Per-panorama COLMAP pose and quality metadata for scene-registered panoramas.
+- A render command that consumes saved selections.
+- Rendering from saved longitude/latitude selections in `metadata.json`.
 
 ## Working Assumptions
 
@@ -208,6 +209,67 @@ Current output metadata path for the real workflow:
 /data/itri-3d-reconstruction/scene-reconstruction/2026-06-15-0002/colmap/session-001-img-0002-img-0003-img-0004-img-0005-img-0006/pinhole-renders/metadata.json
 ```
 
+## Approved Stage 3 Render From Metadata Selections
+
+The CLI can now render selected pinhole views from an existing metadata file.
+
+Command shape:
+
+```bash
+manual-pinhole-render \
+  --output-dir /path/to/pinhole-renders \
+  --render-selections
+```
+
+Input expectation:
+
+```json
+{
+  "selection_index": 0,
+  "longitude": 0.785398163,
+  "latitude": -0.174532925
+}
+```
+
+Stage 3 behavior:
+
+- Read `output-dir/metadata.json`.
+- Iterate over panorama records with non-empty `selections`.
+- Validate source panorama file paths and selection latitude.
+- Wrap longitude to `[-pi, pi]`.
+- Render each selected pinhole image using the existing renderer.
+- Write images using the approved p/m filename convention.
+- Update each selection with render parameters, rendered filename/path, degrees,
+  render status, and `pinhole_camera_pose`.
+- Compute `pinhole_camera_pose` from the optimized panorama pose plus selected
+  longitude/latitude.
+- Write updated `metadata.json` with a `render_summary`.
+
+Smoke-tested command:
+
+```bash
+python -m render_pinhole.tools.manual_pinhole_render \
+  -o /tmp/manual-pinhole-stage3-smoke \
+  --render-selections
+```
+
+Smoke-test result:
+
+```text
+Rendered 1 selected pinhole views.
+shelf-1781171031546_00000051__sel-000__lon-p045.0__lat-m010.0__w1280_h960.png
+```
+
+Verification:
+
+```text
+pytest /workspace/tests/test_renderer_api.py
+29 passed
+
+pytest /workspace/tests
+101 passed
+```
+
 ## Selection JSON Contract
 
 The JSON file should be explicit enough to reproduce the render and trace every
@@ -350,7 +412,7 @@ requested pinhole views and updates image metadata.
 
 This proves the file contract is useful before investing in interaction design.
 
-Status: next recommended slice.
+Status: implemented.
 
 ### Stage 4: Manual Selection Interface
 
@@ -371,7 +433,7 @@ Status: pending.
 
 ### 2026-06-16
 
-Completed Stage 1 and Stage 2.
+Completed Stage 1, Stage 2, and Stage 3.
 
 Changed behavior:
 
@@ -387,23 +449,22 @@ Changed behavior:
 - Added optimized panorama pose in raw unscaled COLMAP world coordinates.
 - Added per-panorama COLMAP quality metrics.
 - Added `tqdm` progress for long-running metadata initialization steps.
+- Added `--render-selections` to render saved longitude/latitude selections.
+- Updated selections with rendered image paths and derived pinhole poses.
 
 Known limitations:
 
 - Source identity still relies on legacy filename inference for existing
   workspaces. The long-term fix is tracked in
   `colmap-view-identity-manifest.md`.
-- `pinhole_camera_pose` is not available until a user selects a longitude and
-  latitude.
-- No selected pinhole images are rendered yet.
+- `pinhole_camera_pose` is available only after rendering a saved selection.
 - No browser/manual selection UI exists yet.
 
 Recommended next slice:
 
-Implement Stage 3: render selected pinhole views from existing selections in
-`metadata.json`, update each selection with rendered filename/path, and compute
-the selected pinhole camera pose from the panorama pose plus selected
-longitude/latitude.
+Implement Stage 4: a lightweight browser/manual selection UI that writes
+longitude/latitude selections into `metadata.json`, previewing candidate crops
+before final rendering.
 
 ## Risks
 

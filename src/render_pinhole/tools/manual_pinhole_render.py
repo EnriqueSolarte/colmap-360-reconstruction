@@ -7,7 +7,7 @@ import json
 from collections import Counter
 from dataclasses import dataclass
 from importlib import metadata as package_metadata
-from math import degrees
+from math import degrees, pi
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,7 @@ from render_pinhole.defaults import (
     DEFAULT_PINHOLE_INTERPOLATION,
     DEFAULT_PINHOLE_WIDTH,
 )
+from render_pinhole.renderer import EquirectangularToPinhole
 
 try:  # Keep non-scene metadata initialization usable without pycolmap.
     import pycolmap
@@ -70,6 +71,14 @@ class SceneContext:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.render_selections:
+        try:
+            render_metadata_selections(args.output_dir)
+        except (OSError, ValueError, KeyError) as error:
+            print(error)
+            return 1
+        return 0
+
     pano_paths = _iter_pano_paths(args.pano_dir, show_progress=True)
     if not pano_paths:
         print(f"No panorama images found in {args.pano_dir}")
@@ -120,6 +129,142 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Metadata: {metadata_path}")
     print(f"Initialized {metadata['panorama_count']} panoramas.")
     return 0
+
+
+def render_metadata_selections(output_dir: Path) -> dict[str, Any]:
+    metadata_path = output_dir / METADATA_FILENAME
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    render_defaults = metadata.get("render_defaults", {})
+    panoramas = metadata.get("panoramas", [])
+    selection_count = sum(len(panorama.get("selections", [])) for panorama in panoramas)
+    rendered_count = 0
+
+    progress = tqdm(
+        total=selection_count,
+        desc="Rendering selected pinhole views",
+        unit="view",
+    )
+    try:
+        for panorama in panoramas:
+            source_path = panorama.get("source_pano_path") or panorama.get("pano_path")
+            selections = panorama.get("selections", [])
+            if not selections:
+                continue
+            if panorama.get("source_status") == SOURCE_STATUS_MISSING:
+                raise ValueError(
+                    "Cannot render selections for missing source panorama: "
+                    f"{panorama.get('scene_pano_filename') or panorama.get('pano_filename')}"
+                )
+            if source_path is None:
+                raise ValueError(
+                    "Cannot render selections without source panorama path: "
+                    f"{panorama.get('scene_pano_filename') or panorama.get('pano_filename')}"
+                )
+
+            source_path = Path(source_path)
+            if not source_path.is_file():
+                raise FileNotFoundError(f"Source panorama file not found: {source_path}")
+            renderer = EquirectangularToPinhole.from_file(source_path)
+
+            for fallback_index, selection in enumerate(selections):
+                render_selection(
+                    renderer,
+                    output_dir,
+                    panorama,
+                    selection,
+                    render_defaults,
+                    fallback_index,
+                )
+                rendered_count += 1
+                progress.update()
+    finally:
+        progress.close()
+
+    metadata["render_summary"] = {
+        "status": "rendered_selections",
+        "selection_count": selection_count,
+        "rendered_selection_count": rendered_count,
+    }
+    with tqdm(total=1, desc="Writing metadata", unit="file") as progress:
+        metadata_path.write_text(
+            json.dumps(metadata, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        progress.update()
+    print(f"Metadata: {metadata_path}")
+    print(f"Rendered {rendered_count} selected pinhole views.")
+    return metadata
+
+
+def render_selection(
+    renderer: EquirectangularToPinhole,
+    output_dir: Path,
+    panorama: dict[str, Any],
+    selection: dict[str, Any],
+    render_defaults: dict[str, Any],
+    fallback_index: int,
+) -> None:
+    longitude = wrap_longitude(float(selection["longitude"]))
+    latitude = float(selection["latitude"])
+    validate_latitude(latitude)
+    selection_index = int(selection.get("selection_index", fallback_index))
+    width = int(selection.get("width", render_defaults["width"]))
+    height = int(selection.get("height", render_defaults["height"]))
+    fov_x = float(selection.get("fov_x", render_defaults["fov_x"]))
+    fov_y = float(selection.get("fov_y", render_defaults["fov_y"]))
+    interpolation = str(selection.get("interpolation", render_defaults["interpolation"]))
+    extension = str(
+        selection.get("output_extension", render_defaults.get("output_extension", ".png"))
+    )
+
+    camera_from_fov(width=width, height=height, fov_x=fov_x, fov_y=fov_y)
+    filename = rendered_filename(
+        str(panorama["pano_stem"]),
+        selection_index=selection_index,
+        longitude_degrees=degrees(longitude),
+        latitude_degrees=degrees(latitude),
+        width=width,
+        height=height,
+        extension=extension,
+    )
+    output_path = output_dir / filename
+    pinhole = renderer.render(
+        height=height,
+        width=width,
+        longitude=longitude,
+        latitude=latitude,
+        fov_x=fov_x,
+        fov_y=fov_y,
+        interpolation=interpolation,
+    )
+    Image.fromarray(pinhole).save(output_path)
+
+    selection.update(
+        {
+            "selection_index": selection_index,
+            "longitude": longitude,
+            "latitude": latitude,
+            "longitude_degrees": degrees(longitude),
+            "latitude_degrees": degrees(latitude),
+            "width": width,
+            "height": height,
+            "fov_x": fov_x,
+            "fov_y": fov_y,
+            "interpolation": interpolation,
+            "output_extension": _normalize_extension(extension),
+            "rendered_filename": filename,
+            "rendered_path": str(output_path),
+            "render_status": "rendered",
+            "pinhole_camera_pose": pinhole_camera_pose_report(
+                panorama.get("pano_camera_pose"),
+                longitude,
+                latitude,
+            ),
+        }
+    )
 
 
 def build_metadata(
@@ -603,6 +748,70 @@ def source_filename_candidates(scene_pano_filename: str) -> list[tuple[str, str]
     return candidates
 
 
+def pinhole_camera_pose_report(
+    pano_camera_pose: dict[str, Any] | None,
+    longitude: float,
+    latitude: float,
+) -> dict[str, Any] | None:
+    if pano_camera_pose is None:
+        return None
+    rotation_world_from_pano = np.asarray(
+        pano_camera_pose["rotation_world_from_pano"],
+        dtype=np.float64,
+    )
+    center_world = np.asarray(pano_camera_pose["center_world"], dtype=np.float64)
+    cam_from_pano = cam_from_pano_rotation(longitude, latitude)
+    rotation_world_from_pinhole = rotation_world_from_pano @ cam_from_pano.T
+    transform_world_from_pinhole = np.eye(4, dtype=np.float64)
+    transform_world_from_pinhole[:3, :3] = rotation_world_from_pinhole
+    transform_world_from_pinhole[:3, 3] = center_world
+    return {
+        "coordinate_frame": pano_camera_pose.get(
+            "coordinate_frame",
+            "colmap_world_unscaled",
+        ),
+        "longitude": longitude,
+        "latitude": latitude,
+        "longitude_degrees": degrees(longitude),
+        "latitude_degrees": degrees(latitude),
+        "center_world": center_world.tolist(),
+        "rotation_world_from_pinhole": rotation_world_from_pinhole.tolist(),
+        "transform_world_from_pinhole": transform_world_from_pinhole.tolist(),
+        "cam_from_pano_rotation": cam_from_pano.tolist(),
+    }
+
+
+def cam_from_pano_rotation(longitude: float, latitude: float) -> np.ndarray:
+    return rotation_x(-latitude) @ rotation_y(-longitude)
+
+
+def rotation_x(angle: float) -> np.ndarray:
+    c = np.cos(angle)
+    s = np.sin(angle)
+    return np.asarray(
+        [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]],
+        dtype=np.float64,
+    )
+
+
+def rotation_y(angle: float) -> np.ndarray:
+    c = np.cos(angle)
+    s = np.sin(angle)
+    return np.asarray(
+        [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]],
+        dtype=np.float64,
+    )
+
+
+def wrap_longitude(longitude: float) -> float:
+    return float((longitude + pi) % (2 * pi) - pi)
+
+
+def validate_latitude(latitude: float) -> None:
+    if not -pi / 2 <= latitude <= pi / 2:
+        raise ValueError("latitude must be in [-pi / 2, pi / 2] radians")
+
+
 def rendered_filename(
     pano_stem: str,
     *,
@@ -640,7 +849,6 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "-i",
         "--pano-dir",
-        required=True,
         type=Path,
         help="Directory containing source equirectangular panorama images.",
     )
@@ -697,9 +905,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="Overwrite an existing metadata.json in the output directory.",
     )
+    parser.add_argument(
+        "--render-selections",
+        action="store_true",
+        help=(
+            "Render existing selections from output-dir/metadata.json and update "
+            "the metadata in place."
+        ),
+    )
     args = parser.parse_args(argv)
 
-    if not args.pano_dir.is_dir():
+    if not args.render_selections and args.pano_dir is None:
+        parser.error("--pano-dir is required unless --render-selections is used")
+    if args.pano_dir is not None and not args.pano_dir.is_dir():
         parser.error(f"--pano-dir must be an existing directory: {args.pano_dir}")
     if args.scene_workspace is not None and not args.scene_workspace.is_dir():
         parser.error(
