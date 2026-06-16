@@ -40,6 +40,7 @@ The repo now has:
 - Per-panorama COLMAP pose and quality metadata for scene-registered panoramas.
 - A render command that consumes saved selections.
 - Rendering from saved longitude/latitude selections in `metadata.json`.
+- A lightweight browser selector for previewing crops and saving selections.
 
 ## Working Assumptions
 
@@ -86,13 +87,11 @@ Initial target reconstructed scene workspace:
 
 Use a lightweight local browser tool, but do not build a full frontend app.
 
-Recommended browser-selection command shape for the later UI stage:
+Browser-selection command shape:
 
 ```bash
 manual-pinhole-select \
-  --pano-dir /data/itri-3d-reconstruction/itri-3d-reconstruction/shelf-1781171031546 \
-  --scene-workspace /data/itri-3d-reconstruction/scene-reconstruction/2026-06-15-0002/colmap/session-001-img-0002-img-0003-img-0004-img-0005-img-0006 \
-  --output selections.json
+  --output-dir /data/itri-3d-reconstruction/scene-reconstruction/2026-06-15-0002/colmap/session-001-img-0002-img-0003-img-0004-img-0005-img-0006/pinhole-renders
 ```
 
 Implementation direction:
@@ -103,6 +102,9 @@ Implementation direction:
 - Clicking the panorama proposes a longitude/latitude pair.
 - Backend renders a preview crop using the existing pinhole renderer.
 - User can save multiple selections per panorama.
+- Saved selections are written back into `metadata.json`.
+- Final render output is still produced separately with
+  `manual-pinhole-render --render-selections`.
 - Keyboard shortcuts can handle next, previous, save, delete, and skip.
 
 This is easier to use than a pure terminal workflow and much smaller than a
@@ -419,7 +421,7 @@ Status: implemented.
 Add the lightweight local browser interface for stepping through panoramas,
 previewing candidate crops, and saving one or more selections per panorama.
 
-Status: pending.
+Status: implemented.
 
 ### Stage 5: Reconstruction Handoff
 
@@ -433,7 +435,7 @@ Status: pending.
 
 ### 2026-06-16
 
-Completed Stage 1, Stage 2, and Stage 3.
+Completed Stage 1, Stage 2, Stage 3, and Stage 4.
 
 Changed behavior:
 
@@ -451,6 +453,12 @@ Changed behavior:
 - Added `tqdm` progress for long-running metadata initialization steps.
 - Added `--render-selections` to render saved longitude/latitude selections.
 - Updated selections with rendered image paths and derived pinhole poses.
+- Added `manual-pinhole-select`, a local browser UI backed by a Python standard
+  library HTTP server.
+- Added panorama navigation, click-to-longitude/latitude conversion, backend
+  preview rendering, save selection, and delete selection actions.
+- Persisted manual selections directly into the existing `metadata.json`
+  contract with `render_status: pending` until final rendering.
 
 Known limitations:
 
@@ -458,13 +466,14 @@ Known limitations:
   workspaces. The long-term fix is tracked in
   `colmap-view-identity-manifest.md`.
 - `pinhole_camera_pose` is available only after rendering a saved selection.
-- No browser/manual selection UI exists yet.
+- The browser/manual selector does not render the final selected set
+  automatically; this remains a separate explicit render step.
 
 Recommended next slice:
 
-Implement Stage 4: a lightweight browser/manual selection UI that writes
-longitude/latitude selections into `metadata.json`, previewing candidate crops
-before final rendering.
+Implement Stage 5: add the reconstruction handoff conventions needed by the
+Gaussian Splatting workflow, including camera metadata export and traceability
+from selected pinhole images back to source panoramas.
 
 ## Risks
 

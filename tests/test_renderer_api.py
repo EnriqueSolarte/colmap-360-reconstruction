@@ -1,3 +1,4 @@
+import io
 import json
 from math import pi
 
@@ -17,6 +18,12 @@ from render_pinhole.tools.manual_pinhole_render import (
     build_metadata,
     rendered_filename,
     main as manual_render_main,
+)
+from render_pinhole.tools.manual_pinhole_select_server import (
+    append_selection,
+    delete_selection,
+    pixel_to_longitude_latitude,
+    render_preview_png,
 )
 from render_pinhole.tools.random_pinhole_image import main as random_render_image_main
 from render_pinhole.tools.render_pinhole_directory import main as render_directory_main
@@ -771,6 +778,146 @@ def test_manual_render_cli_rejects_invalid_selection_latitude(tmp_path) -> None:
 
     assert exit_code == 1
     assert not list(output_dir.glob("*.png"))
+
+
+def test_manual_select_pixel_coordinates_map_to_lon_lat() -> None:
+    longitude, latitude = pixel_to_longitude_latitude(50.0, 25.0, 100, 50)
+
+    assert longitude == pytest.approx(0.0)
+    assert latitude == pytest.approx(0.0)
+
+    longitude, latitude = pixel_to_longitude_latitude(0.0, 0.0, 100, 50)
+
+    assert longitude == pytest.approx(-pi)
+    assert latitude == pytest.approx(pi / 2)
+
+
+def test_manual_select_appends_and_deletes_selection(tmp_path) -> None:
+    source_path = tmp_path / "pano.png"
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(source_path)
+    metadata = {
+        "render_defaults": {
+            "width": 10,
+            "height": 8,
+            "fov_x": pi / 2,
+            "fov_y": pi / 3,
+            "interpolation": "nearest",
+            "output_extension": ".png",
+        },
+        "panoramas": [
+            {
+                "pano_index": 4,
+                "pano_filename": source_path.name,
+                "pano_stem": source_path.stem,
+                "source_pano_path": str(source_path),
+                "source_status": "matched",
+                "pano_camera_pose": {
+                    "coordinate_frame": "colmap_world_unscaled",
+                    "center_world": [1.0, 2.0, 3.0],
+                    "rotation_world_from_pano": np.eye(3).tolist(),
+                },
+                "selections": [
+                    {
+                        "selection_index": 2,
+                        "longitude": 0.0,
+                        "latitude": 0.0,
+                    }
+                ],
+            }
+        ],
+    }
+
+    selection = append_selection(metadata, 4, pi / 4, -pi / 6)
+
+    assert selection["selection_index"] == 3
+    assert selection["render_status"] == "pending"
+    assert selection["selected_by"] == "manual-pinhole-select"
+    assert selection["longitude_degrees"] == 45.0
+    assert selection["latitude_degrees"] == -29.999999999999996
+    assert selection["pinhole_camera_pose"]["center_world"] == [1.0, 2.0, 3.0]
+    assert metadata["selection_summary"] == {
+        "selected_panorama_count": 1,
+        "selection_count": 2,
+    }
+
+    assert delete_selection(metadata, 4, 2) is True
+    assert [item["selection_index"] for item in metadata["panoramas"][0]["selections"]] == [
+        3
+    ]
+    assert metadata["selection_summary"] == {
+        "selected_panorama_count": 1,
+        "selection_count": 1,
+    }
+
+
+def test_manual_select_preview_renders_png_bytes(tmp_path) -> None:
+    source_path = tmp_path / "pano.png"
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(source_path)
+    metadata = {
+        "render_defaults": {
+            "width": 10,
+            "height": 8,
+            "fov_x": pi / 2,
+            "fov_y": pi / 3,
+            "interpolation": "nearest",
+            "output_extension": ".png",
+        },
+        "panoramas": [
+            {
+                "pano_index": 0,
+                "pano_filename": source_path.name,
+                "pano_stem": source_path.stem,
+                "source_pano_path": str(source_path),
+                "source_status": "matched",
+                "selections": [],
+            }
+        ],
+    }
+
+    preview = render_preview_png(metadata, 0, pi / 4, 0.0)
+
+    assert preview.startswith(b"\x89PNG")
+    image = Image.open(io.BytesIO(preview))
+    assert np.asarray(image).shape == (8, 10, 3)
+
+
+def test_manual_select_preview_caps_resolution_without_changing_saved_selection(
+    tmp_path,
+) -> None:
+    source_path = tmp_path / "pano.png"
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(source_path)
+    metadata = {
+        "render_defaults": {
+            "width": 1280,
+            "height": 960,
+            "fov_x": pi / 2,
+            "fov_y": pi / 3,
+            "interpolation": "nearest",
+            "output_extension": ".png",
+        },
+        "panoramas": [
+            {
+                "pano_index": 0,
+                "pano_filename": source_path.name,
+                "pano_stem": source_path.stem,
+                "source_pano_path": str(source_path),
+                "source_status": "matched",
+                "pano_camera_pose": None,
+                "selections": [],
+            }
+        ],
+    }
+
+    preview = render_preview_png(metadata, 0, pi / 4, 0.0)
+    selection = append_selection(metadata, 0, pi / 4, 0.0)
+
+    image = Image.open(io.BytesIO(preview))
+    assert np.asarray(image).shape == (384, 512, 3)
+    assert selection["width"] == 1280
+    assert selection["height"] == 960
 
 
 def test_manual_render_scene_metadata_uses_registered_colmap_panoramas(tmp_path) -> None:
