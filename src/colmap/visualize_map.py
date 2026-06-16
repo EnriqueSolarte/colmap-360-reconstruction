@@ -17,8 +17,6 @@ os.environ.setdefault("XDG_RUNTIME_DIR", "/tmp/open3d-runtime")
 
 import numpy as np
 
-from .reconstruct import DEFAULT_WORKSPACE
-
 try:
     import pycolmap
 except ImportError:  # pragma: no cover - environment dependent
@@ -30,6 +28,8 @@ except ImportError:  # pragma: no cover - environment dependent
     o3d = None
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_WORKSPACE = PROJECT_ROOT / "data" / "colmap-panorama-rig"
 DEFAULT_MODEL = DEFAULT_WORKSPACE / "sparse_best"
 
 

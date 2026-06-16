@@ -3,7 +3,7 @@ from math import pi
 import numpy as np
 import pytest
 
-from ep_pinhole import render_pinhole
+from render_pinhole import render_pinhole
 
 EP_HEIGHT = 181
 EP_WIDTH = 360

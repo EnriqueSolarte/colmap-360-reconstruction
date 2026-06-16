@@ -4,15 +4,15 @@ from math import pi
 import numpy as np
 import pytest
 
-from ep_pinhole import EquirectangularToPinhole, render_pinhole
-from ep_pinhole.tools.render_pinhole_image import (
+from render_pinhole import EquirectangularToPinhole, render_pinhole
+from render_pinhole.tools.render_pinhole_image import (
     DEFAULT_HEIGHT,
     DEFAULT_WIDTH,
     main as render_image_main,
 )
-from ep_pinhole.tools.random_pinhole_image import main as random_render_image_main
-from ep_pinhole.tools.render_pinhole_directory import main as render_directory_main
-from ep_pinhole.view_sampling import (
+from render_pinhole.tools.random_pinhole_image import main as random_render_image_main
+from render_pinhole.tools.render_pinhole_directory import main as render_directory_main
+from render_pinhole.view_sampling import (
     VIEW_SAMPLING_DESCRIPTIONS,
     random_views,
     uniform_longitude_views,

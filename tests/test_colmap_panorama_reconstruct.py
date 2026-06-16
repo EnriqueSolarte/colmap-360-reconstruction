@@ -56,7 +56,7 @@ from colmap.panorama_reconstruct import (
     validate_initial_session_compatible,
     validate_rig_masks,
 )
-from ep_pinhole import EquirectangularToPinhole
+from render_pinhole import EquirectangularToPinhole
 
 
 def create_previous_panorama_session(

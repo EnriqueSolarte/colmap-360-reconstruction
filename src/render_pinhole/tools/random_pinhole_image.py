@@ -8,8 +8,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from ep_pinhole import EquirectangularToPinhole
-from ep_pinhole.defaults import (
+from render_pinhole import EquirectangularToPinhole
+from render_pinhole.defaults import (
     DEFAULT_EP_LATITUDE_MAX,
     DEFAULT_EP_LATITUDE_MIN,
     DEFAULT_EP_LONGITUDE_MAX,
