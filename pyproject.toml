@@ -30,6 +30,7 @@ visualize = [
 [project.scripts]
 colmap-panorama-reconstruct = "colmap.panorama_reconstruct:main"
 colmap-visualize = "colmap.visualize_map:main"
+manual-pinhole-render = "render_pinhole.tools.manual_pinhole_render:main"
 tools-sampling = "tools.sampling_dir:main"
 tools-proc-video = "tools.proc_video:main"
 

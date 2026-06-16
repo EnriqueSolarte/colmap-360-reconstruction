@@ -10,6 +10,14 @@ from render_pinhole.tools.render_pinhole_image import (
     DEFAULT_WIDTH,
     main as render_image_main,
 )
+from render_pinhole.tools.manual_pinhole_render import (
+    PanoramaRigViewMetadata,
+    SceneContext,
+    ScenePanoramaGroup,
+    build_metadata,
+    rendered_filename,
+    main as manual_render_main,
+)
 from render_pinhole.tools.random_pinhole_image import main as random_render_image_main
 from render_pinhole.tools.render_pinhole_directory import main as render_directory_main
 from render_pinhole.view_sampling import (
@@ -537,3 +545,348 @@ def test_render_directory_cli_supports_uniform_longitude_views(tmp_path) -> None
         0.25,
         0.25,
     ]
+
+
+def test_manual_render_cli_initializes_metadata(tmp_path, capsys) -> None:
+    pano_dir = tmp_path / "panos"
+    output_dir = tmp_path / "pinhole-renders"
+    pano_dir.mkdir()
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(pano_dir / "pano_002.png")
+    Image.fromarray(make_equirectangular_image()).save(pano_dir / "pano_001.jpg")
+    (pano_dir / "notes.txt").write_text("not an image", encoding="utf-8")
+
+    exit_code = manual_render_main(
+        [
+            "-i",
+            str(pano_dir),
+            "-o",
+            str(output_dir),
+            "--width",
+            "10",
+            "--height",
+            "8",
+            "--fov-x",
+            str(pi / 2),
+            "--fov-y",
+            str(pi / 3),
+            "--interpolation",
+            "nearest",
+            "--output-extension",
+            "jpg",
+        ]
+    )
+
+    metadata_path = output_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 0
+    assert metadata["schema_version"] == 1
+    assert metadata["tool"] == "manual-pinhole-render"
+    assert metadata["pano_dir"] == str(pano_dir)
+    assert metadata["scene_workspace"] is None
+    assert metadata["output_dir"] == str(output_dir)
+    assert metadata["metadata_path"] == str(metadata_path)
+    assert metadata["pose_status"] == "missing"
+    assert metadata["source_pano_count"] == 2
+    assert metadata["scene"] is None
+    assert metadata["render_defaults"]["width"] == 10
+    assert metadata["render_defaults"]["height"] == 8
+    assert metadata["render_defaults"]["fov_x"] == pi / 2
+    assert metadata["render_defaults"]["fov_y"] == pi / 3
+    assert metadata["render_defaults"]["interpolation"] == "nearest"
+    assert metadata["render_defaults"]["output_extension"] == ".jpg"
+    assert metadata["render_defaults"]["camera"]["model"] == "PINHOLE"
+    assert metadata["render_defaults"]["camera"]["width"] == 10
+    assert metadata["render_defaults"]["camera"]["height"] == 8
+    assert metadata["panorama_count"] == 2
+    assert [record["pano_filename"] for record in metadata["panoramas"]] == [
+        "pano_001.jpg",
+        "pano_002.png",
+    ]
+    assert metadata["panoramas"][0]["pano_index"] == 0
+    assert metadata["panoramas"][0]["pano_camera_pose"] is None
+    assert metadata["panoramas"][0]["pose_status"] == "missing"
+    assert metadata["panoramas"][0]["source_status"] == "matched"
+    assert metadata["panoramas"][0]["colmap_quality"] is None
+    assert metadata["panoramas"][0]["selections"] == []
+    output = capsys.readouterr().out
+    assert f"Metadata: {metadata_path}" in output
+    assert "Initialized 2 panoramas." in output
+
+
+def test_manual_render_cli_refuses_to_overwrite_metadata(tmp_path) -> None:
+    pano_dir = tmp_path / "panos"
+    output_dir = tmp_path / "pinhole-renders"
+    pano_dir.mkdir()
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(pano_dir / "pano.png")
+
+    assert manual_render_main(["-i", str(pano_dir), "-o", str(output_dir)]) == 0
+    metadata_path = output_dir / "metadata.json"
+    original_metadata = metadata_path.read_text(encoding="utf-8")
+
+    assert manual_render_main(["-i", str(pano_dir), "-o", str(output_dir)]) == 1
+    assert metadata_path.read_text(encoding="utf-8") == original_metadata
+
+    assert (
+        manual_render_main(
+            ["-i", str(pano_dir), "-o", str(output_dir), "--overwrite"]
+        )
+        == 0
+    )
+
+
+def test_manual_render_cli_rejects_invalid_panorama_image(tmp_path, capsys) -> None:
+    pano_dir = tmp_path / "panos"
+    output_dir = tmp_path / "pinhole-renders"
+    pano_dir.mkdir()
+    (pano_dir / "broken.png").write_text("not an image", encoding="utf-8")
+
+    exit_code = manual_render_main(["-i", str(pano_dir), "-o", str(output_dir)])
+
+    assert exit_code == 1
+    assert not (output_dir / "metadata.json").exists()
+    assert "Invalid panorama image" in capsys.readouterr().out
+
+
+def test_manual_render_filename_uses_pm_angle_convention() -> None:
+    assert (
+        rendered_filename(
+            "shelf-1781171031546_000123",
+            selection_index=2,
+            longitude_degrees=45.0,
+            latitude_degrees=-10.0,
+            width=1280,
+            height=960,
+            extension="png",
+        )
+        == (
+            "shelf-1781171031546_000123__sel-002"
+            "__lon-p045.0__lat-m010.0__w1280_h960.png"
+        )
+    )
+
+
+def test_manual_render_scene_metadata_uses_registered_colmap_panoramas(tmp_path) -> None:
+    source_path = tmp_path / "shelf-0001.png"
+    source_path.write_bytes(b"placeholder")
+    scene_name = "img-0002_shelf-0001.png"
+    views = (
+        PanoramaRigViewMetadata(
+            index=0,
+            image_prefix="pano_camera00/",
+            yaw=0.0,
+            pitch=0.0,
+            cam_from_pano_rotation=np.eye(3),
+        ),
+        PanoramaRigViewMetadata(
+            index=1,
+            image_prefix="pano_camera01/",
+            yaw=0.0,
+            pitch=0.0,
+            cam_from_pano_rotation=np.eye(3),
+        ),
+    )
+    images = (
+        FakeColmapImage(
+            image_id=1,
+            name=f"pano_camera00/{scene_name}",
+            point3d_ids=[10],
+        ),
+        FakeColmapImage(
+            image_id=2,
+            name=f"pano_camera01/{scene_name}",
+            point3d_ids=[11],
+        ),
+    )
+    reconstruction = FakeColmapReconstruction(
+        {
+            10: FakePoint3D(1.0, [1, 3]),
+            11: FakePoint3D(3.0, [2]),
+        },
+        num_reg_images=2,
+    )
+    scene_context = SceneContext(
+        workspace=tmp_path / "scene",
+        model_path=tmp_path / "scene" / "sparse_best",
+        rig_metadata_path=tmp_path / "scene" / "panorama_rig_config.json",
+        reconstruction=reconstruction,
+        views=views,
+        groups=(ScenePanoramaGroup(name=scene_name, images=images),),
+        image_frame_names={
+            1: scene_name,
+            2: scene_name,
+            3: "connected.png",
+        },
+    )
+
+    metadata = build_metadata(
+        pano_paths=[source_path],
+        pano_dir=tmp_path,
+        output_dir=tmp_path / "renders",
+        scene_workspace=tmp_path / "scene",
+        width=10,
+        height=8,
+        fov_x=pi / 2,
+        fov_y=pi / 3,
+        interpolation="bilinear",
+        output_extension=".png",
+        scene_context=scene_context,
+    )
+
+    record = metadata["panoramas"][0]
+    quality = record["colmap_quality"]
+
+    assert metadata["panorama_count"] == 1
+    assert metadata["source_pano_count"] == 1
+    assert metadata["pose_status"] == "matched"
+    assert metadata["scene"]["registered_virtual_image_count"] == 2
+    assert metadata["scene"]["registered_panorama_count"] == 1
+    assert record["scene_pano_filename"] == scene_name
+    assert record["source_pano_filename"] == "shelf-0001.png"
+    assert record["source_pano_path"] == str(source_path)
+    assert record["source_status"] == "matched"
+    assert record["source_resolution_strategy"] == "strip_first_prefix"
+    assert record["pose_status"] == "matched"
+    assert record["pano_camera_pose"]["coordinate_frame"] == "colmap_world_unscaled"
+    assert record["pano_camera_pose"]["center_world"] == [1.0, 2.0, 3.0]
+    assert quality["registered_virtual_image_count"] == 2
+    assert quality["expected_virtual_image_count"] == 2
+    assert quality["active_virtual_camera_count"] == 2
+    assert quality["triangulated_observation_count"] == 2
+    assert quality["unique_point3D_count"] == 2
+    assert quality["mean_reprojection_error_px"] == 2.0
+    assert quality["median_reprojection_error_px"] == 2.0
+    assert quality["p90_reprojection_error_px"] == pytest.approx(2.8)
+    assert quality["mean_track_length"] == 1.5
+    assert quality["connected_panorama_count"] == 1
+    assert quality["top_connected_panoramas"] == [
+        {"scene_pano_filename": "connected.png", "shared_track_count": 1}
+    ]
+    assert [camera["virtual_camera_index"] for camera in quality["per_virtual_camera"]] == [
+        0,
+        1,
+    ]
+
+
+def test_manual_render_scene_metadata_marks_missing_source_panoramas(tmp_path) -> None:
+    scene_name = "img-0002_missing.png"
+    views = (
+        PanoramaRigViewMetadata(
+            index=0,
+            image_prefix="pano_camera00/",
+            yaw=0.0,
+            pitch=0.0,
+            cam_from_pano_rotation=np.eye(3),
+        ),
+    )
+    scene_context = SceneContext(
+        workspace=tmp_path / "scene",
+        model_path=tmp_path / "scene" / "sparse_best",
+        rig_metadata_path=tmp_path / "scene" / "panorama_rig_config.json",
+        reconstruction=FakeColmapReconstruction({}, num_reg_images=1),
+        views=views,
+        groups=(
+            ScenePanoramaGroup(
+                name=scene_name,
+                images=(
+                    FakeColmapImage(
+                        image_id=1,
+                        name=f"pano_camera00/{scene_name}",
+                        point3d_ids=[],
+                    ),
+                ),
+            ),
+        ),
+        image_frame_names={1: scene_name},
+    )
+
+    metadata = build_metadata(
+        pano_paths=[],
+        pano_dir=tmp_path,
+        output_dir=tmp_path / "renders",
+        scene_workspace=tmp_path / "scene",
+        width=10,
+        height=8,
+        fov_x=pi / 2,
+        fov_y=pi / 3,
+        interpolation="bilinear",
+        output_extension=".png",
+        scene_context=scene_context,
+    )
+
+    record = metadata["panoramas"][0]
+
+    assert record["scene_pano_filename"] == scene_name
+    assert record["source_pano_filename"] is None
+    assert record["source_pano_path"] is None
+    assert record["source_status"] == "missing"
+    assert record["source_resolution_strategy"] == "unresolved"
+
+
+class FakeColmapImage:
+    def __init__(self, image_id: int, name: str, point3d_ids: list[int]):
+        self.image_id = image_id
+        self.name = name
+        self.camera_id = image_id + 100
+        self.points2D = [FakePoint2D(point3d_id) for point3d_id in point3d_ids]
+        self.num_points3D = len(point3d_ids)
+
+    def projection_center(self):
+        return np.asarray([1.0, 2.0, 3.0])
+
+    def cam_from_world(self):
+        return FakePose()
+
+
+class FakePoint2D:
+    def __init__(self, point3d_id: int | None):
+        self.point3D_id = point3d_id
+
+    def has_point3D(self) -> bool:
+        return self.point3D_id is not None
+
+
+class FakePoint3D:
+    def __init__(self, error: float, image_ids: list[int]):
+        self.error = error
+        self.track = FakeTrack(image_ids)
+
+
+class FakeTrack:
+    def __init__(self, image_ids: list[int]):
+        self.elements = [FakeTrackElement(image_id) for image_id in image_ids]
+
+    def length(self) -> int:
+        return len(self.elements)
+
+
+class FakeTrackElement:
+    def __init__(self, image_id: int):
+        self.image_id = image_id
+
+
+class FakeColmapReconstruction:
+    def __init__(self, points: dict[int, FakePoint3D], num_reg_images: int):
+        self._points = points
+        self._num_reg_images = num_reg_images
+
+    def point3D(self, point_id: int) -> FakePoint3D:
+        return self._points[point_id]
+
+    def num_reg_images(self) -> int:
+        return self._num_reg_images
+
+
+class FakePose:
+    translation = np.asarray([0.0, 0.0, 0.0])
+    rotation = None
+
+    def __init__(self):
+        self.rotation = FakeRotation()
+
+
+class FakeRotation:
+    def matrix(self):
+        return np.eye(3)

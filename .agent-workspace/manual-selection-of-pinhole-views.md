@@ -29,10 +29,16 @@ The repo already has:
 The repo does not yet have:
 
 - A manual review UI or command loop.
-- A persistent selection file format for hand-picked longitude/latitude pairs.
-- A render command that consumes a user-authored selection file.
+- A populated selection workflow for hand-picked longitude/latitude pairs.
+- A render command that consumes saved selections.
 - A clear mapping from reconstructed panorama records back to manually selected
   pinhole outputs.
+
+The repo now has:
+
+- A `manual-pinhole-render` metadata initializer.
+- Scene-aware filtering so the COLMAP scene defines the panorama subset.
+- Per-panorama COLMAP pose and quality metadata for scene-registered panoramas.
 
 ## Working Assumptions
 
@@ -79,7 +85,7 @@ Initial target reconstructed scene workspace:
 
 Use a lightweight local browser tool, but do not build a full frontend app.
 
-Recommended command shape:
+Recommended browser-selection command shape for the later UI stage:
 
 ```bash
 manual-pinhole-select \
@@ -101,6 +107,106 @@ Implementation direction:
 This is easier to use than a pure terminal workflow and much smaller than a
 framework-based browser app. It also works naturally with remote development:
 the user can open a forwarded local port in a browser.
+
+## Approved Stage 1 CLI
+
+The first implementation slice creates and validates the render metadata
+workspace before manual selections exist.
+
+Command shape:
+
+```bash
+manual-pinhole-render \
+  --pano-dir /data/itri-3d-reconstruction/itri-3d-reconstruction/shelf-1781171031546 \
+  --scene-workspace /data/itri-3d-reconstruction/scene-reconstruction/2026-06-15-0002/colmap/session-001-img-0002-img-0003-img-0004-img-0005-img-0006 \
+  --output-dir /data/itri-3d-reconstruction/scene-reconstruction/2026-06-15-0002/colmap/session-001-img-0002-img-0003-img-0004-img-0005-img-0006/pinhole-renders
+```
+
+Aliases:
+
+```text
+--pano-dir / -i
+--output-dir / -o
+```
+
+Stage 1 output:
+
+```text
+pinhole-renders/
+  metadata.json
+```
+
+The metadata records each panorama filename/path, optional scene workspace, the
+render defaults, empty per-panorama `selections`, and pose status. Pose lookup
+is intentionally deferred until the reconstruction workspace mapping is
+confirmed.
+
+## Approved Stage 2 Scene-Aware Metadata
+
+When `--scene-workspace` is provided, the COLMAP scene defines the panorama
+subset. The source panorama directory passed with `--pano-dir` may contain many
+more images than were used in the reconstruction, so it is only used to resolve
+original source panorama paths.
+
+Stage 2 behavior:
+
+- Read `scene-workspace/sparse_best`.
+- Read `scene-workspace/panorama_rig_config.json`.
+- Collapse registered virtual-camera images into panorama frames.
+- Write metadata only for panorama frames registered in the COLMAP scene.
+- Resolve each scene panorama filename back to `--pano-dir` when possible.
+- Mark unresolved source panorama files explicitly.
+- Show `tqdm` progress while scanning, validating, grouping, computing COLMAP
+  quality, and writing metadata.
+
+Per-panorama metadata includes:
+
+- Scene panorama filename.
+- Source panorama filename/path and source resolution status.
+- Optimized panorama pose in raw unscaled COLMAP world coordinates.
+- Registered and active virtual-camera counts.
+- Triangulated observation count.
+- Unique 3D point count.
+- Mean, median, and p90 reprojection error.
+- Mean track length.
+- Connected panorama count and top connected panoramas.
+- Per-virtual-camera image IDs and triangulated observation counts.
+
+Implemented result:
+
+```text
+source_pano_count: 14419
+registered_virtual_image_count: 2076
+registered_panorama_count: 173
+panorama_count: 173
+source_status matched: 173
+```
+
+Smoke-tested command:
+
+```bash
+python -m render_pinhole.tools.manual_pinhole_render \
+  -i /data/itri-3d-reconstruction/itri-3d-reconstruction/shelf-1781171031546 \
+  --scene-workspace /data/itri-3d-reconstruction/scene-reconstruction/2026-06-15-0002/colmap/session-001-img-0002-img-0003-img-0004-img-0005-img-0006 \
+  -o /tmp/manual-pinhole-slice2-smoke \
+  --overwrite
+```
+
+Verification:
+
+```text
+pytest /workspace/tests/test_renderer_api.py
+27 passed
+
+pytest /workspace/tests
+97 passed
+```
+
+Current output metadata path for the real workflow:
+
+```text
+/data/itri-3d-reconstruction/scene-reconstruction/2026-06-15-0002/colmap/session-001-img-0002-img-0003-img-0004-img-0005-img-0006/pinhole-renders/metadata.json
+```
 
 ## Selection JSON Contract
 
@@ -213,7 +319,7 @@ camera metadata and debugging harder.
 
 ## Proposed Staged Direction
 
-### Stage 1: Selection File Contract
+### Stage 1: Metadata Initializer And Selection Contract
 
 Define a small, versioned selection file that records:
 
@@ -226,25 +332,78 @@ Define a small, versioned selection file that records:
   selected direction.
 - Optional reviewer notes or tags.
 
-This stage should include validation but should not build an interactive UI yet.
+This stage should include validation but should not build an interactive UI or
+render selected pinhole images yet.
 
-### Stage 2: Render From Selection File
+Status: implemented.
 
-Add a CLI that reads the selection file, renders the requested pinhole views,
-and writes both images and metadata.
+### Stage 2: Scene-Aware Metadata And Quality
+
+Make the CLI scene-aware and add per-panorama COLMAP pose and quality metadata.
+
+Status: implemented.
+
+### Stage 3: Render From Metadata Selections
+
+Extend the CLI so that once `metadata.json` contains selections, it renders the
+requested pinhole views and updates image metadata.
 
 This proves the file contract is useful before investing in interaction design.
 
-### Stage 3: Manual Selection Interface
+Status: next recommended slice.
+
+### Stage 4: Manual Selection Interface
 
 Add the lightweight local browser interface for stepping through panoramas,
 previewing candidate crops, and saving one or more selections per panorama.
 
-### Stage 4: Reconstruction Handoff
+Status: pending.
+
+### Stage 5: Reconstruction Handoff
 
 Add output conventions and metadata needed by the Gaussian Splatting workflow.
 This should include clear camera intrinsics and traceability back to the source
 panoramas.
+
+Status: pending.
+
+## Progress Log
+
+### 2026-06-16
+
+Completed Stage 1 and Stage 2.
+
+Changed behavior:
+
+- Added `manual-pinhole-render`.
+- Registered the CLI in `pyproject.toml`.
+- Wrote `pinhole-renders/metadata.json` as the central state file.
+- Preserved empty `selections` arrays for future manual longitude/latitude
+  picks.
+- Made `--scene-workspace` authoritative for which panorama frames are included.
+- Resolved scene panorama names back to source panorama files in `--pano-dir`
+  using exact match first, then legacy prefix stripping.
+- Stored missing source files explicitly instead of dropping scene panoramas.
+- Added optimized panorama pose in raw unscaled COLMAP world coordinates.
+- Added per-panorama COLMAP quality metrics.
+- Added `tqdm` progress for long-running metadata initialization steps.
+
+Known limitations:
+
+- Source identity still relies on legacy filename inference for existing
+  workspaces. The long-term fix is tracked in
+  `colmap-view-identity-manifest.md`.
+- `pinhole_camera_pose` is not available until a user selects a longitude and
+  latitude.
+- No selected pinhole images are rendered yet.
+- No browser/manual selection UI exists yet.
+
+Recommended next slice:
+
+Implement Stage 3: render selected pinhole views from existing selections in
+`metadata.json`, update each selection with rendered filename/path, and compute
+the selected pinhole camera pose from the panorama pose plus selected
+longitude/latitude.
 
 ## Risks
 
