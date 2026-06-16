@@ -301,6 +301,98 @@ Use three levels of verification:
 The expected outcome is not identical sparse geometry. The expected outcome is a
 useful continuation model with substantially lower runtime.
 
+## Evaluation Evidence: 2026-06-16
+
+Reproducibility metadata:
+
+- Project version: `v0.1.0`
+- Git branch: `dev`
+- Git commit: `b0eb69bfde5f62823732d3ee05cbaabac0027b46`
+- Git remote: `https://github.com/EnriqueSolarte/colmap-360-reconstruction.git`
+- Implementation worktree status before this note update: clean
+
+Evaluation inputs:
+
+- `2026-06-16-0001`: `/data/itri-3d-reconstruction/scene-reconstruction/2026-06-16-0001/colmap`
+- `2026-06-16-0002`: `/data/itri-3d-reconstruction/scene-reconstruction/2026-06-16-0002/colmap`
+
+The two runs are not a clean score-vs-no-score comparison. The run scripts use
+different `last-k` settings:
+
+- `2026-06-16-0001/run-reconstruction.sh`: `--last-k-frames 5`
+- `2026-06-16-0002/run-reconstruction.sh`: `--last-k-frames 30`
+
+Completed report summary:
+
+```text
+2026-06-16-0001, last-k=5
+session                           total min  match min  pairs   reg frames  points  mean err
+img-0001                              21.4       20.5       -          29   10593     0.833
+img-0001-img-0002                     52.4       51.3   66240          58   24451     0.887
+img-0001-img-0002-img-0003            74.6       73.4   66240          87   34801     0.895
+img-0001-img-0002-img-0003-img-0004   91.6       90.1   66240         116   48517     0.914
+
+2026-06-16-0002, last-k=30 plus keyframe-score reporting
+session                           total min  match min  pairs    reg frames  points  mean err
+img-0001                              21.4       20.5        -          29   10593     0.833
+img-0001-img-0002                    117.7      116.4   166464          58   40160     0.961
+img-0001-img-0002-img-0003           162.7      161.1   170640          87   59313     1.000
+```
+
+Practical conclusions:
+
+- `last-k=5` is much faster than `last-k=30` on these runs.
+- `last-k=30` produces more sparse points, but the mean reprojection error is
+  worse. More points are not automatically better; this may be noisier geometry
+  rather than a strictly better reconstruction.
+- Matching remains the dominant runtime cost. Even with constant pair count in
+  `last-k=5`, matching time still grows as the accumulated database grows:
+  `51.3m -> 73.4m -> 90.1m`.
+- The score computation itself is cheap compared with matching: approximately
+  `2-3s` in the completed scored reports.
+- Score reporting is available in some reports from both directories. The
+  `2026-06-16-0001` run is mainly a `last-k=5` evaluation, but later reports
+  include `keyframe_score_count` values, likely because they were produced after
+  score-reporting code was available.
+
+Keyframe-score observations:
+
+- Top-scored frames are not simply the latest frames. Example from
+  `2026-06-16-0001/img-0001-img-0002-img-0003-img-0004`:
+
+```text
+selected last-k frames: 1127, 1128, 1129, 1130, 1131
+top scored frames:      1128, 751, 1505, 374, 1491
+```
+
+This is useful evidence. The score is selecting a different anchor set than
+pure recency. It does not yet prove that `top-k` or `hybrid-k` will be faster
+or better, but it makes the next experiment worth running.
+
+Brutally practical recommendation:
+
+- Do not evaluate `hybrid-k` with large candidate counts such as
+  `last-k=20 + top-k=10`; it will likely create too many pairs and reproduce
+  the `last-k=30` cost problem.
+- Use small candidate counts first:
+
+```text
+--match-scope top-k --top-k-frames 5
+--match-scope hybrid-k --last-k-frames 3 --top-k-frames 3
+--match-scope hybrid-k --last-k-frames 5 --top-k-frames 5
+```
+
+- Compare against the strongest current baseline, which is `last-k=5`, not
+  `last-k=30`.
+- Track both quality and runtime:
+  `matching_pair_count`, `matching_and_rig_verification`, registered frames,
+  sparse points, mean reprojection error, and visual sanity of the model.
+- If matching time keeps increasing even with small bounded pair counts, the
+  next serious optimization is probably not only better anchor selection. It is
+  likely a reduced active matching database: match only new images plus selected
+  anchors in a temporary database, then import the resulting verified geometry
+  back into the accumulated session database.
+
 ## Open Questions
 
 - What should the first default be after implementation: keep `all`, or switch
