@@ -26,10 +26,59 @@ def test_sampling_cli_starts_from_initial_index(tmp_path, capsys) -> None:
 
     assert exit_code == 0
     assert sorted(path.name for path in dest_dir.iterdir()) == ["001.jpg", "003.jpg"]
-    assert (dest_dir / "001.jpg").resolve() == (source_dir / "001.jpg").resolve()
+    assert not (dest_dir / "001.jpg").is_symlink()
+    assert (dest_dir / "001.jpg").stat().st_dev == (
+        source_dir / "001.jpg"
+    ).stat().st_dev
+    assert (dest_dir / "001.jpg").stat().st_ino == (
+        source_dir / "001.jpg"
+    ).stat().st_ino
 
     output = capsys.readouterr().out
     assert "idx=1" in output
+    assert "hard link" in output
+
+
+def test_sampling_cli_can_create_symlinks(tmp_path) -> None:
+    source_dir = tmp_path / "source"
+    dest_dir = tmp_path / "dest"
+    source_dir.mkdir()
+    (source_dir / "000.jpg").write_text("000")
+
+    exit_code = sampling_main(
+        [
+            "--source",
+            str(source_dir),
+            "--destination",
+            str(dest_dir),
+            "--symlink",
+        ]
+    )
+
+    assert exit_code == 0
+    assert (dest_dir / "000.jpg").is_symlink()
+    assert (dest_dir / "000.jpg").resolve() == (source_dir / "000.jpg").resolve()
+
+
+def test_sampling_cli_does_not_fallback_on_link_error(tmp_path) -> None:
+    source_dir = tmp_path / "source"
+    dest_dir = tmp_path / "dest"
+    source_dir.mkdir()
+    dest_dir.mkdir()
+    (source_dir / "000.jpg").write_text("source")
+    (dest_dir / "000.jpg").write_text("existing")
+
+    with pytest.raises(FileExistsError):
+        sampling_main(
+            [
+                "--source",
+                str(source_dir),
+                "--destination",
+                str(dest_dir),
+            ]
+        )
+
+    assert (dest_dir / "000.jpg").read_text() == "existing"
 
 
 def test_sampling_cli_rejects_negative_initial_index(tmp_path) -> None:

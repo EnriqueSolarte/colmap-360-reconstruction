@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sample a directory of images by creating symbolic links in a target directory."""
+"""Sample a directory of images by creating hard links in a target directory."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "-d",
         "--destination",
-        help="Directory where symbolic links will be created.",
+        help="Directory where links will be created.",
     )
     parser.add_argument(
         "--skip",
@@ -42,6 +42,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         help="Initial image index to start sampling from. Default: 0.",
     )
+    parser.add_argument(
+        "--symlink",
+        action="store_true",
+        help="Create symbolic links instead of the default hard links.",
+    )
     return parser.parse_args(argv)
 
 
@@ -49,6 +54,22 @@ def list_images(directory: Path) -> List[Path]:
     """Return a sorted list of files inside ``directory``."""
     files: Iterable[Path] = directory.iterdir()
     return sorted(file for file in files if file.is_file())
+
+
+def create_hardlink(src: Path, dst: Path) -> None:
+    """
+    Create a hard link ``dst`` pointing to ``src``.
+
+    If the link already exists and points to the same file, nothing happens.
+    Otherwise the original filesystem error is raised.
+    """
+    try:
+        os.link(src, dst)
+        return
+    except FileExistsError:
+        if os.path.samefile(src, dst):
+            return
+        raise
 
 
 def create_symlink(src: Path, dst: Path) -> None:
@@ -94,11 +115,15 @@ def main(argv: list[str] | None = None) -> int:
     created = 0
     for file in sampled_files:
         target_path = dest_dir / file.name
-        create_symlink(file, target_path)
+        if args.symlink:
+            create_symlink(file, target_path)
+        else:
+            create_hardlink(file, target_path)
         created += 1
 
+    link_type = "symbolic link" if args.symlink else "hard link"
     print(
-        f"Linked {created} file(s) from {source_dir} "
+        f"Created {created} {link_type}(s) from {source_dir} "
         f"into {dest_dir.resolve()} with skip={args.skip}, idx={args.idx}"
     )
     return 0
