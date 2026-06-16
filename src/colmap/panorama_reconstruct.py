@@ -107,6 +107,13 @@ class GeneratedVirtualImageBatch:
         return [self.records_by_name[name][1] for name in self.names]
 
 
+@dataclass(frozen=True)
+class RigFrameImageSet:
+    frame_id: int
+    image_ids: tuple[int, ...]
+    image_names: tuple[str, ...]
+
+
 def default_render_options(render_type: str) -> PanoramaRenderOptions:
     if render_type == "overlapping":
         return PanoramaRenderOptions(
@@ -382,6 +389,157 @@ def read_generated_virtual_image_batch(
     return GeneratedVirtualImageBatch(
         names=tuple(image_names),
         records_by_name=read_image_records_by_name(database_path, image_names),
+    )
+
+
+def read_rig_frame_image_sets(
+    database_path: Path,
+    frame_ids: Sequence[int],
+) -> list[RigFrameImageSet]:
+    if not frame_ids:
+        return []
+    frame_id_set = {int(frame_id) for frame_id in frame_ids}
+    placeholders = ",".join("?" for _value in frame_id_set)
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT frame_data.frame_id, images.image_id, images.name
+            FROM frame_data
+            JOIN images ON images.image_id = frame_data.data_id
+            WHERE frame_data.frame_id IN ({placeholders})
+            ORDER BY frame_data.frame_id, frame_data.sensor_id, images.name
+            """,
+            tuple(sorted(frame_id_set)),
+        ).fetchall()
+    frames: dict[int, list[tuple[int, str]]] = {
+        frame_id: [] for frame_id in sorted(frame_id_set)
+    }
+    for frame_id, image_id, image_name in rows:
+        frames[int(frame_id)].append((int(image_id), str(image_name)))
+    return [
+        RigFrameImageSet(
+            frame_id=frame_id,
+            image_ids=tuple(image_id for image_id, _image_name in images),
+            image_names=tuple(image_name for _image_id, image_name in images),
+        )
+        for frame_id, images in frames.items()
+        if images
+    ]
+
+
+def read_rig_frame_image_sets_for_images(
+    database_path: Path,
+    image_ids: Sequence[int],
+) -> list[RigFrameImageSet]:
+    if not image_ids:
+        return []
+    image_id_set = {int(image_id) for image_id in image_ids}
+    placeholders = ",".join("?" for _value in image_id_set)
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT DISTINCT frame_id
+            FROM frame_data
+            WHERE data_id IN ({placeholders})
+            ORDER BY frame_id
+            """,
+            tuple(sorted(image_id_set)),
+        ).fetchall()
+    return read_rig_frame_image_sets(
+        database_path,
+        [int(row[0]) for row in rows],
+    )
+
+
+def read_last_old_rig_frame_image_sets(
+    database_path: Path,
+    *,
+    excluded_image_ids: Sequence[int],
+    limit: int,
+) -> list[RigFrameImageSet]:
+    if limit <= 0:
+        return []
+    excluded_image_id_set = {int(image_id) for image_id in excluded_image_ids}
+    with sqlite3.connect(database_path) as connection:
+        if excluded_image_id_set:
+            placeholders = ",".join("?" for _value in excluded_image_id_set)
+            rows = connection.execute(
+                f"""
+                SELECT frames.frame_id
+                FROM frames
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM frame_data
+                    WHERE frame_data.frame_id = frames.frame_id
+                    AND frame_data.data_id IN ({placeholders})
+                )
+                ORDER BY frames.frame_id DESC
+                LIMIT ?
+                """,
+                (*tuple(sorted(excluded_image_id_set)), limit),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT frame_id
+                FROM frames
+                ORDER BY frame_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+    return read_rig_frame_image_sets(
+        database_path,
+        sorted(int(row[0]) for row in rows),
+    )
+
+
+def add_frame_image_pairs(
+    pairs: list[tuple[str, str]],
+    seen_pair_keys: set[tuple[int, int]],
+    frame_a: RigFrameImageSet,
+    frame_b: RigFrameImageSet,
+) -> None:
+    for image_id_a, image_name_a in zip(frame_a.image_ids, frame_a.image_names):
+        for image_id_b, image_name_b in zip(frame_b.image_ids, frame_b.image_names):
+            if image_id_a == image_id_b:
+                continue
+            key = tuple(sorted((image_id_a, image_id_b)))
+            if key in seen_pair_keys:
+                continue
+            seen_pair_keys.add(key)
+            pairs.append((image_name_a, image_name_b))
+
+
+def build_last_k_match_pairs(
+    new_frames: Sequence[RigFrameImageSet],
+    selected_old_frames: Sequence[RigFrameImageSet],
+    *,
+    new_frame_overlap: int,
+) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    seen_pair_keys: set[tuple[int, int]] = set()
+    ordered_new_frames = sorted(new_frames, key=lambda frame: frame.frame_id)
+    for index, frame in enumerate(ordered_new_frames):
+        for neighbor in ordered_new_frames[index + 1 : index + 1 + new_frame_overlap]:
+            add_frame_image_pairs(pairs, seen_pair_keys, frame, neighbor)
+    for new_frame in ordered_new_frames:
+        for old_frame in selected_old_frames:
+            add_frame_image_pairs(pairs, seen_pair_keys, old_frame, new_frame)
+    return pairs
+
+
+def write_image_pair_list(
+    path: Path,
+    pairs: Sequence[tuple[str, str]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(
+            f"{image_name_a} {image_name_b}\n"
+            for image_name_a, image_name_b in pairs
+        ),
+        encoding="utf-8",
     )
 
 
@@ -1133,15 +1291,31 @@ def match_features(
     database_path: Path,
     *,
     matcher: str,
+    match_scope: str,
     matching_options: Any,
     overlap: int,
     loop_detection: bool,
     vocab_tree_path: Path | None,
+    image_pairs_path: Path | None = None,
     device: Any | None = None,
 ) -> None:
     validate_vocab_tree_path(vocab_tree_path)
     if device is None:
         device = pycolmap_module.Device.cpu
+    if match_scope == "last-k":
+        if image_pairs_path is None:
+            raise ValueError("image_pairs_path is required for last-k matching")
+        pairing_options = pycolmap_module.ImportedPairingOptions()
+        pairing_options.match_list_path = image_pairs_path
+        pycolmap_module.match_image_pairs(
+            database_path,
+            matching_options=matching_options,
+            pairing_options=pairing_options,
+            device=device,
+        )
+        return
+    if match_scope != "all":
+        raise ValueError("match_scope must be 'all' or 'last-k'")
     if matcher == "sequential":
         pairing_options = pycolmap_module.SequentialPairingOptions()
         pairing_options.overlap = overlap
@@ -1200,6 +1374,8 @@ def run_panorama_reconstruction(
     *,
     render_options: PanoramaRenderOptions,
     matcher: str = "sequential",
+    match_scope: str = "all",
+    last_k_frames: int = 20,
     overlap: int = 15,
     loop_detection: bool = True,
     vocab_tree_path: Path | None = None,
@@ -1377,6 +1553,36 @@ def run_panorama_reconstruction(
     )
 
     stage_started_at = time.perf_counter()
+    if match_scope == "last-k" and initial_session is None:
+        raise ValueError("--match-scope last-k requires --initial-session")
+    if match_scope not in {"all", "last-k"}:
+        raise ValueError("match_scope must be 'all' or 'last-k'")
+    new_frame_sets = read_rig_frame_image_sets_for_images(
+        paths["database"],
+        generated_image_batch.image_ids,
+    )
+    selected_old_frame_sets: list[RigFrameImageSet] = []
+    match_pairs: list[tuple[str, str]] = []
+    if match_scope == "last-k":
+        selected_old_frame_sets = read_last_old_rig_frame_image_sets(
+            paths["database"],
+            excluded_image_ids=generated_image_batch.image_ids,
+            limit=last_k_frames,
+        )
+        if not selected_old_frame_sets:
+            raise RuntimeError(
+                "--match-scope last-k could not find old rig frames in the "
+                "initial session database"
+            )
+        match_pairs = build_last_k_match_pairs(
+            new_frame_sets,
+            selected_old_frame_sets,
+            new_frame_overlap=overlap,
+        )
+        if not match_pairs:
+            raise RuntimeError("--match-scope last-k produced no image pairs")
+        write_image_pair_list(paths["match_pairs"], match_pairs)
+
     matching_options = create_feature_matching_options(
         pycolmap_module,
         feature_options,
@@ -1387,10 +1593,12 @@ def run_panorama_reconstruction(
         pycolmap_module,
         paths["database"],
         matcher=matcher,
+        match_scope=match_scope,
         matching_options=matching_options,
         overlap=overlap,
         loop_detection=loop_detection,
         vocab_tree_path=vocab_tree_path,
+        image_pairs_path=paths["match_pairs"] if match_scope == "last-k" else None,
         device=execution["device"],
     )
     record_elapsed_stage(
@@ -1443,6 +1651,8 @@ def run_panorama_reconstruction(
         views=views,
         panorama_count=len(panorama_paths),
         matcher=matcher,
+        match_scope=match_scope,
+        last_k_frames=last_k_frames,
         overlap=overlap,
         loop_detection=loop_detection,
         vocab_tree_path=vocab_tree_path,
@@ -1456,6 +1666,10 @@ def run_panorama_reconstruction(
         image_limit=image_limit,
         new_image_prefix=new_image_prefix,
         generated_image_batch=generated_image_batch,
+        new_frame_sets=new_frame_sets,
+        selected_old_frame_sets=selected_old_frame_sets,
+        matching_pair_count=len(match_pairs) if match_scope == "last-k" else None,
+        match_pairs_path=paths["match_pairs"] if match_scope == "last-k" else None,
         initial_session=initial_session,
         initial_metadata=initial_metadata,
         reconstructions=reconstructions,
@@ -1499,6 +1713,7 @@ def panorama_workspace_paths(workspace: Path) -> dict[str, Path]:
         "raw_ply": workspace / "cloud_colmap_raw.ply",
         "report": workspace / "panorama_rig_report.json",
         "rig_metadata": workspace / "panorama_rig_config.json",
+        "match_pairs": workspace / "last_k_match_pairs.txt",
     }
 
 
@@ -1555,6 +1770,8 @@ def build_panorama_report(
     views: Sequence[PanoramaRigView],
     panorama_count: int,
     matcher: str,
+    match_scope: str,
+    last_k_frames: int,
     overlap: int,
     loop_detection: bool,
     vocab_tree_path: Path | None,
@@ -1568,6 +1785,10 @@ def build_panorama_report(
     image_limit: int | None,
     new_image_prefix: Path | None,
     generated_image_batch: GeneratedVirtualImageBatch,
+    new_frame_sets: Sequence[RigFrameImageSet],
+    selected_old_frame_sets: Sequence[RigFrameImageSet],
+    matching_pair_count: int | None,
+    match_pairs_path: Path | None,
     initial_session: InitialPanoramaSession | None,
     initial_metadata: dict[str, Any] | None,
     reconstructions: dict[int, Any],
@@ -1608,6 +1829,11 @@ def build_panorama_report(
         "camera": camera.report(),
         "options": {
             "matcher": matcher,
+            "match_scope": match_scope,
+            "effective_pairing": (
+                "imported_last_k" if match_scope == "last-k" else matcher
+            ),
+            "last_k_frames": last_k_frames,
             "sequential_overlap": overlap,
             "loop_detection": loop_detection,
             "vocab_tree_path": (
@@ -1663,6 +1889,27 @@ def build_panorama_report(
         "new_database_image_ids": generated_image_batch.image_ids,
         "new_database_camera_ids": generated_image_batch.camera_ids,
         "new_database_image_names": list(generated_image_batch.names),
+        "new_frame_count": len(new_frame_sets),
+        "new_frame_ids": [frame.frame_id for frame in new_frame_sets],
+        "selected_old_frame_count": len(selected_old_frame_sets),
+        "selected_old_frame_ids": [
+            frame.frame_id for frame in selected_old_frame_sets
+        ],
+        "selected_old_image_count": sum(
+            len(frame.image_ids) for frame in selected_old_frame_sets
+        ),
+        "selected_old_image_ids": [
+            image_id
+            for frame in selected_old_frame_sets
+            for image_id in frame.image_ids
+        ],
+        "selected_old_image_names": [
+            image_name
+            for frame in selected_old_frame_sets
+            for image_name in frame.image_names
+        ],
+        "matching_pair_count": matching_pair_count,
+        "match_pairs_path": None if match_pairs_path is None else str(match_pairs_path),
         "masks": masks_report,
         "features_by_virtual_camera": feature_report,
         "feature_health": feature_health,
@@ -1833,6 +2080,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Feature matching strategy.",
     )
     parser.add_argument(
+        "--match-scope",
+        choices=("all", "last-k"),
+        default="all",
+        help=(
+            "Image-pair scope. 'all' uses the selected matcher over the full "
+            "database. 'last-k' matches current images against current images "
+            "and the last K old rig frames from --initial-session."
+        ),
+    )
+    parser.add_argument(
+        "--last-k-frames",
+        type=int,
+        default=20,
+        help="Number of old rig frames to anchor when --match-scope=last-k.",
+    )
+    parser.add_argument(
         "--overlap",
         type=int,
         default=15,
@@ -1968,6 +2231,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--fov-y must be greater than 0 and less than pi radians")
     if args.image_limit is not None and args.image_limit <= 0:
         parser.error("--image-limit must be positive")
+    if args.last_k_frames <= 0:
+        parser.error("--last-k-frames must be positive")
+    if args.match_scope == "last-k" and args.initial_session is None:
+        parser.error("--match-scope last-k requires --initial-session")
     if args.max_num_features <= 0:
         parser.error("--max-num-features must be positive")
     if not 0 <= args.png_compression <= 9:
@@ -2009,6 +2276,8 @@ def main(argv: list[str] | None = None) -> int:
         workspace=args.workspace,
         render_options=render_options_from_args(args),
         matcher=args.matcher,
+        match_scope=args.match_scope,
+        last_k_frames=args.last_k_frames,
         overlap=args.overlap,
         loop_detection=args.loop_detection,
         vocab_tree_path=args.vocab_tree_path,
@@ -2040,6 +2309,7 @@ def main(argv: list[str] | None = None) -> int:
     if report["initial_session"]["enabled"]:
         print(f"initial session: {report['initial_session']['workspace']}")
     print(f"compute device: {report['options']['resolved_device']}")
+    print(f"match scope: {report['options']['match_scope']}")
     print(
         "virtual cameras with features: "
         f"{report['feature_health']['virtual_cameras_with_features']}/"

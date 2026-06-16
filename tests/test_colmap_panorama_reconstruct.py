@@ -16,6 +16,7 @@ from colmap.panorama_reconstruct import (
     PipelineExecutionOptions,
     VirtualImageOutputOptions,
     assign_camera_ids_by_prefix,
+    build_last_k_match_pairs,
     build_rig_remap_maps,
     build_initial_session_report,
     build_panorama_report,
@@ -37,7 +38,10 @@ from colmap.panorama_reconstruct import (
     read_camera_ids_by_prefix,
     read_generated_virtual_image_batch,
     read_image_records_by_name,
+    read_last_old_rig_frame_image_sets,
+    read_rig_frame_image_sets_for_images,
     resolve_initial_panorama_session,
+    RigFrameImageSet,
     run_incremental_mapping,
     parse_args,
     pad_equirectangular_image,
@@ -479,6 +483,8 @@ def test_panorama_report_includes_new_database_images(tmp_path) -> None:
         views=views,
         panorama_count=1,
         matcher="sequential",
+        match_scope="all",
+        last_k_frames=20,
         overlap=15,
         loop_detection=True,
         vocab_tree_path=None,
@@ -499,6 +505,10 @@ def test_panorama_report_includes_new_database_images(tmp_path) -> None:
         image_limit=None,
         new_image_prefix=Path("img-0002"),
         generated_image_batch=batch,
+        new_frame_sets=[],
+        selected_old_frame_sets=[],
+        matching_pair_count=None,
+        match_pairs_path=None,
         initial_session=None,
         initial_metadata=None,
         reconstructions={0: FakeReconstruction()},
@@ -507,6 +517,8 @@ def test_panorama_report_includes_new_database_images(tmp_path) -> None:
     )
 
     assert report["database_image_count"] == 4
+    assert report["options"]["match_scope"] == "all"
+    assert report["options"]["effective_pairing"] == "sequential"
     assert report["old_database_image_count"] == 2
     assert report["new_database_image_count"] == 2
     assert report["new_database_image_ids"] == [7, 9]
@@ -515,6 +527,95 @@ def test_panorama_report_includes_new_database_images(tmp_path) -> None:
         "pano_camera00/img-0002_shelf.png",
         "pano_camera01/img-0002_shelf.png",
     ]
+
+
+def test_last_k_frame_selection_excludes_generated_frames(tmp_path) -> None:
+    database_path = tmp_path / "database.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE frames(frame_id INTEGER PRIMARY KEY, rig_id INTEGER)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE frame_data(
+                frame_id INTEGER,
+                data_id INTEGER,
+                sensor_id INTEGER,
+                sensor_type INTEGER
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
+            [
+                (1, "pano_camera00/old-1.png", 1),
+                (2, "pano_camera01/old-1.png", 2),
+                (3, "pano_camera00/old-2.png", 1),
+                (4, "pano_camera01/old-2.png", 2),
+                (5, "pano_camera00/old-3.png", 1),
+                (6, "pano_camera01/old-3.png", 2),
+                (7, "pano_camera00/new.png", 1),
+                (8, "pano_camera01/new.png", 2),
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO frames(frame_id, rig_id) VALUES (?, 13)",
+            [(10,), (11,), (12,), (13,)],
+        )
+        connection.executemany(
+            """
+            INSERT INTO frame_data(frame_id, data_id, sensor_id, sensor_type)
+            VALUES (?, ?, ?, 0)
+            """,
+            [
+                (10, 1, 1),
+                (10, 2, 2),
+                (11, 3, 1),
+                (11, 4, 2),
+                (12, 5, 1),
+                (12, 6, 2),
+                (13, 7, 1),
+                (13, 8, 2),
+            ],
+        )
+
+    new_frames = read_rig_frame_image_sets_for_images(database_path, [7, 8])
+    old_frames = read_last_old_rig_frame_image_sets(
+        database_path,
+        excluded_image_ids=[7, 8],
+        limit=2,
+    )
+
+    assert [frame.frame_id for frame in new_frames] == [13]
+    assert [frame.frame_id for frame in old_frames] == [11, 12]
+    assert [frame.image_ids for frame in old_frames] == [(3, 4), (5, 6)]
+
+
+def test_last_k_match_pairs_use_new_overlap_and_old_anchors() -> None:
+    new_frames = [
+        RigFrameImageSet(20, (20, 21), ("new-a-0.png", "new-a-1.png")),
+        RigFrameImageSet(21, (22, 23), ("new-b-0.png", "new-b-1.png")),
+        RigFrameImageSet(22, (24, 25), ("new-c-0.png", "new-c-1.png")),
+    ]
+    old_frames = [
+        RigFrameImageSet(10, (10, 11), ("old-a-0.png", "old-a-1.png")),
+    ]
+
+    pairs = build_last_k_match_pairs(
+        new_frames,
+        old_frames,
+        new_frame_overlap=1,
+    )
+
+    assert len(pairs) == 20
+    assert ("new-a-0.png", "new-b-0.png") in pairs
+    assert ("new-b-1.png", "new-c-1.png") in pairs
+    assert ("new-a-0.png", "new-c-0.png") not in pairs
+    assert ("old-a-0.png", "new-a-0.png") in pairs
+    assert ("old-a-1.png", "new-c-1.png") in pairs
 
 
 def test_seeded_generated_frames_are_moved_into_existing_rig(tmp_path) -> None:
@@ -888,6 +989,7 @@ def test_sequential_matching_expands_rig_and_enables_loop_detection(
         FakePycolmap,
         tmp_path / "database.db",
         matcher="sequential",
+        match_scope="all",
         matching_options=matching_options,
         overlap=25,
         loop_detection=True,
@@ -899,6 +1001,51 @@ def test_sequential_matching_expands_rig_and_enables_loop_detection(
     assert pairing.expand_rig_images is True
     assert pairing.loop_detection is True
     assert pairing.vocab_tree_path == vocab_tree
+    assert device == "cpu"
+
+
+def test_last_k_matching_uses_imported_image_pairs(tmp_path) -> None:
+    class ImportedPairingOptions:
+        def __init__(self):
+            self.match_list_path = None
+
+    class FakePycolmap:
+        class Device:
+            cpu = "cpu"
+
+        ImportedPairingOptions = ImportedPairingOptions
+        calls = []
+
+        @classmethod
+        def match_image_pairs(
+            cls,
+            database_path,
+            *,
+            matching_options,
+            pairing_options,
+            device,
+        ):
+            cls.calls.append((database_path, matching_options, pairing_options, device))
+
+    pair_list = tmp_path / "pairs.txt"
+    pair_list.write_text("a.png b.png\n", encoding="utf-8")
+    matching_options = object()
+
+    match_features(
+        FakePycolmap,
+        tmp_path / "database.db",
+        matcher="sequential",
+        match_scope="last-k",
+        matching_options=matching_options,
+        overlap=25,
+        loop_detection=True,
+        vocab_tree_path=None,
+        image_pairs_path=pair_list,
+    )
+
+    _database, matching, pairing, device = FakePycolmap.calls[0]
+    assert matching is matching_options
+    assert pairing.match_list_path == pair_list
     assert device == "cpu"
 
 
@@ -949,6 +1096,8 @@ def test_parse_args_accepts_image_limit(tmp_path) -> None:
 
     assert args.image_limit == 3
     assert args.initial_session == previous
+    assert args.match_scope == "all"
+    assert args.last_k_frames == 20
     assert args.loop_detection is True
     assert args.feature_extractor == "sift"
     assert args.feature_matcher == "sift-bruteforce"
@@ -959,6 +1108,39 @@ def test_parse_args_accepts_image_limit(tmp_path) -> None:
     assert args.device == "auto"
     assert args.gpu_index == "-1"
     assert args.gpu_bundle_adjustment is True
+
+
+def test_parse_args_accepts_last_k_match_scope(tmp_path) -> None:
+    previous = tmp_path / "previous"
+    previous.mkdir()
+
+    args = parse_args(
+        [
+            "--input-image-path",
+            str(tmp_path),
+            "--initial-session",
+            str(previous),
+            "--match-scope",
+            "last-k",
+            "--last-k-frames",
+            "7",
+        ]
+    )
+
+    assert args.match_scope == "last-k"
+    assert args.last_k_frames == 7
+
+
+def test_parse_args_rejects_last_k_without_initial_session(tmp_path) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--input-image-path",
+                str(tmp_path),
+                "--match-scope",
+                "last-k",
+            ]
+        )
 
 
 def test_render_panorama_rig_images_respects_image_limit(tmp_path, monkeypatch) -> None:
