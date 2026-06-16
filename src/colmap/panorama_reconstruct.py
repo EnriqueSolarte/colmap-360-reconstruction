@@ -11,7 +11,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from math import cos, pi, radians, sin, tan
+from math import cos, log, pi, radians, sin, tan
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - environment dependent
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WORKSPACE = PROJECT_ROOT / "data" / "colmap-panorama-rig"
+COLMAP_IMAGE_PAIR_ID_PRIME = 2_147_483_647
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,62 @@ class RigFrameImageSet:
     frame_id: int
     image_ids: tuple[int, ...]
     image_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class KeyframeAnchorScore:
+    frame_id: int
+    anchor_score: float
+    connectivity_score: float
+    triangulated_support_score: float
+    fov_distribution_score: float
+    reprojection_quality_score: float
+    connected_frame_count: int
+    verified_inlier_count: int
+    triangulated_point_count: int
+    active_virtual_camera_count: int
+    total_virtual_camera_count: int
+    active_virtual_camera_ratio: float
+    fov_entropy: float
+    median_reprojection_error_px: float | None
+    mean_reprojection_error_px: float | None
+    image_ids: tuple[int, ...]
+    image_names: tuple[str, ...]
+    triangulated_points_by_image: tuple[int, ...]
+
+    def report(self) -> dict[str, Any]:
+        return {
+            "frame_id": self.frame_id,
+            "anchor_score": round_report_float(self.anchor_score),
+            "connectivity_score": round_report_float(self.connectivity_score),
+            "triangulated_support_score": round_report_float(
+                self.triangulated_support_score,
+            ),
+            "fov_distribution_score": round_report_float(
+                self.fov_distribution_score,
+            ),
+            "reprojection_quality_score": round_report_float(
+                self.reprojection_quality_score,
+            ),
+            "connected_frame_count": self.connected_frame_count,
+            "verified_inlier_count": self.verified_inlier_count,
+            "triangulated_point_count": self.triangulated_point_count,
+            "active_virtual_camera_count": self.active_virtual_camera_count,
+            "total_virtual_camera_count": self.total_virtual_camera_count,
+            "active_virtual_camera_ratio": round_report_float(
+                self.active_virtual_camera_ratio,
+            ),
+            "fov_entropy": round_report_float(self.fov_entropy),
+            "median_reprojection_error_px": optional_report_float(
+                self.median_reprojection_error_px,
+            ),
+            "mean_reprojection_error_px": optional_report_float(
+                self.mean_reprojection_error_px,
+            ),
+            "image_ids": list(self.image_ids),
+            "image_names": list(self.image_names),
+            "triangulated_points_by_image": list(self.triangulated_points_by_image),
+        }
 
 
 def default_render_options(render_type: str) -> PanoramaRenderOptions:
@@ -540,6 +597,212 @@ def write_image_pair_list(
             for image_name_a, image_name_b in pairs
         ),
         encoding="utf-8",
+    )
+
+
+def round_report_float(value: float) -> float:
+    return round(float(value), 6)
+
+
+def optional_report_float(value: float | None) -> float | None:
+    return None if value is None else round_report_float(value)
+
+
+def log_capped_score(value: int | float, cap: int | float) -> float:
+    if value <= 0 or cap <= 0:
+        return 0.0
+    return min(log(1.0 + float(value)) / log(1.0 + float(cap)), 1.0)
+
+
+def linear_capped_score(value: int | float, cap: int | float) -> float:
+    if value <= 0 or cap <= 0:
+        return 0.0
+    return min(float(value) / float(cap), 1.0)
+
+
+def decode_colmap_image_pair_id(pair_id: int) -> tuple[int, int]:
+    image_id2 = pair_id % COLMAP_IMAGE_PAIR_ID_PRIME
+    image_id1 = (pair_id - image_id2) // COLMAP_IMAGE_PAIR_ID_PRIME
+    return int(image_id1), int(image_id2)
+
+
+def read_frame_connection_stats(
+    database_path: Path,
+    frame_id_by_image_id: dict[int, int],
+) -> dict[int, dict[str, int | set[int]]]:
+    stats: dict[int, dict[str, int | set[int]]] = {
+        frame_id: {"connected_frame_ids": set(), "verified_inlier_count": 0}
+        for frame_id in set(frame_id_by_image_id.values())
+    }
+    with sqlite3.connect(database_path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if "two_view_geometries" not in tables:
+            return stats
+        rows = connection.execute(
+            """
+            SELECT pair_id, rows
+            FROM two_view_geometries
+            WHERE rows > 0
+            """
+        ).fetchall()
+    for pair_id, inlier_count in rows:
+        image_id1, image_id2 = decode_colmap_image_pair_id(int(pair_id))
+        frame_id1 = frame_id_by_image_id.get(image_id1)
+        frame_id2 = frame_id_by_image_id.get(image_id2)
+        if frame_id1 is None or frame_id2 is None or frame_id1 == frame_id2:
+            continue
+        frame1_connected = stats[frame_id1]["connected_frame_ids"]
+        frame2_connected = stats[frame_id2]["connected_frame_ids"]
+        if not isinstance(frame1_connected, set) or not isinstance(frame2_connected, set):
+            raise AssertionError("invalid frame connection stats")
+        frame1_connected.add(frame_id2)
+        frame2_connected.add(frame_id1)
+        stats[frame_id1]["verified_inlier_count"] = int(
+            stats[frame_id1]["verified_inlier_count"],
+        ) + int(inlier_count)
+        stats[frame_id2]["verified_inlier_count"] = int(
+            stats[frame_id2]["verified_inlier_count"],
+        ) + int(inlier_count)
+    return stats
+
+
+def normalized_entropy(counts: Sequence[int]) -> float:
+    total = sum(counts)
+    positive_counts = [count for count in counts if count > 0]
+    if total <= 0 or len(positive_counts) <= 1:
+        return 0.0
+    entropy = -sum(
+        (count / total) * log(count / total)
+        for count in positive_counts
+    )
+    return entropy / log(len(counts))
+
+
+def score_keyframe_anchors(
+    database_path: Path,
+    reconstruction: Any,
+    *,
+    total_virtual_camera_count: int,
+    min_active_camera_points: int = 30,
+    connectivity_frame_cap: int = 10,
+    verified_inlier_cap: int = 5000,
+    triangulated_point_cap: int = 3000,
+    reprojection_error_scale_px: float = 2.0,
+) -> list[KeyframeAnchorScore]:
+    frames: dict[int, list[Any]] = {}
+    for image_id in reconstruction.reg_image_ids():
+        image = reconstruction.image(image_id)
+        frame_id = int(image.frame_id)
+        frames.setdefault(frame_id, []).append(image)
+
+    frame_id_by_image_id = {
+        int(image.image_id): frame_id
+        for frame_id, images in frames.items()
+        for image in images
+    }
+    connection_stats = read_frame_connection_stats(database_path, frame_id_by_image_id)
+    scores = []
+    for frame_id, images in frames.items():
+        ordered_images = sorted(images, key=lambda image: int(image.image_id))
+        triangulated_points_by_image = []
+        point_ids: set[int] = set()
+        for image in ordered_images:
+            image_point_ids = {
+                int(point2d.point3D_id)
+                for point2d in image.points2D
+                if point2d.has_point3D()
+            }
+            triangulated_points_by_image.append(len(image_point_ids))
+            point_ids.update(image_point_ids)
+
+        point_errors = [
+            float(reconstruction.points3D[point_id].error)
+            for point_id in point_ids
+            if point_id in reconstruction.points3D
+            and reconstruction.points3D[point_id].has_error()
+        ]
+        median_error = (
+            None if not point_errors else float(np.median(np.asarray(point_errors)))
+        )
+        mean_error = (
+            None if not point_errors else float(np.mean(np.asarray(point_errors)))
+        )
+        active_virtual_camera_count = sum(
+            count >= min_active_camera_points
+            for count in triangulated_points_by_image
+        )
+        active_virtual_camera_ratio = (
+            0.0
+            if total_virtual_camera_count <= 0
+            else min(active_virtual_camera_count / total_virtual_camera_count, 1.0)
+        )
+        fov_entropy = normalized_entropy(triangulated_points_by_image)
+        fov_distribution_score = 0.5 * active_virtual_camera_ratio + 0.5 * fov_entropy
+
+        frame_connection_stats = connection_stats.get(
+            frame_id,
+            {"connected_frame_ids": set(), "verified_inlier_count": 0},
+        )
+        connected_frame_ids = frame_connection_stats["connected_frame_ids"]
+        if not isinstance(connected_frame_ids, set):
+            raise AssertionError("invalid connected frame set")
+        connected_frame_count = len(connected_frame_ids)
+        verified_inlier_count = int(frame_connection_stats["verified_inlier_count"])
+        connectivity_score = 0.5 * linear_capped_score(
+            connected_frame_count,
+            connectivity_frame_cap,
+        ) + 0.5 * log_capped_score(verified_inlier_count, verified_inlier_cap)
+        triangulated_support_score = log_capped_score(
+            len(point_ids),
+            triangulated_point_cap,
+        )
+        reprojection_quality_score = (
+            0.0
+            if median_error is None
+            else 1.0 / (1.0 + median_error / reprojection_error_scale_px)
+        )
+        anchor_score = (
+            connectivity_score
+            * triangulated_support_score
+            * fov_distribution_score
+            * reprojection_quality_score
+        )
+        scores.append(
+            KeyframeAnchorScore(
+                frame_id=frame_id,
+                anchor_score=anchor_score,
+                connectivity_score=connectivity_score,
+                triangulated_support_score=triangulated_support_score,
+                fov_distribution_score=fov_distribution_score,
+                reprojection_quality_score=reprojection_quality_score,
+                connected_frame_count=connected_frame_count,
+                verified_inlier_count=verified_inlier_count,
+                triangulated_point_count=len(point_ids),
+                active_virtual_camera_count=active_virtual_camera_count,
+                total_virtual_camera_count=total_virtual_camera_count,
+                active_virtual_camera_ratio=active_virtual_camera_ratio,
+                fov_entropy=fov_entropy,
+                median_reprojection_error_px=median_error,
+                mean_reprojection_error_px=mean_error,
+                image_ids=tuple(int(image.image_id) for image in ordered_images),
+                image_names=tuple(str(image.name) for image in ordered_images),
+                triangulated_points_by_image=tuple(triangulated_points_by_image),
+            )
+        )
+    return sorted(
+        scores,
+        key=lambda score: (
+            score.anchor_score,
+            score.connected_frame_count,
+            score.triangulated_point_count,
+            -score.frame_id,
+        ),
+        reverse=True,
     )
 
 
@@ -1643,6 +1906,18 @@ def run_panorama_reconstruction(
     )
 
     stage_started_at = time.perf_counter()
+    keyframe_scores = score_keyframe_anchors(
+        paths["database"],
+        best_reconstruction,
+        total_virtual_camera_count=len(views),
+    )
+    record_elapsed_stage(
+        elapsed_seconds_by_stage,
+        "keyframe_scoring",
+        stage_started_at,
+    )
+
+    stage_started_at = time.perf_counter()
     report = build_panorama_report(
         pycolmap_version=pycolmap_module.__version__,
         input_image_path=input_image_path,
@@ -1675,6 +1950,7 @@ def run_panorama_reconstruction(
         reconstructions=reconstructions,
         best_model_id=best_model_id,
         best_reconstruction=best_reconstruction,
+        keyframe_scores=keyframe_scores,
     )
     elapsed_seconds_by_stage["report_writing"] = 0.0
     elapsed_seconds = time.perf_counter() - started_at
@@ -1794,6 +2070,7 @@ def build_panorama_report(
     reconstructions: dict[int, Any],
     best_model_id: int,
     best_reconstruction: Any,
+    keyframe_scores: Sequence[KeyframeAnchorScore],
 ) -> dict[str, Any]:
     database_report = read_database_stats(paths["database"])
     new_database_image_count = len(generated_image_batch.names)
@@ -1910,6 +2187,28 @@ def build_panorama_report(
         ],
         "matching_pair_count": matching_pair_count,
         "match_pairs_path": None if match_pairs_path is None else str(match_pairs_path),
+        "keyframe_score_formula": {
+            "score": (
+                "connectivity_score * triangulated_support_score * "
+                "fov_distribution_score * reprojection_quality_score"
+            ),
+            "connectivity_score": (
+                "0.5 * min(connected_frame_count / 10, 1) + "
+                "0.5 * min(log(1 + verified_inlier_count) / log(1 + 5000), 1)"
+            ),
+            "triangulated_support_score": (
+                "min(log(1 + triangulated_point_count) / log(1 + 3000), 1)"
+            ),
+            "fov_distribution_score": (
+                "0.5 * active_virtual_camera_ratio + 0.5 * fov_entropy"
+            ),
+            "reprojection_quality_score": (
+                "1 / (1 + median_reprojection_error_px / 2)"
+            ),
+            "min_active_camera_points": 30,
+        },
+        "keyframe_score_count": len(keyframe_scores),
+        "keyframe_scores": [score.report() for score in keyframe_scores],
         "masks": masks_report,
         "features_by_virtual_camera": feature_report,
         "feature_health": feature_health,

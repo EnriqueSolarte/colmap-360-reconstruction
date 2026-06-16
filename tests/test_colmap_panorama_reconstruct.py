@@ -10,6 +10,7 @@ from PIL import Image
 
 from colmap.camera import camera_from_fov
 from colmap.panorama_reconstruct import (
+    COLMAP_IMAGE_PAIR_ID_PRIME,
     FeaturePipelineOptions,
     GeneratedVirtualImageBatch,
     PanoramaRenderOptions,
@@ -51,6 +52,7 @@ from colmap.panorama_reconstruct import (
     replace_generated_frames_with_seed_rig_frames,
     resolve_pipeline_execution,
     rig_view_masks,
+    score_keyframe_anchors,
     validate_initial_session_compatible,
     validate_rig_masks,
 )
@@ -514,11 +516,14 @@ def test_panorama_report_includes_new_database_images(tmp_path) -> None:
         reconstructions={0: FakeReconstruction()},
         best_model_id=0,
         best_reconstruction=FakeReconstruction(),
+        keyframe_scores=[],
     )
 
     assert report["database_image_count"] == 4
     assert report["options"]["match_scope"] == "all"
     assert report["options"]["effective_pairing"] == "sequential"
+    assert report["keyframe_score_count"] == 0
+    assert report["keyframe_scores"] == []
     assert report["old_database_image_count"] == 2
     assert report["new_database_image_count"] == 2
     assert report["new_database_image_ids"] == [7, 9]
@@ -527,6 +532,89 @@ def test_panorama_report_includes_new_database_images(tmp_path) -> None:
         "pano_camera00/img-0002_shelf.png",
         "pano_camera01/img-0002_shelf.png",
     ]
+
+
+def test_score_keyframe_anchors_reports_quality_components(tmp_path) -> None:
+    class FakePoint2D:
+        def __init__(self, point3d_id):
+            self.point3D_id = point3d_id
+
+        def has_point3D(self):
+            return self.point3D_id >= 0
+
+    class FakeImage:
+        def __init__(self, image_id, frame_id, name, point3d_ids):
+            self.image_id = image_id
+            self.frame_id = frame_id
+            self.name = name
+            self.points2D = [FakePoint2D(point3d_id) for point3d_id in point3d_ids]
+
+    class FakePoint3D:
+        def __init__(self, error):
+            self.error = error
+
+        def has_error(self):
+            return True
+
+    class FakeReconstruction:
+        def __init__(self):
+            self._images = {
+                1: FakeImage(1, 10, "pano_camera00/a.png", [101, 102, -1]),
+                2: FakeImage(2, 10, "pano_camera01/a.png", [103]),
+                3: FakeImage(3, 11, "pano_camera00/b.png", [201]),
+                4: FakeImage(4, 11, "pano_camera01/b.png", [202]),
+            }
+            self.points3D = {
+                101: FakePoint3D(0.5),
+                102: FakePoint3D(1.0),
+                103: FakePoint3D(1.5),
+                201: FakePoint3D(3.0),
+                202: FakePoint3D(3.5),
+            }
+
+        def reg_image_ids(self):
+            return list(self._images)
+
+        def image(self, image_id):
+            return self._images[image_id]
+
+    def pair_id(image_id1, image_id2):
+        image_id1, image_id2 = sorted((image_id1, image_id2))
+        return COLMAP_IMAGE_PAIR_ID_PRIME * image_id1 + image_id2
+
+    database_path = tmp_path / "database.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE two_view_geometries(pair_id INTEGER PRIMARY KEY, rows INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO two_view_geometries(pair_id, rows) VALUES (?, ?)",
+            [
+                (pair_id(1, 3), 80),
+                (pair_id(2, 4), 40),
+                (pair_id(1, 2), 999),
+            ],
+        )
+
+    scores = score_keyframe_anchors(
+        database_path,
+        FakeReconstruction(),
+        total_virtual_camera_count=2,
+        min_active_camera_points=1,
+        connectivity_frame_cap=2,
+        verified_inlier_cap=100,
+        triangulated_point_cap=10,
+    )
+    score_by_frame = {score.frame_id: score for score in scores}
+
+    assert set(score_by_frame) == {10, 11}
+    assert score_by_frame[10].connected_frame_count == 1
+    assert score_by_frame[10].verified_inlier_count == 120
+    assert score_by_frame[10].triangulated_point_count == 3
+    assert score_by_frame[10].active_virtual_camera_count == 2
+    assert score_by_frame[10].fov_distribution_score > 0.9
+    assert score_by_frame[10].median_reprojection_error_px == 1.0
+    assert score_by_frame[10].anchor_score > 0.0
 
 
 def test_last_k_frame_selection_excludes_generated_frames(tmp_path) -> None:
