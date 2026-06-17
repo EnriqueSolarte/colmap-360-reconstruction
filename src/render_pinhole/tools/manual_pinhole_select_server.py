@@ -547,12 +547,38 @@ INDEX_HTML = r"""<!doctype html>
       padding: 14px;
       background: #0b0d0f;
     }
+    .pano-frame {
+      position: relative;
+      display: inline-grid;
+      max-width: 100%;
+      max-height: calc(100vh - 82px);
+    }
     #panorama {
       max-width: 100%;
       max-height: calc(100vh - 82px);
       object-fit: contain;
       border: 1px solid var(--line);
       cursor: crosshair;
+      display: block;
+      grid-area: 1 / 1;
+    }
+    .cursor-line {
+      position: absolute;
+      display: none;
+      pointer-events: none;
+      background: rgba(79, 183, 165, 0.86);
+      z-index: 2;
+    }
+    .cursor-line.visible { display: block; }
+    #cursorVertical {
+      top: 0;
+      bottom: 0;
+      width: 1px;
+    }
+    #cursorHorizontal {
+      left: 0;
+      right: 0;
+      height: 1px;
     }
     aside {
       display: grid;
@@ -595,6 +621,18 @@ INDEX_HTML = r"""<!doctype html>
       display: flex;
       gap: 8px;
       margin-top: 10px;
+    }
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .checkbox-row input {
+      width: 16px;
+      min-height: 16px;
     }
     .list {
       min-height: 0;
@@ -649,7 +687,11 @@ INDEX_HTML = r"""<!doctype html>
         <div id="filename" class="title"></div>
       </div>
       <div class="viewport">
-        <img id="panorama" alt="">
+        <div id="panoFrame" class="pano-frame">
+          <img id="panorama" alt="">
+          <div id="cursorVertical" class="cursor-line"></div>
+          <div id="cursorHorizontal" class="cursor-line"></div>
+        </div>
       </div>
     </section>
     <aside>
@@ -680,6 +722,10 @@ INDEX_HTML = r"""<!doctype html>
           <button id="previewBtn">Preview</button>
           <button id="saveBtn" class="primary">Save</button>
         </div>
+        <label class="checkbox-row">
+          <input id="cmdSaveOnly" type="checkbox">
+          Cmd-click save only
+        </label>
         <div id="status" class="status"></div>
       </section>
       <section class="list" id="selectionList"></section>
@@ -687,7 +733,10 @@ INDEX_HTML = r"""<!doctype html>
   </main>
   <script>
     const els = {
+      panoFrame: document.getElementById("panoFrame"),
       panorama: document.getElementById("panorama"),
+      cursorVertical: document.getElementById("cursorVertical"),
+      cursorHorizontal: document.getElementById("cursorHorizontal"),
       prev: document.getElementById("prev"),
       next: document.getElementById("next"),
       counter: document.getElementById("counter"),
@@ -706,6 +755,7 @@ INDEX_HTML = r"""<!doctype html>
       preview: document.getElementById("preview"),
       previewBtn: document.getElementById("previewBtn"),
       saveBtn: document.getElementById("saveBtn"),
+      cmdSaveOnly: document.getElementById("cmdSaveOnly"),
       status: document.getElementById("status"),
       selectionList: document.getElementById("selectionList")
     };
@@ -853,15 +903,44 @@ INDEX_HTML = r"""<!doctype html>
       setStatus("Deleted.");
     }
 
-    function pickFromClick(event) {
+    function cursorPoint(event) {
       const rect = els.panorama.getBoundingClientRect();
-      const x = event.clientX - rect.left;
-      const y = event.clientY - rect.top;
-      const longitude = (x / rect.width) * 2 * Math.PI - Math.PI;
-      const latitude = Math.PI / 2 - (y / rect.height) * Math.PI;
+      const x = Math.min(Math.max(event.clientX - rect.left, 0), rect.width);
+      const y = Math.min(Math.max(event.clientY - rect.top, 0), rect.height);
+      return {rect, x, y};
+    }
+
+    function updateCursorLines(event) {
+      const point = cursorPoint(event);
+      els.cursorVertical.style.left = `${point.x}px`;
+      els.cursorHorizontal.style.top = `${point.y}px`;
+      els.cursorVertical.classList.add("visible");
+      els.cursorHorizontal.classList.add("visible");
+    }
+
+    function hideCursorLines() {
+      els.cursorVertical.classList.remove("visible");
+      els.cursorHorizontal.classList.remove("visible");
+    }
+
+    function pickFromClick(event) {
+      event.preventDefault();
+      const point = cursorPoint(event);
+      const longitude = (point.x / point.rect.width) * 2 * Math.PI - Math.PI;
+      const latitude = Math.PI / 2 - (point.y / point.rect.height) * Math.PI;
       els.lonDeg.value = degrees(longitude).toFixed(2);
       els.latDeg.value = degrees(latitude).toFixed(2);
-      preview().catch(error => setStatus(error.message));
+      if (event.metaKey) {
+        if (els.cmdSaveOnly.checked) {
+          saveSelection().catch(error => setStatus(error.message));
+        } else {
+          preview()
+            .then(() => saveSelection())
+            .catch(error => setStatus(error.message));
+        }
+      } else {
+        preview().catch(error => setStatus(error.message));
+      }
     }
 
     function formatNumber(value) {
@@ -871,6 +950,8 @@ INDEX_HTML = r"""<!doctype html>
     els.prev.onclick = () => { index = Math.max(index - 1, 0); draw(); };
     els.next.onclick = () => { index = Math.min(index + 1, state.panorama_count - 1); draw(); };
     els.panorama.onclick = pickFromClick;
+    els.panorama.onmousemove = updateCursorLines;
+    els.panorama.onmouseleave = hideCursorLines;
     els.previewBtn.onclick = () => preview().catch(error => setStatus(error.message));
     els.saveBtn.onclick = () => saveSelection().catch(error => setStatus(error.message));
     window.addEventListener("keydown", event => {
