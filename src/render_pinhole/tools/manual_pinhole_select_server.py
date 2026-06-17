@@ -8,7 +8,7 @@ import mimetypes
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from math import ceil, degrees, pi, sqrt
+from math import degrees, pi, radians
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -17,10 +17,17 @@ from PIL import Image
 
 from colmap.camera import camera_from_fov
 from render_pinhole.renderer import EquirectangularToPinhole
+from render_pinhole.tools.manual_pinhole_selection_store import (
+    load_metadata_with_selections,
+    migrate_metadata_to_sidecar,
+    read_collection_snapshot,
+    restore_collection_snapshot,
+    selection_summary_from_metadata,
+    write_metadata_with_sidecar,
+)
 from render_pinhole.tools.manual_pinhole_render import (
     METADATA_FILENAME,
     SOURCE_STATUS_MISSING,
-    pinhole_camera_pose_report,
     validate_latitude,
     wrap_longitude,
 )
@@ -31,6 +38,7 @@ DEFAULT_PREVIEW_MAX_WIDTH = 512
 DEFAULT_PREVIEW_MAX_HEIGHT = 384
 DEFAULT_PANORAMA_DISPLAY_MAX_WIDTH = 1600
 DEFAULT_PANORAMA_DISPLAY_MAX_HEIGHT = 800
+MAX_UNDO_DEPTH = 20
 
 
 def serve_selector(
@@ -40,6 +48,7 @@ def serve_selector(
     port: int = DEFAULT_PORT,
 ) -> None:
     metadata_path = output_dir / METADATA_FILENAME
+    migrate_metadata_to_sidecar(output_dir)
     server = ManualPinholeSelectionServer(
         (host, port),
         ManualPinholeSelectionHandler,
@@ -73,13 +82,30 @@ def pixel_to_longitude_latitude(
 
 
 def load_metadata(output_dir: Path) -> dict[str, Any]:
-    metadata_path = output_dir / METADATA_FILENAME
-    return json.loads(metadata_path.read_text(encoding="utf-8"))
+    return load_metadata_with_selections(output_dir)
 
 
 def write_metadata(output_dir: Path, metadata: dict[str, Any]) -> None:
-    metadata_path = output_dir / METADATA_FILENAME
-    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    write_metadata_with_sidecar(output_dir, metadata)
+
+
+def remember_undo_state(
+    undo_stack: list[dict[str, str | None] | str],
+    snapshot: dict[str, str | None] | str,
+    *,
+    max_depth: int = MAX_UNDO_DEPTH,
+) -> None:
+    undo_stack.append(snapshot)
+    del undo_stack[:-max_depth]
+
+
+def restore_undo_state(
+    output_dir: Path,
+    undo_stack: list[dict[str, str | None] | str],
+) -> dict[str, Any] | None:
+    if not undo_stack:
+        return None
+    return restore_collection_snapshot(output_dir, undo_stack.pop())
 
 
 def append_selection(
@@ -140,17 +166,17 @@ def append_roi_selections(
     longitude_max: float,
     latitude_min: float,
     latitude_max: float,
-    count: int,
+    delta_degrees: float,
     overrides: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     panorama = panorama_at_index(metadata, pano_index)
     selections = []
-    for longitude, latitude in uniform_roi_points(
+    for longitude, latitude in roi_points_by_delta(
         longitude_min=longitude_min,
         longitude_max=longitude_max,
         latitude_min=latitude_min,
         latitude_max=latitude_max,
-        count=count,
+        delta_degrees=delta_degrees,
     ):
         selection = selection_record(
             metadata,
@@ -165,16 +191,16 @@ def append_roi_selections(
     return selections
 
 
-def uniform_roi_points(
+def roi_points_by_delta(
     *,
     longitude_min: float,
     longitude_max: float,
     latitude_min: float,
     latitude_max: float,
-    count: int,
+    delta_degrees: float,
 ) -> list[tuple[float, float]]:
-    if count <= 0:
-        raise ValueError("ROI sample count must be positive")
+    if delta_degrees <= 0:
+        raise ValueError("ROI delta angle must be positive")
     longitude_min = wrap_longitude(float(longitude_min))
     longitude_max = wrap_longitude(float(longitude_max))
     latitude_min = float(latitude_min)
@@ -186,18 +212,27 @@ def uniform_roi_points(
     if latitude_max <= latitude_min:
         raise ValueError("ROI latitude_max must be greater than latitude_min")
 
-    cols = int(ceil(sqrt(count)))
-    rows = int(ceil(count / cols))
+    delta = radians(float(delta_degrees))
+    longitude_values = axis_values_by_delta(longitude_min, longitude_max, delta)
+    latitude_values = list(
+        reversed(axis_values_by_delta(latitude_min, latitude_max, delta))
+    )
+    return [
+        (longitude, latitude)
+        for latitude in latitude_values
+        for longitude in longitude_values
+    ]
+
+
+def axis_values_by_delta(minimum: float, maximum: float, delta: float) -> list[float]:
+    span = maximum - minimum
+    if span <= delta:
+        return [(minimum + maximum) / 2.0]
+    value = minimum + delta / 2.0
     points = []
-    for row in range(rows):
-        latitude = latitude_max - ((row + 0.5) / rows) * (latitude_max - latitude_min)
-        for col in range(cols):
-            longitude = longitude_min + (
-                (col + 0.5) / cols
-            ) * (longitude_max - longitude_min)
-            points.append((longitude, latitude))
-            if len(points) == count:
-                return points
+    while value < maximum:
+        points.append(value)
+        value += delta
     return points
 
 
@@ -226,11 +261,6 @@ def selection_record(
         "output_extension": params["output_extension"],
         "render_status": "pending",
         "selected_by": "manual-pinhole-select",
-        "pinhole_camera_pose": pinhole_camera_pose_report(
-            panorama.get("pano_camera_pose"),
-            longitude,
-            latitude,
-        ),
     }
     return selection
 
@@ -365,17 +395,7 @@ def next_selection_index(selections: list[dict[str, Any]]) -> int:
 
 
 def selection_summary(metadata: dict[str, Any]) -> dict[str, int]:
-    panoramas = metadata.get("panoramas", [])
-    selected_panorama_count = sum(
-        1 for panorama in panoramas if panorama.get("selections")
-    )
-    selection_count = sum(
-        len(panorama.get("selections", [])) for panorama in panoramas
-    )
-    return {
-        "selected_panorama_count": selected_panorama_count,
-        "selection_count": selection_count,
-    }
+    return selection_summary_from_metadata(metadata)
 
 
 def api_state(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -443,6 +463,7 @@ class ManualPinholeSelectionServer(ThreadingHTTPServer):
         super().__init__(server_address, handler_class)
         self.output_dir = output_dir
         self.metadata_lock = threading.Lock()
+        self.undo_stack: list[dict[str, str | None] | str] = []
 
 
 class ManualPinholeSelectionHandler(BaseHTTPRequestHandler):
@@ -501,6 +522,7 @@ class ManualPinholeSelectionHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/selections":
                 with self.server.metadata_lock:
+                    previous_snapshot = read_collection_snapshot(self.server.output_dir)
                     metadata = load_metadata(self.server.output_dir)
                     selection = append_selection(
                         metadata,
@@ -509,11 +531,13 @@ class ManualPinholeSelectionHandler(BaseHTTPRequestHandler):
                         float(payload["latitude"]),
                         payload.get("render"),
                     )
+                    remember_undo_state(self.server.undo_stack, previous_snapshot)
                     write_metadata(self.server.output_dir, metadata)
                 self.send_json({"selection": selection, "state": api_state(metadata)})
                 return
             if path == "/api/sample-roi-selections":
                 with self.server.metadata_lock:
+                    previous_snapshot = read_collection_snapshot(self.server.output_dir)
                     metadata = load_metadata(self.server.output_dir)
                     selections = append_roi_selections(
                         metadata,
@@ -522,9 +546,10 @@ class ManualPinholeSelectionHandler(BaseHTTPRequestHandler):
                         longitude_max=float(payload["longitude_max"]),
                         latitude_min=float(payload["latitude_min"]),
                         latitude_max=float(payload["latitude_max"]),
-                        count=int(payload["count"]),
+                        delta_degrees=float(payload["delta_degrees"]),
                         overrides=payload.get("render"),
                     )
+                    remember_undo_state(self.server.undo_stack, previous_snapshot)
                     write_metadata(self.server.output_dir, metadata)
                 self.send_json(
                     {
@@ -536,36 +561,65 @@ class ManualPinholeSelectionHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/delete-selection":
                 with self.server.metadata_lock:
+                    previous_snapshot = read_collection_snapshot(self.server.output_dir)
                     metadata = load_metadata(self.server.output_dir)
                     deleted = delete_selection(
                         metadata,
                         int(payload["pano_index"]),
                         int(payload["selection_index"]),
                     )
-                    write_metadata(self.server.output_dir, metadata)
+                    if deleted:
+                        remember_undo_state(
+                            self.server.undo_stack,
+                            previous_snapshot,
+                        )
+                        write_metadata(self.server.output_dir, metadata)
                 status = HTTPStatus.OK if deleted else HTTPStatus.NOT_FOUND
                 self.send_json({"deleted": deleted, "state": api_state(metadata)}, status)
                 return
             if path == "/api/reset-panorama-selections":
                 with self.server.metadata_lock:
+                    previous_snapshot = read_collection_snapshot(self.server.output_dir)
                     metadata = load_metadata(self.server.output_dir)
                     removed_count = reset_panorama_selections(
                         metadata,
                         int(payload["pano_index"]),
                     )
-                    write_metadata(self.server.output_dir, metadata)
+                    if removed_count:
+                        remember_undo_state(
+                            self.server.undo_stack,
+                            previous_snapshot,
+                        )
+                        write_metadata(self.server.output_dir, metadata)
                 self.send_json(
                     {"removed_count": removed_count, "state": api_state(metadata)}
                 )
                 return
             if path == "/api/reset-collection-selections":
                 with self.server.metadata_lock:
+                    previous_snapshot = read_collection_snapshot(self.server.output_dir)
                     metadata = load_metadata(self.server.output_dir)
                     removed_count = reset_collection_selections(metadata)
-                    write_metadata(self.server.output_dir, metadata)
+                    if removed_count:
+                        remember_undo_state(
+                            self.server.undo_stack,
+                            previous_snapshot,
+                        )
+                        write_metadata(self.server.output_dir, metadata)
                 self.send_json(
                     {"removed_count": removed_count, "state": api_state(metadata)}
                 )
+                return
+            if path == "/api/undo":
+                with self.server.metadata_lock:
+                    metadata = restore_undo_state(
+                        self.server.output_dir,
+                        self.server.undo_stack,
+                    )
+                    undone = metadata is not None
+                    if metadata is None:
+                        metadata = load_metadata(self.server.output_dir)
+                self.send_json({"undone": undone, "state": api_state(metadata)})
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
@@ -949,11 +1003,12 @@ INDEX_HTML = r"""<!doctype html>
             <input id="roiMode" type="checkbox">
             ROI sampling
           </label>
-          <label>N<input id="roiCount" type="number" min="1" step="1" value="9"></label>
+          <label>Delta deg<input id="roiDeltaDeg" type="number" min="0.1" step="0.1" value="10"></label>
         </div>
         <div id="status" class="status"></div>
       </section>
       <section class="reset-actions">
+        <button id="undoBtn">Undo</button>
         <button id="resetPanoBtn" class="danger">Reset Pano</button>
         <button id="resetCollectionBtn" class="danger">Reset Collection</button>
       </section>
@@ -988,7 +1043,8 @@ INDEX_HTML = r"""<!doctype html>
       saveBtn: document.getElementById("saveBtn"),
       cmdSaveOnly: document.getElementById("cmdSaveOnly"),
       roiMode: document.getElementById("roiMode"),
-      roiCount: document.getElementById("roiCount"),
+      roiDeltaDeg: document.getElementById("roiDeltaDeg"),
+      undoBtn: document.getElementById("undoBtn"),
       resetPanoBtn: document.getElementById("resetPanoBtn"),
       resetCollectionBtn: document.getElementById("resetCollectionBtn"),
       status: document.getElementById("status"),
@@ -1199,10 +1255,23 @@ INDEX_HTML = r"""<!doctype html>
       setStatus(`Reset ${payload.removed_count} collection view(s).`);
     }
 
+    async function undoLastAction() {
+      const response = await fetch("/api/undo", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({})
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      state = payload.state;
+      draw();
+      setStatus(payload.undone ? "Undone." : "Nothing to undo.");
+    }
+
     async function sampleRoiSelections(bounds) {
       const current = pano();
-      const count = Math.max(1, Math.floor(Number(els.roiCount.value) || 1));
-      setStatus(`Sampling ${count} ROI view(s)...`);
+      const deltaDegrees = Math.max(0.1, Number(els.roiDeltaDeg.value) || 10);
+      setStatus(`Sampling ROI at ${formatNumber(deltaDegrees)} deg...`);
       const response = await fetch("/api/sample-roi-selections", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
@@ -1212,7 +1281,7 @@ INDEX_HTML = r"""<!doctype html>
           longitude_max: bounds.longitudeMax,
           latitude_min: bounds.latitudeMin,
           latitude_max: bounds.latitudeMax,
-          count,
+          delta_degrees: deltaDegrees,
           render: renderOverrides()
         })
       });
@@ -1354,6 +1423,7 @@ INDEX_HTML = r"""<!doctype html>
     els.panorama.onmouseleave = hideCursorLines;
     els.previewBtn.onclick = () => preview().catch(error => setStatus(error.message));
     els.saveBtn.onclick = () => saveSelection().catch(error => setStatus(error.message));
+    els.undoBtn.onclick = () => undoLastAction().catch(error => setStatus(error.message));
     els.resetPanoBtn.onclick = () => resetPanoSelections().catch(error => setStatus(error.message));
     els.resetCollectionBtn.onclick = () => resetCollectionSelections().catch(error => setStatus(error.message));
     window.addEventListener("keydown", event => {

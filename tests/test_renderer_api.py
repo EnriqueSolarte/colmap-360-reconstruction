@@ -1,6 +1,6 @@
 import io
 import json
-from math import pi
+from math import degrees, pi
 
 import numpy as np
 import pytest
@@ -19,6 +19,11 @@ from render_pinhole.tools.manual_pinhole_render import (
     rendered_filename,
     main as manual_render_main,
 )
+from render_pinhole.tools.manual_pinhole_selection_store import (
+    SELECTIONS_FILENAME,
+    load_metadata_with_selections,
+    write_metadata_with_sidecar,
+)
 from render_pinhole.tools.manual_pinhole_select_server import (
     append_roi_selections,
     append_selection,
@@ -26,9 +31,11 @@ from render_pinhole.tools.manual_pinhole_select_server import (
     pixel_to_longitude_latitude,
     render_panorama_display_jpeg,
     render_preview_png,
+    remember_undo_state,
+    restore_undo_state,
+    roi_points_by_delta,
     reset_collection_selections,
     reset_panorama_selections,
-    uniform_roi_points,
 )
 from render_pinhole.tools.random_pinhole_image import main as random_render_image_main
 from render_pinhole.tools.render_pinhole_directory import main as render_directory_main
@@ -726,11 +733,14 @@ def test_manual_render_cli_renders_existing_metadata_selections(tmp_path) -> Non
 
     exit_code = manual_render_main(["-o", str(output_dir), "--render-selections"])
 
-    updated = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    updated = load_metadata_with_selections(output_dir)
     selection = updated["panoramas"][0]["selections"][0]
     rendered_path = output_dir / selection["rendered_filename"]
+    raw_metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
 
     assert exit_code == 0
+    assert raw_metadata["panoramas"][0]["selections"] == []
+    assert (output_dir / SELECTIONS_FILENAME).is_file()
     assert selection["render_status"] == "rendered"
     assert selection["rendered_filename"] == "pano__sel-000__lon-p045.0__lat-m030.0__w10_h8.png"
     assert selection["rendered_path"] == str(rendered_path)
@@ -840,7 +850,7 @@ def test_manual_select_appends_and_deletes_selection(tmp_path) -> None:
     assert selection["selected_by"] == "manual-pinhole-select"
     assert selection["longitude_degrees"] == 45.0
     assert selection["latitude_degrees"] == -29.999999999999996
-    assert selection["pinhole_camera_pose"]["center_world"] == [1.0, 2.0, 3.0]
+    assert "pinhole_camera_pose" not in selection
     assert metadata["selection_summary"] == {
         "selected_panorama_count": 1,
         "selection_count": 2,
@@ -892,20 +902,44 @@ def test_manual_select_resets_panorama_and_collection_selections() -> None:
     }
 
 
-def test_manual_select_uniform_roi_points_are_grid_centered() -> None:
-    points = uniform_roi_points(
+def test_manual_select_undo_stack_restores_previous_metadata(tmp_path) -> None:
+    output_dir = tmp_path / "pinhole-renders"
+    output_dir.mkdir()
+    metadata_path = output_dir / "metadata.json"
+    metadata_path.write_text(
+        json.dumps({"panoramas": [], "version": "current"}),
+        encoding="utf-8",
+    )
+    undo_stack: list[str] = []
+    previous = json.dumps({"panoramas": [], "version": "previous"})
+
+    remember_undo_state(undo_stack, previous, max_depth=1)
+    remember_undo_state(
+        undo_stack,
+        json.dumps({"panoramas": [], "version": "older"}),
+        max_depth=1,
+    )
+    restored = restore_undo_state(output_dir, undo_stack)
+
+    assert restored == {"panoramas": [], "version": "older"}
+    assert json.loads(metadata_path.read_text(encoding="utf-8")) == restored
+    assert restore_undo_state(output_dir, undo_stack) is None
+
+
+def test_manual_select_roi_points_are_spaced_by_delta() -> None:
+    points = roi_points_by_delta(
         longitude_min=-1.0,
         longitude_max=1.0,
-        latitude_min=-0.5,
-        latitude_max=0.5,
-        count=4,
+        latitude_min=-1.0,
+        latitude_max=1.0,
+        delta_degrees=degrees(1.0),
     )
 
     assert points == [
-        (-0.5, 0.25),
-        (0.5, 0.25),
-        (-0.5, -0.25),
-        (0.5, -0.25),
+        (-0.5, 0.5),
+        (0.5, 0.5),
+        (-0.5, -0.5),
+        (0.5, -0.5),
     ]
 
 
@@ -940,20 +974,21 @@ def test_manual_select_appends_roi_selections(tmp_path) -> None:
         0,
         longitude_min=-1.0,
         longitude_max=1.0,
-        latitude_min=-0.5,
-        latitude_max=0.5,
-        count=3,
+        latitude_min=-1.0,
+        latitude_max=1.0,
+        delta_degrees=degrees(1.0),
     )
 
-    assert [selection["selection_index"] for selection in selections] == [0, 1, 2]
+    assert [selection["selection_index"] for selection in selections] == [0, 1, 2, 3]
     assert [(selection["longitude"], selection["latitude"]) for selection in selections] == [
-        (-0.5, 0.25),
-        (0.5, 0.25),
-        (-0.5, -0.25),
+        (-0.5, 0.5),
+        (0.5, 0.5),
+        (-0.5, -0.5),
+        (0.5, -0.5),
     ]
     assert metadata["selection_summary"] == {
         "selected_panorama_count": 1,
-        "selection_count": 3,
+        "selection_count": 4,
     }
 
 
@@ -1024,6 +1059,49 @@ def test_manual_select_preview_caps_resolution_without_changing_saved_selection(
     assert np.asarray(image).shape == (384, 512, 3)
     assert selection["width"] == 1280
     assert selection["height"] == 960
+
+
+def test_manual_select_writes_selection_sidecar(tmp_path) -> None:
+    source_path = tmp_path / "pano.png"
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(source_path)
+    output_dir = tmp_path / "pinhole-renders"
+    output_dir.mkdir()
+    metadata = {
+        "render_defaults": {
+            "width": 10,
+            "height": 8,
+            "fov_x": pi / 2,
+            "fov_y": pi / 3,
+            "interpolation": "nearest",
+            "output_extension": ".png",
+        },
+        "panoramas": [
+            {
+                "pano_index": 0,
+                "pano_filename": source_path.name,
+                "pano_stem": source_path.stem,
+                "source_pano_path": str(source_path),
+                "source_status": "matched",
+                "selections": [],
+            }
+        ],
+    }
+
+    append_selection(metadata, 0, pi / 4, 0.0)
+    write_metadata_with_sidecar(output_dir, metadata)
+
+    raw_metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    sidecar = json.loads((output_dir / SELECTIONS_FILENAME).read_text(encoding="utf-8"))
+    loaded = load_metadata_with_selections(output_dir)
+
+    assert raw_metadata["panoramas"][0]["selections"] == []
+    assert raw_metadata["panoramas"][0]["selection_count"] == 1
+    assert sidecar["selection_summary"] == {
+        "selected_panorama_count": 1,
+        "selection_count": 1,
+    }
+    assert loaded["panoramas"][0]["selections"][0]["selection_index"] == 0
 
 
 def test_manual_select_panorama_display_uses_resized_jpeg(tmp_path) -> None:

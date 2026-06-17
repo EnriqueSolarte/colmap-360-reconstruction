@@ -24,6 +24,10 @@ from render_pinhole.defaults import (
     DEFAULT_PINHOLE_WIDTH,
 )
 from render_pinhole.renderer import EquirectangularToPinhole
+from render_pinhole.tools.manual_pinhole_selection_store import (
+    load_metadata_with_selections,
+    write_metadata_with_sidecar,
+)
 
 try:  # Keep non-scene metadata initialization usable without pycolmap.
     import pycolmap
@@ -136,7 +140,7 @@ def render_metadata_selections(output_dir: Path) -> dict[str, Any]:
     if not metadata_path.is_file():
         raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
 
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata = load_metadata_with_selections(output_dir)
     render_defaults = metadata.get("render_defaults", {})
     panoramas = metadata.get("panoramas", [])
     selection_count = sum(len(panorama.get("selections", [])) for panorama in panoramas)
@@ -189,10 +193,7 @@ def render_metadata_selections(output_dir: Path) -> dict[str, Any]:
         "rendered_selection_count": rendered_count,
     }
     with tqdm(total=1, desc="Writing metadata", unit="file") as progress:
-        metadata_path.write_text(
-            json.dumps(metadata, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        write_metadata_with_sidecar(output_dir, metadata)
         progress.update()
     print(f"Metadata: {metadata_path}")
     print(f"Rendered {rendered_count} selected pinhole views.")
