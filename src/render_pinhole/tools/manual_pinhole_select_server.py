@@ -8,7 +8,7 @@ import mimetypes
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from math import degrees, pi
+from math import ceil, degrees, pi, sqrt
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -29,6 +29,8 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_PREVIEW_MAX_WIDTH = 512
 DEFAULT_PREVIEW_MAX_HEIGHT = 384
+DEFAULT_PANORAMA_DISPLAY_MAX_WIDTH = 1600
+DEFAULT_PANORAMA_DISPLAY_MAX_HEIGHT = 800
 
 
 def serve_selector(
@@ -113,6 +115,92 @@ def delete_selection(
     return deleted
 
 
+def reset_panorama_selections(metadata: dict[str, Any], pano_index: int) -> int:
+    panorama = panorama_at_index(metadata, pano_index)
+    removed_count = len(panorama.get("selections", []))
+    panorama["selections"] = []
+    metadata["selection_summary"] = selection_summary(metadata)
+    return removed_count
+
+
+def reset_collection_selections(metadata: dict[str, Any]) -> int:
+    removed_count = 0
+    for panorama in metadata.get("panoramas", []):
+        removed_count += len(panorama.get("selections", []))
+        panorama["selections"] = []
+    metadata["selection_summary"] = selection_summary(metadata)
+    return removed_count
+
+
+def append_roi_selections(
+    metadata: dict[str, Any],
+    pano_index: int,
+    *,
+    longitude_min: float,
+    longitude_max: float,
+    latitude_min: float,
+    latitude_max: float,
+    count: int,
+    overrides: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    panorama = panorama_at_index(metadata, pano_index)
+    selections = []
+    for longitude, latitude in uniform_roi_points(
+        longitude_min=longitude_min,
+        longitude_max=longitude_max,
+        latitude_min=latitude_min,
+        latitude_max=latitude_max,
+        count=count,
+    ):
+        selection = selection_record(
+            metadata,
+            panorama,
+            longitude,
+            latitude,
+            overrides,
+        )
+        panorama.setdefault("selections", []).append(selection)
+        selections.append(selection)
+    metadata["selection_summary"] = selection_summary(metadata)
+    return selections
+
+
+def uniform_roi_points(
+    *,
+    longitude_min: float,
+    longitude_max: float,
+    latitude_min: float,
+    latitude_max: float,
+    count: int,
+) -> list[tuple[float, float]]:
+    if count <= 0:
+        raise ValueError("ROI sample count must be positive")
+    longitude_min = wrap_longitude(float(longitude_min))
+    longitude_max = wrap_longitude(float(longitude_max))
+    latitude_min = float(latitude_min)
+    latitude_max = float(latitude_max)
+    validate_latitude(latitude_min)
+    validate_latitude(latitude_max)
+    if longitude_max <= longitude_min:
+        raise ValueError("ROI longitude_max must be greater than longitude_min")
+    if latitude_max <= latitude_min:
+        raise ValueError("ROI latitude_max must be greater than latitude_min")
+
+    cols = int(ceil(sqrt(count)))
+    rows = int(ceil(count / cols))
+    points = []
+    for row in range(rows):
+        latitude = latitude_max - ((row + 0.5) / rows) * (latitude_max - latitude_min)
+        for col in range(cols):
+            longitude = longitude_min + (
+                (col + 0.5) / cols
+            ) * (longitude_max - longitude_min)
+            points.append((longitude, latitude))
+            if len(points) == count:
+                return points
+    return points
+
+
 def selection_record(
     metadata: dict[str, Any],
     panorama: dict[str, Any],
@@ -173,6 +261,25 @@ def render_preview_png(
     )
     buffer = io.BytesIO()
     Image.fromarray(pinhole).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def render_panorama_display_jpeg(
+    metadata: dict[str, Any],
+    pano_index: int,
+    *,
+    max_width: int = DEFAULT_PANORAMA_DISPLAY_MAX_WIDTH,
+    max_height: int = DEFAULT_PANORAMA_DISPLAY_MAX_HEIGHT,
+) -> bytes:
+    if max_width <= 0 or max_height <= 0:
+        raise ValueError("display panorama max dimensions must be positive")
+    panorama = panorama_at_index(metadata, pano_index)
+    source_path = source_panorama_path(panorama)
+    with Image.open(source_path) as image:
+        display = image.convert("RGB")
+        display.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+        buffer = io.BytesIO()
+        display.save(buffer, format="JPEG", quality=85, optimize=True)
     return buffer.getvalue()
 
 
@@ -352,6 +459,17 @@ class ManualPinholeSelectionHandler(BaseHTTPRequestHandler):
                     metadata = load_metadata(self.server.output_dir)
                 self.send_json(api_state(metadata))
                 return
+            if path.startswith("/api/panorama-preview/"):
+                pano_index = int(path.rsplit("/", 1)[1])
+                with self.server.metadata_lock:
+                    metadata = load_metadata(self.server.output_dir)
+                display = render_panorama_display_jpeg(metadata, pano_index)
+                self.send_bytes(
+                    display,
+                    "image/jpeg",
+                    headers={"Cache-Control": "public, max-age=3600"},
+                )
+                return
             if path.startswith("/api/panorama/"):
                 pano_index = int(path.rsplit("/", 1)[1])
                 with self.server.metadata_lock:
@@ -394,6 +512,28 @@ class ManualPinholeSelectionHandler(BaseHTTPRequestHandler):
                     write_metadata(self.server.output_dir, metadata)
                 self.send_json({"selection": selection, "state": api_state(metadata)})
                 return
+            if path == "/api/sample-roi-selections":
+                with self.server.metadata_lock:
+                    metadata = load_metadata(self.server.output_dir)
+                    selections = append_roi_selections(
+                        metadata,
+                        int(payload["pano_index"]),
+                        longitude_min=float(payload["longitude_min"]),
+                        longitude_max=float(payload["longitude_max"]),
+                        latitude_min=float(payload["latitude_min"]),
+                        latitude_max=float(payload["latitude_max"]),
+                        count=int(payload["count"]),
+                        overrides=payload.get("render"),
+                    )
+                    write_metadata(self.server.output_dir, metadata)
+                self.send_json(
+                    {
+                        "created_count": len(selections),
+                        "selections": selections,
+                        "state": api_state(metadata),
+                    }
+                )
+                return
             if path == "/api/delete-selection":
                 with self.server.metadata_lock:
                     metadata = load_metadata(self.server.output_dir)
@@ -405,6 +545,27 @@ class ManualPinholeSelectionHandler(BaseHTTPRequestHandler):
                     write_metadata(self.server.output_dir, metadata)
                 status = HTTPStatus.OK if deleted else HTTPStatus.NOT_FOUND
                 self.send_json({"deleted": deleted, "state": api_state(metadata)}, status)
+                return
+            if path == "/api/reset-panorama-selections":
+                with self.server.metadata_lock:
+                    metadata = load_metadata(self.server.output_dir)
+                    removed_count = reset_panorama_selections(
+                        metadata,
+                        int(payload["pano_index"]),
+                    )
+                    write_metadata(self.server.output_dir, metadata)
+                self.send_json(
+                    {"removed_count": removed_count, "state": api_state(metadata)}
+                )
+                return
+            if path == "/api/reset-collection-selections":
+                with self.server.metadata_lock:
+                    metadata = load_metadata(self.server.output_dir)
+                    removed_count = reset_collection_selections(metadata)
+                    write_metadata(self.server.output_dir, metadata)
+                self.send_json(
+                    {"removed_count": removed_count, "state": api_state(metadata)}
+                )
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
@@ -434,10 +595,13 @@ class ManualPinholeSelectionHandler(BaseHTTPRequestHandler):
         data: bytes,
         content_type: str,
         status: HTTPStatus = HTTPStatus.OK,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -465,9 +629,14 @@ INDEX_HTML = r"""<!doctype html>
       --danger: #df6c63;
     }
     * { box-sizing: border-box; }
+    html {
+      height: 100%;
+      overflow: hidden;
+    }
     body {
       margin: 0;
-      min-height: 100vh;
+      height: 100%;
+      overflow: hidden;
       background: var(--bg);
       color: var(--text);
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -508,10 +677,12 @@ INDEX_HTML = r"""<!doctype html>
     .app {
       display: grid;
       grid-template-columns: minmax(0, 1fr) 360px;
-      min-height: 100vh;
+      height: 100vh;
+      overflow: hidden;
     }
     .stage {
       min-width: 0;
+      min-height: 0;
       display: grid;
       grid-template-rows: auto minmax(0, 1fr);
       border-right: 1px solid var(--line);
@@ -580,10 +751,37 @@ INDEX_HTML = r"""<!doctype html>
       right: 0;
       height: 1px;
     }
+    .marker-layer {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      z-index: 3;
+    }
+    .selection-marker {
+      position: absolute;
+      width: 9px;
+      height: 9px;
+      border: 1px solid #ffffff;
+      border-radius: 50%;
+      background: #ff3b30;
+      box-shadow: 0 0 0 2px rgba(255, 59, 48, 0.32);
+      transform: translate(-50%, -50%);
+    }
+    .roi-box {
+      position: absolute;
+      display: none;
+      border: 2px solid var(--warn);
+      background: rgba(217, 164, 65, 0.16);
+      pointer-events: none;
+      z-index: 4;
+    }
+    .roi-box.visible { display: block; }
     aside {
       display: grid;
-      grid-template-rows: auto auto minmax(0, 1fr);
-      min-height: 100vh;
+      grid-template-rows: auto auto auto minmax(0, 1fr);
+      height: 100vh;
+      min-height: 0;
+      overflow: hidden;
       background: var(--panel);
     }
     .panel {
@@ -622,6 +820,12 @@ INDEX_HTML = r"""<!doctype html>
       gap: 8px;
       margin-top: 10px;
     }
+    .reset-actions {
+      display: flex;
+      gap: 8px;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--line);
+    }
     .checkbox-row {
       display: flex;
       align-items: center;
@@ -634,9 +838,20 @@ INDEX_HTML = r"""<!doctype html>
       width: 16px;
       min-height: 16px;
     }
+    .roi-controls {
+      display: grid;
+      grid-template-columns: 1fr 72px;
+      align-items: end;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .roi-controls .checkbox-row {
+      margin-top: 0;
+    }
     .list {
       min-height: 0;
-      overflow: auto;
+      overflow-y: auto;
+      overscroll-behavior: contain;
       padding: 10px 14px 14px;
     }
     .selection {
@@ -670,7 +885,8 @@ INDEX_HTML = r"""<!doctype html>
         border-bottom: 1px solid var(--line);
       }
       aside {
-        min-height: auto;
+        height: auto;
+        min-height: 0;
       }
     }
   </style>
@@ -689,6 +905,8 @@ INDEX_HTML = r"""<!doctype html>
       <div class="viewport">
         <div id="panoFrame" class="pano-frame">
           <img id="panorama" alt="">
+          <div id="markerLayer" class="marker-layer"></div>
+          <div id="roiBox" class="roi-box"></div>
           <div id="cursorVertical" class="cursor-line"></div>
           <div id="cursorHorizontal" class="cursor-line"></div>
         </div>
@@ -707,8 +925,8 @@ INDEX_HTML = r"""<!doctype html>
           <label>Latitude deg<input id="latDeg" type="number" step="0.1"></label>
           <label>Width<input id="width" type="number" step="1"></label>
           <label>Height<input id="height" type="number" step="1"></label>
-          <label>FOV X rad<input id="fovX" type="number" step="0.001"></label>
-          <label>FOV Y rad<input id="fovY" type="number" step="0.001"></label>
+          <label>FOV X deg<input id="fovXDeg" type="number" step="0.1"></label>
+          <label>FOV Y deg<input id="fovYDeg" type="number" step="0.1"></label>
           <label>Interpolation
             <select id="interpolation">
               <option value="linear">linear</option>
@@ -726,7 +944,18 @@ INDEX_HTML = r"""<!doctype html>
           <input id="cmdSaveOnly" type="checkbox">
           Cmd-click save only
         </label>
+        <div class="roi-controls">
+          <label class="checkbox-row">
+            <input id="roiMode" type="checkbox">
+            ROI sampling
+          </label>
+          <label>N<input id="roiCount" type="number" min="1" step="1" value="9"></label>
+        </div>
         <div id="status" class="status"></div>
+      </section>
+      <section class="reset-actions">
+        <button id="resetPanoBtn" class="danger">Reset Pano</button>
+        <button id="resetCollectionBtn" class="danger">Reset Collection</button>
       </section>
       <section class="list" id="selectionList"></section>
     </aside>
@@ -735,6 +964,8 @@ INDEX_HTML = r"""<!doctype html>
     const els = {
       panoFrame: document.getElementById("panoFrame"),
       panorama: document.getElementById("panorama"),
+      markerLayer: document.getElementById("markerLayer"),
+      roiBox: document.getElementById("roiBox"),
       cursorVertical: document.getElementById("cursorVertical"),
       cursorHorizontal: document.getElementById("cursorHorizontal"),
       prev: document.getElementById("prev"),
@@ -749,18 +980,25 @@ INDEX_HTML = r"""<!doctype html>
       latDeg: document.getElementById("latDeg"),
       width: document.getElementById("width"),
       height: document.getElementById("height"),
-      fovX: document.getElementById("fovX"),
-      fovY: document.getElementById("fovY"),
+      fovXDeg: document.getElementById("fovXDeg"),
+      fovYDeg: document.getElementById("fovYDeg"),
       interpolation: document.getElementById("interpolation"),
       preview: document.getElementById("preview"),
       previewBtn: document.getElementById("previewBtn"),
       saveBtn: document.getElementById("saveBtn"),
       cmdSaveOnly: document.getElementById("cmdSaveOnly"),
+      roiMode: document.getElementById("roiMode"),
+      roiCount: document.getElementById("roiCount"),
+      resetPanoBtn: document.getElementById("resetPanoBtn"),
+      resetCollectionBtn: document.getElementById("resetCollectionBtn"),
       status: document.getElementById("status"),
       selectionList: document.getElementById("selectionList")
     };
     let state = null;
     let index = 0;
+    let roiStart = null;
+    let isDrawingRoi = false;
+    let suppressNextClick = false;
 
     function radians(value) { return Number(value) * Math.PI / 180; }
     function degrees(value) { return Number(value) * 180 / Math.PI; }
@@ -769,8 +1007,8 @@ INDEX_HTML = r"""<!doctype html>
       return {
         width: Number(els.width.value),
         height: Number(els.height.value),
-        fov_x: Number(els.fovX.value),
-        fov_y: Number(els.fovY.value),
+        fov_x: radians(els.fovXDeg.value),
+        fov_y: radians(els.fovYDeg.value),
         interpolation: els.interpolation.value
       };
     }
@@ -781,9 +1019,9 @@ INDEX_HTML = r"""<!doctype html>
       state = await response.json();
       const defaults = state.render_defaults || {};
       els.width.value = defaults.width || 1280;
-      els.height.value = defaults.height || 960;
-      els.fovX.value = defaults.fov_x || 1.221730476;
-      els.fovY.value = defaults.fov_y || 0.967145867;
+      els.height.value = defaults.height || 1280;
+      els.fovXDeg.value = formatNumber(defaults.fov_x_degrees ?? degrees(defaults.fov_x ?? 1.221730476));
+      els.fovYDeg.value = formatNumber(defaults.fov_y_degrees ?? degrees(defaults.fov_y ?? 1.221730476));
       els.interpolation.value = defaults.interpolation || "linear";
       index = Math.min(index, Math.max(state.panorama_count - 1, 0));
       draw();
@@ -805,9 +1043,38 @@ INDEX_HTML = r"""<!doctype html>
       els.selectedCount.textContent = `${current.selections.length}`;
       els.prev.disabled = index === 0;
       els.next.disabled = index >= state.panorama_count - 1;
-      els.panorama.src = `/api/panorama/${current.pano_index}?t=${Date.now()}`;
+      clearMarkers();
+      els.panorama.onload = () => drawMarkers(pano());
+      els.panorama.src = `/api/panorama-preview/${current.pano_index}`;
       drawSelections(current);
+      if (els.panorama.complete) {
+        requestAnimationFrame(() => drawMarkers(current));
+      }
       setStatus("");
+    }
+
+    function clearMarkers() {
+      els.markerLayer.innerHTML = "";
+    }
+
+    function drawMarkers(current) {
+      clearMarkers();
+      if (!current || !current.selections.length) return;
+      const rect = els.panorama.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      for (const selection of current.selections) {
+        const longitude = Number(selection.longitude);
+        const latitude = Number(selection.latitude);
+        if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) continue;
+        const x = clamp(((longitude + Math.PI) / (2 * Math.PI)) * rect.width, 0, rect.width);
+        const y = clamp(((Math.PI / 2 - latitude) / Math.PI) * rect.height, 0, rect.height);
+        const marker = document.createElement("div");
+        marker.className = "selection-marker";
+        marker.style.left = `${x}px`;
+        marker.style.top = `${y}px`;
+        marker.title = `sel-${String(selection.selection_index).padStart(3, "0")}`;
+        els.markerLayer.appendChild(marker);
+      }
     }
 
     function drawSelections(current) {
@@ -841,8 +1108,8 @@ INDEX_HTML = r"""<!doctype html>
       els.latDeg.value = formatNumber(selection.latitude_degrees ?? degrees(selection.latitude));
       if (selection.width) els.width.value = selection.width;
       if (selection.height) els.height.value = selection.height;
-      if (selection.fov_x) els.fovX.value = selection.fov_x;
-      if (selection.fov_y) els.fovY.value = selection.fov_y;
+      if (selection.fov_x) els.fovXDeg.value = formatNumber(degrees(selection.fov_x));
+      if (selection.fov_y) els.fovYDeg.value = formatNumber(degrees(selection.fov_y));
       if (selection.interpolation) els.interpolation.value = selection.interpolation;
       preview().catch(error => setStatus(error.message));
     }
@@ -903,6 +1170,59 @@ INDEX_HTML = r"""<!doctype html>
       setStatus("Deleted.");
     }
 
+    async function resetPanoSelections() {
+      const current = pano();
+      if (!confirm("Reset all saved pinhole views for this panorama?")) return;
+      const response = await fetch("/api/reset-panorama-selections", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({pano_index: current.pano_index})
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      state = payload.state;
+      draw();
+      setStatus(`Reset ${payload.removed_count} pano view(s).`);
+    }
+
+    async function resetCollectionSelections() {
+      if (!confirm("Reset the entire saved pinhole-view collection?")) return;
+      const response = await fetch("/api/reset-collection-selections", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({})
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      state = payload.state;
+      draw();
+      setStatus(`Reset ${payload.removed_count} collection view(s).`);
+    }
+
+    async function sampleRoiSelections(bounds) {
+      const current = pano();
+      const count = Math.max(1, Math.floor(Number(els.roiCount.value) || 1));
+      setStatus(`Sampling ${count} ROI view(s)...`);
+      const response = await fetch("/api/sample-roi-selections", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          pano_index: current.pano_index,
+          longitude_min: bounds.longitudeMin,
+          longitude_max: bounds.longitudeMax,
+          latitude_min: bounds.latitudeMin,
+          latitude_max: bounds.latitudeMax,
+          count,
+          render: renderOverrides()
+        })
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      state = payload.state;
+      draw();
+      setStatus(`Sampled ${payload.created_count} ROI view(s).`);
+    }
+
     function cursorPoint(event) {
       const rect = els.panorama.getBoundingClientRect();
       const x = Math.min(Math.max(event.clientX - rect.left, 0), rect.width);
@@ -910,12 +1230,23 @@ INDEX_HTML = r"""<!doctype html>
       return {rect, x, y};
     }
 
-    function updateCursorLines(event) {
-      const point = cursorPoint(event);
+    function pointAngles(point) {
+      return {
+        longitude: (point.x / point.rect.width) * 2 * Math.PI - Math.PI,
+        latitude: Math.PI / 2 - (point.y / point.rect.height) * Math.PI
+      };
+    }
+
+    function updateCursorLinesFromPoint(point) {
       els.cursorVertical.style.left = `${point.x}px`;
       els.cursorHorizontal.style.top = `${point.y}px`;
       els.cursorVertical.classList.add("visible");
       els.cursorHorizontal.classList.add("visible");
+    }
+
+    function updateCursorLines(event) {
+      const point = cursorPoint(event);
+      updateCursorLinesFromPoint(point);
     }
 
     function hideCursorLines() {
@@ -923,13 +1254,76 @@ INDEX_HTML = r"""<!doctype html>
       els.cursorHorizontal.classList.remove("visible");
     }
 
+    function showRoiBox(start, end) {
+      const left = Math.min(start.x, end.x);
+      const top = Math.min(start.y, end.y);
+      const width = Math.abs(end.x - start.x);
+      const height = Math.abs(end.y - start.y);
+      els.roiBox.style.left = `${left}px`;
+      els.roiBox.style.top = `${top}px`;
+      els.roiBox.style.width = `${width}px`;
+      els.roiBox.style.height = `${height}px`;
+      els.roiBox.classList.add("visible");
+    }
+
+    function hideRoiBox() {
+      els.roiBox.classList.remove("visible");
+    }
+
+    function startRoi(event) {
+      if (!els.roiMode.checked || event.button !== 0) return;
+      event.preventDefault();
+      roiStart = cursorPoint(event);
+      isDrawingRoi = true;
+      suppressNextClick = true;
+      showRoiBox(roiStart, roiStart);
+    }
+
+    function updatePanoramaPointer(event) {
+      const point = cursorPoint(event);
+      updateCursorLinesFromPoint(point);
+      if (isDrawingRoi && roiStart) {
+        showRoiBox(roiStart, point);
+      }
+    }
+
+    function finishRoi(event) {
+      if (!isDrawingRoi || !roiStart) return;
+      event.preventDefault();
+      const end = cursorPoint(event);
+      const start = roiStart;
+      isDrawingRoi = false;
+      roiStart = null;
+      hideRoiBox();
+      if (end.x <= start.x || end.y <= start.y) {
+        setStatus("Draw ROI from upper-left to lower-right.");
+        return;
+      }
+      if (end.x - start.x < 4 || end.y - start.y < 4) {
+        setStatus("ROI is too small.");
+        return;
+      }
+      const topLeft = pointAngles(start);
+      const bottomRight = pointAngles(end);
+      sampleRoiSelections({
+        longitudeMin: topLeft.longitude,
+        longitudeMax: bottomRight.longitude,
+        latitudeMin: bottomRight.latitude,
+        latitudeMax: topLeft.latitude
+      }).catch(error => setStatus(error.message));
+    }
+
     function pickFromClick(event) {
       event.preventDefault();
+      if (suppressNextClick) {
+        suppressNextClick = false;
+        return;
+      }
+      if (els.roiMode.checked) return;
       const point = cursorPoint(event);
-      const longitude = (point.x / point.rect.width) * 2 * Math.PI - Math.PI;
-      const latitude = Math.PI / 2 - (point.y / point.rect.height) * Math.PI;
-      els.lonDeg.value = degrees(longitude).toFixed(2);
-      els.latDeg.value = degrees(latitude).toFixed(2);
+      const angles = pointAngles(point);
+      els.lonDeg.value = degrees(angles.longitude).toFixed(2);
+      els.latDeg.value = degrees(angles.latitude).toFixed(2);
       if (event.metaKey) {
         if (els.cmdSaveOnly.checked) {
           saveSelection().catch(error => setStatus(error.message));
@@ -947,17 +1341,28 @@ INDEX_HTML = r"""<!doctype html>
       return value === null || value === undefined ? "n/a" : Number(value).toFixed(2);
     }
 
+    function clamp(value, min, max) {
+      return Math.min(Math.max(value, min), max);
+    }
+
     els.prev.onclick = () => { index = Math.max(index - 1, 0); draw(); };
     els.next.onclick = () => { index = Math.min(index + 1, state.panorama_count - 1); draw(); };
     els.panorama.onclick = pickFromClick;
-    els.panorama.onmousemove = updateCursorLines;
+    els.panorama.onmousedown = startRoi;
+    els.panorama.onmouseup = finishRoi;
+    els.panorama.onmousemove = updatePanoramaPointer;
     els.panorama.onmouseleave = hideCursorLines;
     els.previewBtn.onclick = () => preview().catch(error => setStatus(error.message));
     els.saveBtn.onclick = () => saveSelection().catch(error => setStatus(error.message));
+    els.resetPanoBtn.onclick = () => resetPanoSelections().catch(error => setStatus(error.message));
+    els.resetCollectionBtn.onclick = () => resetCollectionSelections().catch(error => setStatus(error.message));
     window.addEventListener("keydown", event => {
       if (event.key === "ArrowLeft") els.prev.click();
       if (event.key === "ArrowRight") els.next.click();
       if (event.key.toLowerCase() === "s") els.saveBtn.click();
+    });
+    window.addEventListener("resize", () => {
+      if (state && state.panorama_count) drawMarkers(pano());
     });
     refresh().catch(error => setStatus(error.message));
   </script>

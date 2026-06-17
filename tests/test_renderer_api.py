@@ -20,10 +20,15 @@ from render_pinhole.tools.manual_pinhole_render import (
     main as manual_render_main,
 )
 from render_pinhole.tools.manual_pinhole_select_server import (
+    append_roi_selections,
     append_selection,
     delete_selection,
     pixel_to_longitude_latitude,
+    render_panorama_display_jpeg,
     render_preview_png,
+    reset_collection_selections,
+    reset_panorama_selections,
+    uniform_roi_points,
 )
 from render_pinhole.tools.random_pinhole_image import main as random_render_image_main
 from render_pinhole.tools.render_pinhole_directory import main as render_directory_main
@@ -851,6 +856,107 @@ def test_manual_select_appends_and_deletes_selection(tmp_path) -> None:
     }
 
 
+def test_manual_select_resets_panorama_and_collection_selections() -> None:
+    metadata = {
+        "panoramas": [
+            {
+                "pano_index": 0,
+                "selections": [
+                    {"selection_index": 0},
+                    {"selection_index": 1},
+                ],
+            },
+            {
+                "pano_index": 1,
+                "selections": [
+                    {"selection_index": 0},
+                ],
+            },
+        ],
+    }
+
+    assert reset_panorama_selections(metadata, 0) == 2
+    assert metadata["panoramas"][0]["selections"] == []
+    assert metadata["panoramas"][1]["selections"] == [{"selection_index": 0}]
+    assert metadata["selection_summary"] == {
+        "selected_panorama_count": 1,
+        "selection_count": 1,
+    }
+
+    assert reset_collection_selections(metadata) == 1
+    assert metadata["panoramas"][0]["selections"] == []
+    assert metadata["panoramas"][1]["selections"] == []
+    assert metadata["selection_summary"] == {
+        "selected_panorama_count": 0,
+        "selection_count": 0,
+    }
+
+
+def test_manual_select_uniform_roi_points_are_grid_centered() -> None:
+    points = uniform_roi_points(
+        longitude_min=-1.0,
+        longitude_max=1.0,
+        latitude_min=-0.5,
+        latitude_max=0.5,
+        count=4,
+    )
+
+    assert points == [
+        (-0.5, 0.25),
+        (0.5, 0.25),
+        (-0.5, -0.25),
+        (0.5, -0.25),
+    ]
+
+
+def test_manual_select_appends_roi_selections(tmp_path) -> None:
+    source_path = tmp_path / "pano.png"
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(source_path)
+    metadata = {
+        "render_defaults": {
+            "width": 1280,
+            "height": 1280,
+            "fov_x": pi / 2,
+            "fov_y": pi / 2,
+            "interpolation": "nearest",
+            "output_extension": ".png",
+        },
+        "panoramas": [
+            {
+                "pano_index": 0,
+                "pano_filename": source_path.name,
+                "pano_stem": source_path.stem,
+                "source_pano_path": str(source_path),
+                "source_status": "matched",
+                "pano_camera_pose": None,
+                "selections": [],
+            }
+        ],
+    }
+
+    selections = append_roi_selections(
+        metadata,
+        0,
+        longitude_min=-1.0,
+        longitude_max=1.0,
+        latitude_min=-0.5,
+        latitude_max=0.5,
+        count=3,
+    )
+
+    assert [selection["selection_index"] for selection in selections] == [0, 1, 2]
+    assert [(selection["longitude"], selection["latitude"]) for selection in selections] == [
+        (-0.5, 0.25),
+        (0.5, 0.25),
+        (-0.5, -0.25),
+    ]
+    assert metadata["selection_summary"] == {
+        "selected_panorama_count": 1,
+        "selection_count": 3,
+    }
+
+
 def test_manual_select_preview_renders_png_bytes(tmp_path) -> None:
     source_path = tmp_path / "pano.png"
     Image = pytest.importorskip("PIL.Image")
@@ -918,6 +1024,39 @@ def test_manual_select_preview_caps_resolution_without_changing_saved_selection(
     assert np.asarray(image).shape == (384, 512, 3)
     assert selection["width"] == 1280
     assert selection["height"] == 960
+
+
+def test_manual_select_panorama_display_uses_resized_jpeg(tmp_path) -> None:
+    source_path = tmp_path / "pano.png"
+    Image = pytest.importorskip("PIL.Image")
+    image = np.zeros((32, 64, 3), dtype=np.uint8)
+    image[..., 0] = np.arange(64, dtype=np.uint8)
+    image[..., 1] = np.arange(32, dtype=np.uint8)[:, None]
+    Image.fromarray(image).save(source_path)
+    metadata = {
+        "panoramas": [
+            {
+                "pano_index": 0,
+                "pano_filename": source_path.name,
+                "pano_stem": source_path.stem,
+                "source_pano_path": str(source_path),
+                "source_status": "matched",
+                "selections": [],
+            }
+        ],
+    }
+
+    display = render_panorama_display_jpeg(
+        metadata,
+        0,
+        max_width=16,
+        max_height=8,
+    )
+
+    assert display.startswith(b"\xff\xd8")
+    result = Image.open(io.BytesIO(display))
+    assert result.format == "JPEG"
+    assert result.size == (16, 8)
 
 
 def test_manual_render_scene_metadata_uses_registered_colmap_panoramas(tmp_path) -> None:
