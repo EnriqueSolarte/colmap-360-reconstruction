@@ -206,6 +206,114 @@ The workspace includes `panorama_rig_config.json` and
 feature health, matching settings, registered panorama frames, and sparse
 model statistics.
 
+## Manually Select Pinhole Render Directions
+
+After a panorama-rig reconstruction exists, you can manually choose
+longitude/latitude directions from the registered panoramas and render those
+directions as pinhole images. This is useful when you want a curated set of
+perspective views for Gaussian Splatting or other pose-aware training
+pipelines.
+
+First initialize a manual render workspace. The `--scene-workspace` decides
+which panoramas are shown: only panorama frames registered in that COLMAP scene
+are included. The `--pano-dir` is used to resolve those scene frame names back
+to the original equirectangular image files.
+
+```bash
+manual-pinhole-render \
+  --pano-dir /path/to/source-panoramas \
+  --scene-workspace /path/to/panorama-rig-workspace \
+  --output-dir /path/to/panorama-rig-workspace/pinhole-renders
+```
+
+Then open the local browser selector:
+
+```bash
+manual-pinhole-select \
+  --output-dir /path/to/panorama-rig-workspace/pinhole-renders \
+  --host 127.0.0.1 \
+  --port 8766
+```
+
+Open the printed URL, for example `http://127.0.0.1:8766`.
+
+The panorama image is an equirectangular view:
+
+- Horizontal position maps to longitude.
+- The left edge is `-180` degrees, the center is `0` degrees, and the right
+  edge is `+180` degrees.
+- Vertical position maps to latitude.
+- The top edge is `+90` degrees, the center is `0` degrees, and the bottom edge
+  is `-90` degrees.
+
+Basic selection behavior:
+
+- Move the cursor over the panorama to inspect the full-width/full-height
+  crosshair location.
+- Click once to render only a low-resolution preview of that longitude/latitude
+  direction.
+- Press `Cmd` or `Ctrl` while clicking to save the direction as a selected
+  pinhole view. If `Cmd-click save only` is disabled, the preview is rendered
+  too.
+- Use `Preview` to re-render the current numeric longitude/latitude fields.
+- Use `Save` to save the current numeric longitude/latitude fields.
+- Use `Check` beside a saved view to reload that saved direction and preview it.
+- Use `Delete`, `Undo`, `Reset Pano`, and `Reset Collection` to manage saved
+  selections.
+
+For faster batch selection, enable `ROI sampling`, draw a box from the upper
+left to the lower right of the region you want, and set `Delta deg`. The tool
+samples a regular longitude/latitude grid inside that box using the chosen
+angular spacing. Smaller deltas create more views; larger deltas create fewer
+views.
+
+Good manual selections usually follow these rules:
+
+- Prefer textured, well-lit, non-blurry areas with useful geometry.
+- Avoid crops dominated by blank walls, floor, ceiling, reflective surfaces, or
+  heavy motion blur.
+- Avoid latitudes very close to `+90` or `-90` degrees unless you explicitly
+  need pole-facing views.
+- Keep the FOV and resolution consistent unless you have a specific downstream
+  reason to vary intrinsics.
+- Use the per-panorama COLMAP quality fields as hints: panoramas with many
+  triangulated observations and low reprojection error are usually safer
+  pose anchors.
+
+Saved selections are stored in:
+
+```text
+pinhole-renders/metadata.json
+pinhole-renders/selections.json
+```
+
+When you are done selecting, render the final pinhole images:
+
+```bash
+manual-pinhole-render \
+  --output-dir /path/to/panorama-rig-workspace/pinhole-renders \
+  --render-selections
+```
+
+To also export a COLMAP text model for Gaussian Splatting training:
+
+```bash
+manual-pinhole-render \
+  --output-dir /path/to/panorama-rig-workspace/pinhole-renders \
+  --render-selections \
+  --export-gaussian-splatting-colmap
+```
+
+The export writes:
+
+```text
+pinhole-renders/images/
+pinhole-renders/sparse/0/cameras.txt
+pinhole-renders/sparse/0/images.txt
+pinhole-renders/sparse/0/points3D.txt
+pinhole-renders/gaussian_splatting_export.json
+```
+
 ## Visualize Or Summarize COLMAP Output
 
 Summary mode works without Open3D:

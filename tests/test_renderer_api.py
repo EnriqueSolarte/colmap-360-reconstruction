@@ -638,6 +638,32 @@ def test_manual_render_cli_initializes_metadata(tmp_path, capsys) -> None:
     assert "Initialized 2 panoramas." in output
 
 
+def test_manual_render_cli_sorts_panoramas_by_filename_timestamp(tmp_path) -> None:
+    pano_dir = tmp_path / "panos"
+    output_dir = tmp_path / "pinhole-renders"
+    pano_dir.mkdir()
+    Image = pytest.importorskip("PIL.Image")
+    for name in (
+        "plain-b.png",
+        "shelf-2000000000000_00000001.png",
+        "shelf-1000000000000_00000002.png",
+        "plain-a.png",
+    ):
+        Image.fromarray(make_equirectangular_image()).save(pano_dir / name)
+
+    exit_code = manual_render_main(["-i", str(pano_dir), "-o", str(output_dir)])
+
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+
+    assert exit_code == 0
+    assert [record["pano_filename"] for record in metadata["panoramas"]] == [
+        "shelf-1000000000000_00000002.png",
+        "shelf-2000000000000_00000001.png",
+        "plain-a.png",
+        "plain-b.png",
+    ]
+
+
 def test_manual_render_cli_refuses_to_overwrite_metadata(tmp_path) -> None:
     pano_dir = tmp_path / "panos"
     output_dir = tmp_path / "pinhole-renders"
@@ -1261,6 +1287,79 @@ def test_manual_select_panorama_display_uses_resized_jpeg(tmp_path) -> None:
     result = Image.open(io.BytesIO(display))
     assert result.format == "JPEG"
     assert result.size == (16, 8)
+
+
+def test_manual_render_scene_metadata_sorts_registered_panoramas_by_timestamp(
+    tmp_path,
+) -> None:
+    early_source = tmp_path / "shelf-1000000000000_00000002.png"
+    late_source = tmp_path / "shelf-2000000000000_00000001.png"
+    early_source.write_bytes(b"placeholder")
+    late_source.write_bytes(b"placeholder")
+    views = (
+        PanoramaRigViewMetadata(
+            index=0,
+            image_prefix="pano_camera00/",
+            yaw=0.0,
+            pitch=0.0,
+            cam_from_pano_rotation=np.eye(3),
+        ),
+    )
+    early_scene_name = f"img-0002_{early_source.name}"
+    late_scene_name = f"img-0002_{late_source.name}"
+    scene_context = SceneContext(
+        workspace=tmp_path / "scene",
+        model_path=tmp_path / "scene" / "sparse_best",
+        rig_metadata_path=tmp_path / "scene" / "panorama_rig_config.json",
+        reconstruction=FakeColmapReconstruction({}, num_reg_images=2),
+        views=views,
+        groups=(
+            ScenePanoramaGroup(
+                name=late_scene_name,
+                images=(
+                    FakeColmapImage(
+                        image_id=1,
+                        name=f"pano_camera00/{late_scene_name}",
+                        point3d_ids=[],
+                    ),
+                ),
+            ),
+            ScenePanoramaGroup(
+                name=early_scene_name,
+                images=(
+                    FakeColmapImage(
+                        image_id=2,
+                        name=f"pano_camera00/{early_scene_name}",
+                        point3d_ids=[],
+                    ),
+                ),
+            ),
+        ),
+        image_frame_names={
+            1: late_scene_name,
+            2: early_scene_name,
+        },
+    )
+
+    metadata = build_metadata(
+        pano_paths=[late_source, early_source],
+        pano_dir=tmp_path,
+        output_dir=tmp_path / "renders",
+        scene_workspace=tmp_path / "scene",
+        width=10,
+        height=8,
+        fov_x=pi / 2,
+        fov_y=pi / 3,
+        interpolation="bilinear",
+        output_extension=".png",
+        scene_context=scene_context,
+    )
+
+    assert [record["source_pano_filename"] for record in metadata["panoramas"]] == [
+        early_source.name,
+        late_source.name,
+    ]
+    assert [record["pano_index"] for record in metadata["panoramas"]] == [0, 1]
 
 
 def test_manual_render_scene_metadata_uses_registered_colmap_panoramas(tmp_path) -> None:

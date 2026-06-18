@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections import Counter
 from dataclasses import dataclass
 from importlib import metadata as package_metadata
@@ -45,6 +46,7 @@ POSE_STATUS_MATCHED = "matched"
 POSE_STATUS_UNRESOLVED = "unresolved"
 SOURCE_STATUS_MATCHED = "matched"
 SOURCE_STATUS_MISSING = "missing"
+FILENAME_TIMESTAMP_PATTERN = re.compile(r"(?<!\d)(\d{10,})(?!\d)")
 
 
 @dataclass(frozen=True)
@@ -636,8 +638,12 @@ def scene_panorama_records(
     show_progress: bool = False,
 ) -> list[dict[str, Any]]:
     records = []
-    progress = tqdm(
+    ordered_groups = sorted(
         scene_context.groups,
+        key=lambda group: scene_group_timestamp_sort_key(group, source_index),
+    )
+    progress = tqdm(
+        ordered_groups,
         desc="Computing COLMAP panorama stats",
         unit="pano",
         disable=not show_progress,
@@ -1240,10 +1246,44 @@ def _iter_pano_paths(directory: Path, *, show_progress: bool = False) -> list[Pa
         disable=not show_progress,
     )
     return sorted(
-        path
-        for path in entries
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        (
+            path
+            for path in entries
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ),
+        key=panorama_timestamp_sort_key,
     )
+
+
+def scene_group_timestamp_sort_key(
+    group: ScenePanoramaGroup,
+    source_index: dict[str, Path],
+) -> tuple[int, int | str, str]:
+    source = resolve_source_panorama(group.name, source_index)
+    name = (
+        source.get("source_pano_filename")
+        or source.get("source_pano_path")
+        or group.name
+    )
+    return panorama_name_timestamp_sort_key(str(name))
+
+
+def panorama_timestamp_sort_key(path: Path) -> tuple[int, int | str, str]:
+    return panorama_name_timestamp_sort_key(path.name)
+
+
+def panorama_name_timestamp_sort_key(name: str) -> tuple[int, int | str, str]:
+    timestamp = timestamp_from_image_name(name)
+    if timestamp is None:
+        return (1, name, name)
+    return (0, timestamp, name)
+
+
+def timestamp_from_image_name(name: str) -> int | None:
+    match = FILENAME_TIMESTAMP_PATTERN.search(name)
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def _normalize_extension(extension: str) -> str:

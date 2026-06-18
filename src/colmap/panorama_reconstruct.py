@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -37,6 +38,7 @@ DEFAULT_WORKSPACE = PROJECT_ROOT / "data" / "colmap-panorama-rig"
 COLMAP_IMAGE_PAIR_ID_PRIME = 2_147_483_647
 IMPORTED_PAIR_MATCH_SCOPES = {"last-k", "top-k", "hybrid-k"}
 MATCH_SCOPES = {"all"} | IMPORTED_PAIR_MATCH_SCOPES
+FILENAME_TIMESTAMP_PATTERN = re.compile(r"(?<!\d)(\d{10,})(?!\d)")
 
 
 @dataclass(frozen=True)
@@ -1060,10 +1062,27 @@ def cleanup_generated_singleton_rigs(
 
 def panorama_image_paths(input_image_path: Path) -> list[Path]:
     return sorted(
-        path
-        for path in input_image_path.rglob("*")
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        (
+            path
+            for path in input_image_path.rglob("*")
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ),
+        key=panorama_timestamp_sort_key,
     )
+
+
+def panorama_timestamp_sort_key(path: Path) -> tuple[int, int | str, str]:
+    timestamp = timestamp_from_image_name(path.name)
+    if timestamp is None:
+        return (1, path.name, path.name)
+    return (0, timestamp, path.name)
+
+
+def timestamp_from_image_name(name: str) -> int | None:
+    match = FILENAME_TIMESTAMP_PATTERN.search(name)
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def build_rig_views(options: PanoramaRenderOptions) -> list[PanoramaRigView]:

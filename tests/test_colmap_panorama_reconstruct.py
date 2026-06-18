@@ -43,6 +43,7 @@ from colmap.panorama_reconstruct import (
     read_image_records_by_name,
     read_last_old_rig_frame_image_sets,
     read_rig_frame_image_sets_for_images,
+    panorama_image_paths,
     resolve_initial_panorama_session,
     RigFrameImageSet,
     run_incremental_mapping,
@@ -1473,6 +1474,25 @@ def test_render_panorama_rig_images_respects_image_limit(tmp_path, monkeypatch) 
         "unit": "view",
         "updates": 1,
     }
+
+
+def test_panorama_image_paths_sort_by_filename_timestamp(tmp_path) -> None:
+    input_dir = tmp_path / "panos"
+    input_dir.mkdir()
+    for name in (
+        "plain-b.png",
+        "shelf-2000000000000_00000001.png",
+        "shelf-1000000000000_00000002.png",
+        "plain-a.png",
+    ):
+        (input_dir / name).write_bytes(b"image")
+
+    assert [path.name for path in panorama_image_paths(input_dir)] == [
+        "shelf-1000000000000_00000002.png",
+        "shelf-2000000000000_00000001.png",
+        "plain-a.png",
+        "plain-b.png",
+    ]
 
 
 def test_render_panorama_rig_images_rejects_existing_seeded_views(tmp_path) -> None:
