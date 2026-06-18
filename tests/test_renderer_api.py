@@ -16,6 +16,7 @@ from render_pinhole.tools.manual_pinhole_render import (
     PanoramaRigViewMetadata,
     SceneContext,
     ScenePanoramaGroup,
+    auto_selection_longitude_latitude_grid,
     build_metadata,
     gaussian_splatting_image_and_camera_records,
     quaternion_from_rotation,
@@ -662,6 +663,70 @@ def test_manual_render_cli_sorts_panoramas_by_filename_timestamp(tmp_path) -> No
         "plain-a.png",
         "plain-b.png",
     ]
+
+
+def test_manual_render_auto_select_grid_uses_45_degree_cells() -> None:
+    points = auto_selection_longitude_latitude_grid()
+
+    assert len(points) == 32
+    assert points[0] == pytest.approx((-7 * pi / 8, 3 * pi / 8))
+    assert points[7] == pytest.approx((7 * pi / 8, 3 * pi / 8))
+    assert points[-1] == pytest.approx((7 * pi / 8, -3 * pi / 8))
+
+
+def test_manual_render_cli_auto_selects_every_panorama(tmp_path, capsys) -> None:
+    pano_dir = tmp_path / "panos"
+    output_dir = tmp_path / "pinhole-renders"
+    pano_dir.mkdir()
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(pano_dir / "pano_001.png")
+    Image.fromarray(make_equirectangular_image()).save(pano_dir / "pano_002.png")
+
+    exit_code = manual_render_main(
+        [
+            "-i",
+            str(pano_dir),
+            "-o",
+            str(output_dir),
+            "--width",
+            "10",
+            "--height",
+            "8",
+            "--fov-x",
+            str(pi / 2),
+            "--fov-y",
+            str(pi / 3),
+            "--auto-select",
+        ]
+    )
+
+    raw_metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    metadata = load_metadata_with_selections(output_dir)
+
+    assert exit_code == 0
+    assert raw_metadata["panoramas"][0]["selections"] == []
+    assert raw_metadata["panoramas"][0]["selection_count"] == 32
+    assert metadata["selection_summary"] == {
+        "selected_panorama_count": 2,
+        "selection_count": 64,
+    }
+    assert metadata["auto_selection"] == {
+        "enabled": True,
+        "delta_degrees": 45.0,
+        "longitude_sample_count": 8,
+        "latitude_sample_count": 4,
+        "views_per_panorama": 32,
+        "selection_count": 64,
+    }
+    first_selection = metadata["panoramas"][0]["selections"][0]
+    assert first_selection["selection_index"] == 0
+    assert first_selection["longitude_degrees"] == pytest.approx(-157.5)
+    assert first_selection["latitude_degrees"] == pytest.approx(67.5)
+    assert first_selection["width"] == 10
+    assert first_selection["height"] == 8
+    assert first_selection["render_status"] == "pending"
+    assert first_selection["selected_by"] == "manual-pinhole-render --auto-select"
+    assert "Auto-selected 64 pinhole views (45 degree grid)." in capsys.readouterr().out
 
 
 def test_manual_render_cli_refuses_to_overwrite_metadata(tmp_path) -> None:

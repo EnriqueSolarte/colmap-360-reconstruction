@@ -8,7 +8,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from importlib import metadata as package_metadata
-from math import degrees, pi, sqrt
+from math import degrees, pi, radians, sqrt
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,7 @@ from render_pinhole.defaults import (
 from render_pinhole.renderer import EquirectangularToPinhole
 from render_pinhole.tools.manual_pinhole_selection_store import (
     load_metadata_with_selections,
+    selection_summary_from_metadata,
     write_metadata_with_sidecar,
 )
 
@@ -47,6 +48,7 @@ POSE_STATUS_UNRESOLVED = "unresolved"
 SOURCE_STATUS_MATCHED = "matched"
 SOURCE_STATUS_MISSING = "missing"
 FILENAME_TIMESTAMP_PATTERN = re.compile(r"(?<!\d)(\d{10,})(?!\d)")
+AUTO_SELECT_DELTA_DEGREES = 45.0
 
 
 @dataclass(frozen=True)
@@ -137,14 +139,25 @@ def main(argv: list[str] | None = None) -> int:
         source_index=source_index,
         scene_context=scene_context,
     )
+    auto_selection_count = 0
+    if args.auto_select:
+        auto_selection_count = auto_select_metadata(metadata)
     with tqdm(total=1, desc="Writing metadata", unit="file") as progress:
-        metadata_path.write_text(
-            json.dumps(metadata, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        if args.auto_select:
+            write_metadata_with_sidecar(args.output_dir, metadata)
+        else:
+            metadata_path.write_text(
+                json.dumps(metadata, indent=2) + "\n",
+                encoding="utf-8",
+            )
         progress.update()
     print(f"Metadata: {metadata_path}")
     print(f"Initialized {metadata['panorama_count']} panoramas.")
+    if args.auto_select:
+        print(
+            f"Auto-selected {auto_selection_count} pinhole views "
+            f"({AUTO_SELECT_DELTA_DEGREES:g} degree grid)."
+        )
     return 0
 
 
@@ -608,6 +621,103 @@ def build_metadata(
         "panorama_count": len(panoramas),
         "panoramas": panoramas,
     }
+
+
+def auto_select_metadata(
+    metadata: dict[str, Any],
+    *,
+    delta_degrees: float = AUTO_SELECT_DELTA_DEGREES,
+) -> int:
+    params = metadata.get("render_defaults", {})
+    selections_per_panorama = auto_selection_longitude_latitude_grid(
+        delta_degrees=delta_degrees,
+    )
+    selection_count = 0
+    for panorama in metadata.get("panoramas", []):
+        panorama["selections"] = [
+            auto_selection_record(
+                selection_index=index,
+                longitude=longitude,
+                latitude=latitude,
+                params=params,
+            )
+            for index, (longitude, latitude) in enumerate(selections_per_panorama)
+        ]
+        selection_count += len(panorama["selections"])
+    metadata["selection_summary"] = selection_summary_from_metadata(metadata)
+    metadata["auto_selection"] = {
+        "enabled": True,
+        "delta_degrees": delta_degrees,
+        "longitude_sample_count": len(
+            auto_selection_axis_values(-pi, pi, radians(delta_degrees))
+        ),
+        "latitude_sample_count": len(
+            auto_selection_axis_values(-pi / 2.0, pi / 2.0, radians(delta_degrees))
+        ),
+        "views_per_panorama": len(selections_per_panorama),
+        "selection_count": selection_count,
+    }
+    return selection_count
+
+
+def auto_selection_record(
+    *,
+    selection_index: int,
+    longitude: float,
+    latitude: float,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "selection_index": selection_index,
+        "longitude": longitude,
+        "latitude": latitude,
+        "longitude_degrees": degrees(longitude),
+        "latitude_degrees": degrees(latitude),
+        "width": int(params["width"]),
+        "height": int(params["height"]),
+        "fov_x": float(params["fov_x"]),
+        "fov_y": float(params["fov_y"]),
+        "interpolation": str(params.get("interpolation", DEFAULT_PINHOLE_INTERPOLATION)),
+        "output_extension": _normalize_extension(
+            str(params.get("output_extension", ".png"))
+        ),
+        "render_status": "pending",
+        "selected_by": "manual-pinhole-render --auto-select",
+    }
+
+
+def auto_selection_longitude_latitude_grid(
+    *,
+    delta_degrees: float = AUTO_SELECT_DELTA_DEGREES,
+) -> list[tuple[float, float]]:
+    if delta_degrees <= 0.0:
+        raise ValueError("auto selection delta must be positive")
+    delta = radians(delta_degrees)
+    longitudes = auto_selection_axis_values(-pi, pi, delta)
+    latitudes = list(
+        reversed(auto_selection_axis_values(-pi / 2.0, pi / 2.0, delta))
+    )
+    return [
+        (longitude, latitude)
+        for latitude in latitudes
+        for longitude in longitudes
+    ]
+
+
+def auto_selection_axis_values(
+    minimum: float,
+    maximum: float,
+    delta: float,
+) -> list[float]:
+    span = maximum - minimum
+    if span <= delta:
+        return [(minimum + maximum) / 2.0]
+    value = minimum + delta / 2.0
+    values = []
+    while value < maximum:
+        values.append(value)
+        value += delta
+    return values
 
 
 def source_panorama_records(paths: list[Path]) -> list[dict[str, Any]]:
@@ -1195,6 +1305,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Overwrite an existing metadata.json in the output directory.",
     )
     parser.add_argument(
+        "--auto-select",
+        action="store_true",
+        help=(
+            "Initialize every panorama with an automatic 45 degree "
+            "longitude/latitude selection grid."
+        ),
+    )
+    parser.add_argument(
         "--render-selections",
         action="store_true",
         help=(
@@ -1215,6 +1333,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
     if args.export_gaussian_splatting_colmap and not args.render_selections:
         parser.error("--export-gaussian-splatting-colmap requires --render-selections")
+    if args.auto_select and args.render_selections:
+        parser.error("--auto-select is only valid when initializing metadata")
     if not args.render_selections and args.pano_dir is None:
         parser.error("--pano-dir is required unless --render-selections is used")
     if args.pano_dir is not None and not args.pano_dir.is_dir():

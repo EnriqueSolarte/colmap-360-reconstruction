@@ -226,6 +226,19 @@ manual-pinhole-render \
   --output-dir /path/to/panorama-rig-workspace/pinhole-renders
 ```
 
+To skip manual point-by-point selection and initialize a regular grid over
+every registered panorama, add `--auto-select`. This samples a 45-degree
+longitude/latitude grid inside the full equirectangular image, producing 32
+pending pinhole views per panorama.
+
+```bash
+manual-pinhole-render \
+  --pano-dir /path/to/source-panoramas \
+  --scene-workspace /path/to/panorama-rig-workspace \
+  --output-dir /path/to/panorama-rig-workspace/pinhole-renders \
+  --auto-select
+```
+
 Then open the local browser selector:
 
 ```bash
