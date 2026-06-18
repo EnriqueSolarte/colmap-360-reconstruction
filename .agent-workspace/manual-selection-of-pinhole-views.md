@@ -429,7 +429,7 @@ Add output conventions and metadata needed by the Gaussian Splatting workflow.
 This should include clear camera intrinsics and traceability back to the source
 panoramas.
 
-Status: pending.
+Status: implemented for COLMAP text export.
 
 ## Progress Log
 
@@ -474,6 +474,50 @@ Recommended next slice:
 Implement Stage 5: add the reconstruction handoff conventions needed by the
 Gaussian Splatting workflow, including camera metadata export and traceability
 from selected pinhole images back to source panoramas.
+
+### 2026-06-17
+
+Implemented the first Stage 5 handoff slice.
+
+Changed behavior:
+
+- Added `--export-gaussian-splatting-colmap` with `--export-colmap` alias to
+  `manual-pinhole-render`.
+- The export flag requires `--render-selections` so rendered images, intrinsics,
+  and pinhole poses are generated before the COLMAP handoff is written.
+- When export is enabled, selected pinhole images are written under
+  `pinhole-renders/images/`.
+- Added a COLMAP text model under `pinhole-renders/sparse/0/`:
+  `cameras.txt`, `images.txt`, and `points3D.txt`.
+- `cameras.txt` uses `PINHOLE` intrinsics derived from each selection's
+  width/height/FOV, reusing a shared camera ID when intrinsics match.
+- `images.txt` stores each selected pinhole view pose using COLMAP
+  world-to-camera quaternion and translation convention.
+- `points3D.txt` copies xyz/rgb/error points from the source scene
+  `sparse_best` model. Original tracks are intentionally omitted because they
+  belong to the old virtual panorama views, not the new manually selected
+  pinhole views.
+- Added `gaussian_splatting_export.json` to record export paths, counts, source
+  model path, and coordinate-frame assumptions.
+
+Command shape:
+
+```bash
+manual-pinhole-render \
+  -o /path/to/pinhole-renders \
+  --render-selections \
+  --export-gaussian-splatting-colmap
+```
+
+Verification:
+
+```text
+pytest /workspace/tests/test_renderer_api.py
+42 passed
+
+pytest /workspace/tests
+114 passed
+```
 
 ## Risks
 

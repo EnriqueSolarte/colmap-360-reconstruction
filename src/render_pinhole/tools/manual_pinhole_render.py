@@ -7,7 +7,7 @@ import json
 from collections import Counter
 from dataclasses import dataclass
 from importlib import metadata as package_metadata
-from math import degrees, pi
+from math import degrees, pi, sqrt
 from pathlib import Path
 from typing import Any
 
@@ -73,11 +73,22 @@ class SceneContext:
     image_frame_names: dict[int, str]
 
 
+@dataclass(frozen=True)
+class ColmapPointRecord:
+    point3D_id: int
+    xyz: tuple[float, float, float]
+    rgb: tuple[int, int, int]
+    error: float
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.render_selections:
         try:
-            render_metadata_selections(args.output_dir)
+            render_metadata_selections(
+                args.output_dir,
+                export_gaussian_splatting_colmap=args.export_gaussian_splatting_colmap,
+            )
         except (OSError, ValueError, KeyError) as error:
             print(error)
             return 1
@@ -135,7 +146,11 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def render_metadata_selections(output_dir: Path) -> dict[str, Any]:
+def render_metadata_selections(
+    output_dir: Path,
+    *,
+    export_gaussian_splatting_colmap: bool = False,
+) -> dict[str, Any]:
     metadata_path = output_dir / METADATA_FILENAME
     if not metadata_path.is_file():
         raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
@@ -145,6 +160,8 @@ def render_metadata_selections(output_dir: Path) -> dict[str, Any]:
     panoramas = metadata.get("panoramas", [])
     selection_count = sum(len(panorama.get("selections", [])) for panorama in panoramas)
     rendered_count = 0
+    image_output_dir = output_dir / "images" if export_gaussian_splatting_colmap else output_dir
+    image_output_dir.mkdir(parents=True, exist_ok=True)
 
     progress = tqdm(
         total=selection_count,
@@ -176,7 +193,7 @@ def render_metadata_selections(output_dir: Path) -> dict[str, Any]:
             for fallback_index, selection in enumerate(selections):
                 render_selection(
                     renderer,
-                    output_dir,
+                    image_output_dir,
                     panorama,
                     selection,
                     render_defaults,
@@ -191,13 +208,278 @@ def render_metadata_selections(output_dir: Path) -> dict[str, Any]:
         "status": "rendered_selections",
         "selection_count": selection_count,
         "rendered_selection_count": rendered_count,
+        "image_output_dir": str(image_output_dir),
     }
+    if export_gaussian_splatting_colmap:
+        metadata["gaussian_splatting_export"] = export_gaussian_splatting_colmap_model(
+            output_dir,
+            metadata,
+        )
     with tqdm(total=1, desc="Writing metadata", unit="file") as progress:
         write_metadata_with_sidecar(output_dir, metadata)
         progress.update()
     print(f"Metadata: {metadata_path}")
     print(f"Rendered {rendered_count} selected pinhole views.")
     return metadata
+
+
+def export_gaussian_splatting_colmap_model(
+    output_dir: Path,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    scene_workspace = metadata.get("scene_workspace")
+    if not scene_workspace:
+        raise ValueError("Cannot export COLMAP handoff without scene_workspace metadata")
+    pycolmap_module = require_pycolmap()
+    source_model_path = resolve_scene_model_path(Path(scene_workspace))
+    reconstruction = pycolmap_module.Reconstruction(source_model_path)
+    points = colmap_point_records(reconstruction)
+    return write_gaussian_splatting_colmap_export(
+        output_dir=output_dir,
+        metadata=metadata,
+        points=points,
+        source_model_path=source_model_path,
+    )
+
+
+def write_gaussian_splatting_colmap_export(
+    *,
+    output_dir: Path,
+    metadata: dict[str, Any],
+    points: list[ColmapPointRecord],
+    source_model_path: Path | None = None,
+) -> dict[str, Any]:
+    sparse_dir = output_dir / "sparse" / "0"
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+    image_records, camera_records = gaussian_splatting_image_and_camera_records(
+        metadata,
+        output_dir,
+    )
+    write_cameras_text(sparse_dir / "cameras.txt", camera_records)
+    write_images_text(sparse_dir / "images.txt", image_records)
+    write_points3d_text(sparse_dir / "points3D.txt", points)
+    manifest = {
+        "status": "exported",
+        "format": "colmap_text",
+        "coordinate_frame": "colmap_world_unscaled",
+        "sparse_dir": str(sparse_dir),
+        "images_dir": str(output_dir / "images"),
+        "source_model_path": None if source_model_path is None else str(source_model_path),
+        "camera_count": len(camera_records),
+        "image_count": len(image_records),
+        "point3D_count": len(points),
+        "points3D_tracks": "omitted_for_derived_manual_pinhole_views",
+    }
+    (output_dir / "gaussian_splatting_export.json").write_text(
+        json.dumps(manifest, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def gaussian_splatting_image_and_camera_records(
+    metadata: dict[str, Any],
+    output_dir: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    camera_ids: dict[tuple[Any, ...], int] = {}
+    camera_records: list[dict[str, Any]] = []
+    image_records: list[dict[str, Any]] = []
+    image_id = 1
+    for panorama in metadata.get("panoramas", []):
+        for fallback_index, selection in enumerate(panorama.get("selections", [])):
+            if selection.get("render_status") != "rendered":
+                raise ValueError("Cannot export COLMAP handoff before all selections are rendered")
+            rendered_path_value = selection.get("rendered_path")
+            if not rendered_path_value:
+                raise ValueError("Rendered selection is missing rendered_path")
+            rendered_path = Path(rendered_path_value)
+            if not rendered_path.is_file():
+                raise FileNotFoundError(f"Rendered pinhole image not found: {rendered_path}")
+            pose = selection.get("pinhole_camera_pose")
+            if pose is None:
+                pose = pinhole_camera_pose_report(
+                    panorama.get("pano_camera_pose"),
+                    float(selection["longitude"]),
+                    float(selection["latitude"]),
+                )
+                selection["pinhole_camera_pose"] = pose
+            if pose is None:
+                raise ValueError(
+                    "Cannot export selection without pinhole pose for "
+                    f"{panorama.get('scene_pano_filename') or panorama.get('pano_filename')}"
+                )
+            camera = camera_record_from_selection(selection)
+            key = camera_record_key(camera)
+            if key not in camera_ids:
+                camera_ids[key] = len(camera_records) + 1
+                camera["camera_id"] = camera_ids[key]
+                camera_records.append(camera)
+            image_records.append(
+                image_record_from_selection(
+                    image_id=image_id,
+                    camera_id=camera_ids[key],
+                    image_name=rendered_path.name,
+                    pose=pose,
+                    panorama=panorama,
+                    selection=selection,
+                    fallback_index=fallback_index,
+                )
+            )
+            image_id += 1
+    if not image_records:
+        raise ValueError("No rendered selections are available to export")
+    return image_records, camera_records
+
+
+def camera_record_from_selection(selection: dict[str, Any]) -> dict[str, Any]:
+    camera = camera_from_fov(
+        width=int(selection["width"]),
+        height=int(selection["height"]),
+        fov_x=float(selection["fov_x"]),
+        fov_y=float(selection["fov_y"]),
+    )
+    return {
+        "model": camera.model,
+        "width": camera.width,
+        "height": camera.height,
+        "params": camera.params,
+    }
+
+
+def camera_record_key(camera: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        camera["model"],
+        int(camera["width"]),
+        int(camera["height"]),
+        tuple(round(float(value), 12) for value in camera["params"]),
+    )
+
+
+def image_record_from_selection(
+    *,
+    image_id: int,
+    camera_id: int,
+    image_name: str,
+    pose: dict[str, Any],
+    panorama: dict[str, Any],
+    selection: dict[str, Any],
+    fallback_index: int,
+) -> dict[str, Any]:
+    rotation_world_from_pinhole = np.asarray(
+        pose["rotation_world_from_pinhole"],
+        dtype=np.float64,
+    )
+    center_world = np.asarray(pose["center_world"], dtype=np.float64)
+    rotation_cam_from_world = rotation_world_from_pinhole.T
+    translation = -rotation_cam_from_world @ center_world
+    return {
+        "image_id": image_id,
+        "qvec": quaternion_from_rotation(rotation_cam_from_world),
+        "tvec": tuple(float(value) for value in translation),
+        "camera_id": camera_id,
+        "image_name": image_name,
+        "source_pano_filename": panorama.get("source_pano_filename"),
+        "scene_pano_filename": panorama.get("scene_pano_filename"),
+        "selection_index": int(selection.get("selection_index", fallback_index)),
+    }
+
+
+def quaternion_from_rotation(rotation: np.ndarray) -> tuple[float, float, float, float]:
+    matrix = np.asarray(rotation, dtype=np.float64)
+    trace = float(np.trace(matrix))
+    if trace > 0.0:
+        s = sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (matrix[2, 1] - matrix[1, 2]) / s
+        qy = (matrix[0, 2] - matrix[2, 0]) / s
+        qz = (matrix[1, 0] - matrix[0, 1]) / s
+    elif matrix[0, 0] > matrix[1, 1] and matrix[0, 0] > matrix[2, 2]:
+        s = sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
+        qw = (matrix[2, 1] - matrix[1, 2]) / s
+        qx = 0.25 * s
+        qy = (matrix[0, 1] + matrix[1, 0]) / s
+        qz = (matrix[0, 2] + matrix[2, 0]) / s
+    elif matrix[1, 1] > matrix[2, 2]:
+        s = sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
+        qw = (matrix[0, 2] - matrix[2, 0]) / s
+        qx = (matrix[0, 1] + matrix[1, 0]) / s
+        qy = 0.25 * s
+        qz = (matrix[1, 2] + matrix[2, 1]) / s
+    else:
+        s = sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
+        qw = (matrix[1, 0] - matrix[0, 1]) / s
+        qx = (matrix[0, 2] + matrix[2, 0]) / s
+        qy = (matrix[1, 2] + matrix[2, 1]) / s
+        qz = 0.25 * s
+    quaternion = np.asarray([qw, qx, qy, qz], dtype=np.float64)
+    quaternion /= np.linalg.norm(quaternion)
+    if quaternion[0] < 0.0:
+        quaternion *= -1.0
+    return tuple(float(value) for value in quaternion)
+
+
+def colmap_point_records(reconstruction: Any) -> list[ColmapPointRecord]:
+    return [
+        ColmapPointRecord(
+            point3D_id=int(point_id),
+            xyz=tuple(float(value) for value in point.xyz),
+            rgb=tuple(int(value) for value in point.color),
+            error=float(point.error),
+        )
+        for point_id, point in sorted(reconstruction.points3D.items())
+    ]
+
+
+def write_cameras_text(path: Path, cameras: list[dict[str, Any]]) -> None:
+    lines = [
+        "# Camera list with one line of data per camera:",
+        "#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]",
+        f"# Number of cameras: {len(cameras)}",
+    ]
+    for camera in cameras:
+        params = " ".join(format_float(value) for value in camera["params"])
+        lines.append(
+            f"{camera['camera_id']} {camera['model']} "
+            f"{camera['width']} {camera['height']} {params}"
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_images_text(path: Path, images: list[dict[str, Any]]) -> None:
+    lines = [
+        "# Image list with two lines of data per image:",
+        "#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME",
+        "#   POINTS2D[] as (X, Y, POINT3D_ID)",
+        f"# Number of images: {len(images)}, mean observations per image: 0",
+    ]
+    for image in images:
+        qvec = " ".join(format_float(value) for value in image["qvec"])
+        tvec = " ".join(format_float(value) for value in image["tvec"])
+        lines.append(
+            f"{image['image_id']} {qvec} {tvec} "
+            f"{image['camera_id']} {image['image_name']}"
+        )
+        lines.append("")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_points3d_text(path: Path, points: list[ColmapPointRecord]) -> None:
+    lines = [
+        "# 3D point list with one line of data per point:",
+        "#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]",
+        f"# Number of points: {len(points)}, mean track length: 0",
+    ]
+    for point in points:
+        xyz = " ".join(format_float(value) for value in point.xyz)
+        rgb = " ".join(str(int(value)) for value in point.rgb)
+        lines.append(
+            f"{point.point3D_id} {xyz} {rgb} {format_float(point.error)}"
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def format_float(value: float) -> str:
+    return f"{float(value):.12g}"
 
 
 def render_selection(
@@ -914,8 +1196,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "the metadata in place."
         ),
     )
+    parser.add_argument(
+        "--export-gaussian-splatting-colmap",
+        "--export-colmap",
+        action="store_true",
+        help=(
+            "After rendering selections, export a COLMAP text model under "
+            "output-dir/sparse/0 for Gaussian Splatting training."
+        ),
+    )
     args = parser.parse_args(argv)
 
+    if args.export_gaussian_splatting_colmap and not args.render_selections:
+        parser.error("--export-gaussian-splatting-colmap requires --render-selections")
     if not args.render_selections and args.pano_dir is None:
         parser.error("--pano-dir is required unless --render-selections is used")
     if args.pano_dir is not None and not args.pano_dir.is_dir():

@@ -12,11 +12,15 @@ from render_pinhole.tools.render_pinhole_image import (
     main as render_image_main,
 )
 from render_pinhole.tools.manual_pinhole_render import (
+    ColmapPointRecord,
     PanoramaRigViewMetadata,
     SceneContext,
     ScenePanoramaGroup,
     build_metadata,
+    gaussian_splatting_image_and_camera_records,
+    quaternion_from_rotation,
     rendered_filename,
+    write_gaussian_splatting_colmap_export,
     main as manual_render_main,
 )
 from render_pinhole.tools.manual_pinhole_selection_store import (
@@ -757,7 +761,129 @@ def test_manual_render_cli_renders_existing_metadata_selections(tmp_path) -> Non
         "status": "rendered_selections",
         "selection_count": 1,
         "rendered_selection_count": 1,
+        "image_output_dir": str(output_dir),
     }
+
+
+def test_manual_render_writes_gaussian_splatting_colmap_export(tmp_path) -> None:
+    output_dir = tmp_path / "pinhole-renders"
+    images_dir = output_dir / "images"
+    images_dir.mkdir(parents=True)
+    rendered_path = images_dir / "pano__sel-000.png"
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(np.zeros((8, 10, 3), dtype=np.uint8)).save(rendered_path)
+    metadata = {
+        "scene_workspace": str(tmp_path / "scene"),
+        "panoramas": [
+            {
+                "pano_index": 0,
+                "pano_filename": "pano.png",
+                "source_pano_filename": "pano.png",
+                "scene_pano_filename": "img-0001_pano.png",
+                "selections": [
+                    {
+                        "selection_index": 0,
+                        "longitude": pi / 4,
+                        "latitude": 0.0,
+                        "width": 10,
+                        "height": 8,
+                        "fov_x": pi / 2,
+                        "fov_y": pi / 3,
+                        "render_status": "rendered",
+                        "rendered_path": str(rendered_path),
+                        "pinhole_camera_pose": {
+                            "coordinate_frame": "colmap_world_unscaled",
+                            "center_world": [1.0, 2.0, 3.0],
+                            "rotation_world_from_pinhole": np.eye(3).tolist(),
+                            "transform_world_from_pinhole": np.eye(4).tolist(),
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    points = [
+        ColmapPointRecord(
+            point3D_id=7,
+            xyz=(1.0, 2.0, 3.0),
+            rgb=(10, 20, 30),
+            error=0.25,
+        )
+    ]
+
+    manifest = write_gaussian_splatting_colmap_export(
+        output_dir=output_dir,
+        metadata=metadata,
+        points=points,
+        source_model_path=tmp_path / "scene" / "sparse_best",
+    )
+    sparse_dir = output_dir / "sparse" / "0"
+
+    assert manifest == {
+        "status": "exported",
+        "format": "colmap_text",
+        "coordinate_frame": "colmap_world_unscaled",
+        "sparse_dir": str(sparse_dir),
+        "images_dir": str(output_dir / "images"),
+        "source_model_path": str(tmp_path / "scene" / "sparse_best"),
+        "camera_count": 1,
+        "image_count": 1,
+        "point3D_count": 1,
+        "points3D_tracks": "omitted_for_derived_manual_pinhole_views",
+    }
+    cameras_text = (sparse_dir / "cameras.txt").read_text(encoding="utf-8")
+    images_text = (sparse_dir / "images.txt").read_text(encoding="utf-8")
+    points_text = (sparse_dir / "points3D.txt").read_text(encoding="utf-8")
+    assert "1 PINHOLE 10 8 5 6.92820323028 5 4" in cameras_text
+    assert "1 1 0 0 0 -1 -2 -3 1 pano__sel-000.png" in images_text
+    assert "7 1 2 3 10 20 30 0.25" in points_text
+    assert json.loads(
+        (output_dir / "gaussian_splatting_export.json").read_text(encoding="utf-8")
+    ) == manifest
+
+
+def test_manual_render_colmap_export_reuses_identical_cameras(tmp_path) -> None:
+    output_dir = tmp_path / "pinhole-renders"
+    images_dir = output_dir / "images"
+    images_dir.mkdir(parents=True)
+    Image = pytest.importorskip("PIL.Image")
+    for name in ("a.png", "b.png"):
+        Image.fromarray(np.zeros((8, 10, 3), dtype=np.uint8)).save(images_dir / name)
+    selection = {
+        "width": 10,
+        "height": 8,
+        "fov_x": pi / 2,
+        "fov_y": pi / 3,
+        "render_status": "rendered",
+        "pinhole_camera_pose": {
+            "center_world": [0.0, 0.0, 0.0],
+            "rotation_world_from_pinhole": np.eye(3).tolist(),
+        },
+    }
+    metadata = {
+        "panoramas": [
+            {
+                "pano_index": 0,
+                "selections": [
+                    {**selection, "selection_index": 0, "rendered_path": str(images_dir / "a.png")},
+                    {**selection, "selection_index": 1, "rendered_path": str(images_dir / "b.png")},
+                ],
+            }
+        ],
+    }
+
+    image_records, camera_records = gaussian_splatting_image_and_camera_records(
+        metadata,
+        output_dir,
+    )
+
+    assert len(image_records) == 2
+    assert len(camera_records) == 1
+    assert [image["camera_id"] for image in image_records] == [1, 1]
+
+
+def test_manual_render_quaternion_from_rotation_identity() -> None:
+    assert quaternion_from_rotation(np.eye(3)) == (1.0, 0.0, 0.0, 0.0)
 
 
 def test_manual_render_cli_rejects_invalid_selection_latitude(tmp_path) -> None:
