@@ -91,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             render_metadata_selections(
                 args.output_dir,
+                scene_workspace=args.scene_workspace,
                 export_gaussian_splatting_colmap=args.export_gaussian_splatting_colmap,
             )
         except (OSError, ValueError, KeyError) as error:
@@ -164,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
 def render_metadata_selections(
     output_dir: Path,
     *,
+    scene_workspace: Path | None = None,
     export_gaussian_splatting_colmap: bool = False,
 ) -> dict[str, Any]:
     metadata_path = output_dir / METADATA_FILENAME
@@ -171,6 +173,8 @@ def render_metadata_selections(
         raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
 
     metadata = load_metadata_with_selections(output_dir)
+    if scene_workspace is not None:
+        apply_scene_workspace_to_metadata(metadata, scene_workspace)
     render_defaults = metadata.get("render_defaults", {})
     panoramas = metadata.get("panoramas", [])
     selection_count = sum(len(panorama.get("selections", [])) for panorama in panoramas)
@@ -236,6 +240,147 @@ def render_metadata_selections(
     print(f"Metadata: {metadata_path}")
     print(f"Rendered {rendered_count} selected pinhole views.")
     return metadata
+
+
+def apply_scene_workspace_to_metadata(
+    metadata: dict[str, Any],
+    scene_workspace: Path,
+) -> int:
+    scene_context = load_scene_context(scene_workspace)
+    source_index = metadata_source_pano_index(metadata)
+    scene_records = scene_panorama_pose_records(
+        scene_context,
+        source_index,
+        show_progress=True,
+    )
+    metadata_records = metadata_panorama_lookup(metadata)
+    updated_count = 0
+    for scene_record in scene_records:
+        key = panorama_match_key(scene_record)
+        if key is None or key not in metadata_records:
+            continue
+        panorama = metadata_records[key]
+        selections = panorama.get("selections", [])
+        panorama.update(
+            {
+                "scene_pano_filename": scene_record.get("scene_pano_filename"),
+                "source_pano_filename": scene_record.get("source_pano_filename"),
+                "source_pano_path": scene_record.get("source_pano_path"),
+                "source_status": scene_record.get("source_status"),
+                "source_resolution_strategy": scene_record.get(
+                    "source_resolution_strategy"
+                ),
+                "pano_camera_pose": scene_record.get("pano_camera_pose"),
+                "pose_status": scene_record.get("pose_status"),
+                "colmap_quality": scene_record.get("colmap_quality"),
+            }
+        )
+        panorama["selections"] = selections
+        updated_count += 1
+
+    metadata["scene_workspace"] = str(scene_workspace)
+    metadata["pose_status"] = POSE_STATUS_MATCHED if updated_count else POSE_STATUS_UNRESOLVED
+    metadata["pose_status_description"] = _pose_status_description(metadata["pose_status"])
+    metadata["scene"] = scene_report(scene_context)
+    metadata["scene_workspace_override"] = {
+        "enabled": True,
+        "workspace": str(scene_workspace),
+        "matched_panorama_count": updated_count,
+        "registered_panorama_count": len(scene_records),
+    }
+    return updated_count
+
+
+def scene_panorama_pose_records(
+    scene_context: SceneContext,
+    source_index: dict[str, Path],
+    *,
+    show_progress: bool = False,
+) -> list[dict[str, Any]]:
+    records = []
+    ordered_groups = sorted(
+        scene_context.groups,
+        key=lambda group: scene_group_timestamp_sort_key(group, source_index),
+    )
+    progress = tqdm(
+        ordered_groups,
+        desc="Attaching COLMAP panorama poses",
+        unit="pano",
+        disable=not show_progress,
+    )
+    for index, group in enumerate(progress):
+        source = resolve_source_panorama(group.name, source_index)
+        records.append(
+            {
+                "pano_index": index,
+                "pano_filename": source["source_pano_filename"] or group.name,
+                "pano_stem": Path(source["source_pano_filename"] or group.name).stem,
+                "pano_path": source["source_pano_path"],
+                "scene_pano_filename": group.name,
+                "source_pano_filename": source["source_pano_filename"],
+                "source_pano_path": source["source_pano_path"],
+                "source_status": source["source_status"],
+                "source_resolution_strategy": source["source_resolution_strategy"],
+                "pano_camera_pose": panorama_pose_report(group, scene_context.views),
+                "pose_status": POSE_STATUS_MATCHED,
+                "colmap_quality": None,
+            }
+        )
+    return records
+
+
+def metadata_source_pano_index(metadata: dict[str, Any]) -> dict[str, Path]:
+    source_index = {}
+    for panorama in metadata.get("panoramas", []):
+        path_value = panorama.get("source_pano_path") or panorama.get("pano_path")
+        if path_value is None:
+            continue
+        path = Path(path_value)
+        for name_value in (
+            panorama.get("source_pano_filename"),
+            panorama.get("pano_filename"),
+            path.name,
+        ):
+            if isinstance(name_value, str) and name_value:
+                source_index[name_value] = path
+    return source_index
+
+
+def metadata_panorama_lookup(metadata: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    lookup = {}
+    for panorama in metadata.get("panoramas", []):
+        for key in metadata_panorama_keys(panorama):
+            lookup.setdefault(key, panorama)
+    return lookup
+
+
+def metadata_panorama_keys(panorama: dict[str, Any]) -> list[str]:
+    keys = []
+    for value in (
+        panorama.get("source_pano_filename"),
+        panorama.get("pano_filename"),
+        panorama.get("scene_pano_filename"),
+    ):
+        if isinstance(value, str) and value:
+            keys.append(value)
+    path_value = panorama.get("source_pano_path") or panorama.get("pano_path")
+    if path_value:
+        keys.append(Path(path_value).name)
+    return keys
+
+
+def panorama_match_key(panorama: dict[str, Any]) -> str | None:
+    for value in (
+        panorama.get("source_pano_filename"),
+        panorama.get("pano_filename"),
+        panorama.get("scene_pano_filename"),
+    ):
+        if isinstance(value, str) and value:
+            return value
+    path_value = panorama.get("source_pano_path") or panorama.get("pano_path")
+    if path_value:
+        return Path(path_value).name
+    return None
 
 
 def export_gaussian_splatting_colmap_model(

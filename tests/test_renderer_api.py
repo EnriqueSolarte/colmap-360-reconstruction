@@ -16,6 +16,7 @@ from render_pinhole.tools.manual_pinhole_render import (
     PanoramaRigViewMetadata,
     SceneContext,
     ScenePanoramaGroup,
+    apply_scene_workspace_to_metadata,
     auto_selection_longitude_latitude_grid,
     build_metadata,
     gaussian_splatting_image_and_camera_records,
@@ -1425,6 +1426,86 @@ def test_manual_render_scene_metadata_sorts_registered_panoramas_by_timestamp(
         late_source.name,
     ]
     assert [record["pano_index"] for record in metadata["panoramas"]] == [0, 1]
+
+
+def test_manual_render_scene_workspace_override_attaches_existing_metadata_poses(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    source_path = tmp_path / "shelf-1000000000000_00000002.png"
+    source_path.write_bytes(b"placeholder")
+    scene_name = f"img-0002_{source_path.name}"
+    views = (
+        PanoramaRigViewMetadata(
+            index=0,
+            image_prefix="pano_camera00/",
+            yaw=0.0,
+            pitch=0.0,
+            cam_from_pano_rotation=np.eye(3),
+        ),
+    )
+    scene_context = SceneContext(
+        workspace=tmp_path / "scene" / "sparse_best",
+        model_path=tmp_path / "scene" / "sparse_best",
+        rig_metadata_path=tmp_path / "scene" / "panorama_rig_config.json",
+        reconstruction=FakeColmapReconstruction({}, num_reg_images=1),
+        views=views,
+        groups=(
+            ScenePanoramaGroup(
+                name=scene_name,
+                images=(
+                    FakeColmapImage(
+                        image_id=1,
+                        name=f"pano_camera00/{scene_name}",
+                        point3d_ids=[],
+                    ),
+                ),
+            ),
+        ),
+        image_frame_names={1: scene_name},
+    )
+    metadata = {
+        "scene_workspace": None,
+        "pose_status": "missing",
+        "panoramas": [
+            {
+                "pano_index": 0,
+                "pano_filename": source_path.name,
+                "pano_stem": source_path.stem,
+                "source_pano_filename": source_path.name,
+                "source_pano_path": str(source_path),
+                "source_status": "matched",
+                "pano_camera_pose": None,
+                "pose_status": "missing",
+                "colmap_quality": None,
+                "selections": [{"selection_index": 0}],
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        "render_pinhole.tools.manual_pinhole_render.load_scene_context",
+        lambda _path: scene_context,
+    )
+
+    updated_count = apply_scene_workspace_to_metadata(
+        metadata,
+        tmp_path / "scene" / "sparse_best",
+    )
+    record = metadata["panoramas"][0]
+
+    assert updated_count == 1
+    assert metadata["scene_workspace"] == str(tmp_path / "scene" / "sparse_best")
+    assert metadata["pose_status"] == "matched"
+    assert metadata["scene_workspace_override"] == {
+        "enabled": True,
+        "workspace": str(tmp_path / "scene" / "sparse_best"),
+        "matched_panorama_count": 1,
+        "registered_panorama_count": 1,
+    }
+    assert record["scene_pano_filename"] == scene_name
+    assert record["pose_status"] == "matched"
+    assert record["pano_camera_pose"]["coordinate_frame"] == "colmap_world_unscaled"
+    assert record["selections"] == [{"selection_index": 0}]
 
 
 def test_manual_render_scene_metadata_uses_registered_colmap_panoramas(tmp_path) -> None:

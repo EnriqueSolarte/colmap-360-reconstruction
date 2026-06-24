@@ -1189,7 +1189,7 @@ INDEX_HTML = r"""<!doctype html>
       setStatus("Preview ready.");
     }
 
-    async function saveSelection() {
+    async function saveSelection({redraw = true} = {}) {
       const current = pano();
       setStatus("Saving...");
       const response = await fetch("/api/selections", {
@@ -1205,8 +1205,23 @@ INDEX_HTML = r"""<!doctype html>
       if (!response.ok) throw new Error(await response.text());
       const payload = await response.json();
       state = payload.state;
-      draw();
-      setStatus("Saved.");
+      if (redraw) {
+        draw();
+        setStatus("Saved.");
+      }
+      return payload;
+    }
+
+    async function saveSelectionAndAdvance(advanceAfterSave) {
+      await saveSelection({redraw: false});
+      if (advanceAfterSave && index < state.panorama_count - 1) {
+        index += 1;
+        draw();
+        setStatus("Saved. Moved to next panorama.");
+      } else {
+        draw();
+        setStatus("Saved.");
+      }
     }
 
     async function deleteSelection(selectionIndex) {
@@ -1393,9 +1408,10 @@ INDEX_HTML = r"""<!doctype html>
       const angles = pointAngles(point);
       els.lonDeg.value = degrees(angles.longitude).toFixed(2);
       els.latDeg.value = degrees(angles.latitude).toFixed(2);
-      if (event.metaKey) {
+      const saveModifier = event.metaKey || event.ctrlKey;
+      if (saveModifier) {
         if (els.cmdSaveOnly.checked) {
-          saveSelection().catch(error => setStatus(error.message));
+          saveSelectionAndAdvance(event.shiftKey).catch(error => setStatus(error.message));
         } else {
           preview()
             .then(() => saveSelection())

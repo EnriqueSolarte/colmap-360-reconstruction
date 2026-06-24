@@ -268,6 +268,8 @@ Basic selection behavior:
 - Press `Cmd` or `Ctrl` while clicking to save the direction as a selected
   pinhole view. If `Cmd-click save only` is disabled, the preview is rendered
   too.
+- When `Cmd-click save only` is enabled, press `Shift` with `Cmd` or `Ctrl`
+  while clicking to save and immediately advance to the next panorama.
 - Use `Preview` to re-render the current numeric longitude/latitude fields.
 - Use `Save` to save the current numeric longitude/latitude fields.
 - Use `Check` beside a saved view to reload that saved direction and preview it.
@@ -326,6 +328,86 @@ pinhole-renders/sparse/0/images.txt
 pinhole-renders/sparse/0/points3D.txt
 pinhole-renders/gaussian_splatting_export.json
 ```
+
+### Example With An Existing Optimized Scene
+
+Use this workflow when you already have:
+
+- an optimized panorama-rig COLMAP model, for example:
+
+```text
+/data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/colmap/1781765016983-1781764929431-1781765089651-1781765215596-1781765283163-1781765391913-1781765475779-1781765557512/sparse_best
+```
+
+- the original panorama images, for example:
+
+```text
+/data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/pano-raw-views/all-merged
+```
+
+The COLMAP scene is the authority for which panorama frames are usable. The
+raw panorama directory may contain extra images; those are only used to resolve
+source files for the registered scene panoramas.
+
+Choose an output directory for the selected pinhole workflow:
+
+```text
+/data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/renders-pinhole
+```
+
+Initialize the selection workspace:
+
+```bash
+manual-pinhole-render \
+  --pano-dir /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/pano-raw-views/all-merged \
+  --scene-workspace /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/colmap/1781765016983-1781764929431-1781765089651-1781765215596-1781765283163-1781765391913-1781765475779-1781765557512/sparse_best \
+  --output-dir /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/renders-pinhole
+```
+
+Open the selector:
+
+```bash
+manual-pinhole-select \
+  --output-dir /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/renders-pinhole \
+  --host 127.0.0.1 \
+  --port 8766
+```
+
+Select views in the browser, then stop the selector server before rendering the
+final set. Avoid editing selections in the browser while the render/export
+command is running.
+
+Render the selected pinhole images and export a COLMAP text model for Gaussian
+Splatting:
+
+```bash
+manual-pinhole-render \
+  --output-dir /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/renders-pinhole \
+  --render-selections \
+  --scene-workspace /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/colmap/1781765016983-1781764929431-1781765089651-1781765215596-1781765283163-1781765391913-1781765475779-1781765557512/sparse_best \
+  --export-gaussian-splatting-colmap
+```
+
+Passing `--scene-workspace` again during render/export is intentional and safe.
+It ensures the exporter has the optimized panorama poses and the source COLMAP
+`points3D`, even if the selection metadata was originally initialized without
+scene pose information.
+
+For a fully automatic baseline selection instead of browser selection, add
+`--auto-select` during initialization:
+
+```bash
+manual-pinhole-render \
+  --pano-dir /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/pano-raw-views/all-merged \
+  --scene-workspace /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/colmap/1781765016983-1781764929431-1781765089651-1781765215596-1781765283163-1781765391913-1781765475779-1781765557512/sparse_best \
+  --output-dir /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/renders-pinhole \
+  --auto-select
+```
+
+`--auto-select` creates 32 pending views per registered panorama using a
+45-degree longitude/latitude grid. It is useful for a baseline dataset, but a
+manual or ROI-curated set is usually better when you want to avoid blank walls,
+blurred views, ceiling/floor-heavy crops, or weakly textured areas.
 
 ## Visualize Or Summarize COLMAP Output
 

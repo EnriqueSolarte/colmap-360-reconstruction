@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 set -e
 # v2026-06-02  14:56:23 by EnriqueSolarte
-# Extracts frames from an input video using ffmpeg, saving every Nth frame
+# Extracts frames from an input video using ffmpeg.
 # into a directory named after the video (without extension).
-# The optional second argument sets N (default 10).
-# Example: ./proc_video.sh /path/to/video.mp4 5
+# By default every frame is extracted.
+# Example: ./proc_video.sh -v /path/to/video.mp4 --skip-frames 4
 # input video
 
 usage() {
-  echo "Usage: ${BASH_SOURCE[0]} -v VIDEO_INPUT"
+  echo "Usage: ${BASH_SOURCE[0]} -v VIDEO_INPUT [--skip-frames COUNT]"
   echo
   echo "Options:"
   echo "  -v, --video-input VIDEO_INPUT   Video input. Required."
-  echo "  -h, --help                  Show this help message."
+  echo "  -s, --skip-frames COUNT         Frames to skip between extracted images. Default: 0."
+  echo "  -h, --help                      Show this help message."
 }
+
+SKIP_FRAMES=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -23,6 +26,14 @@ while [ "$#" -gt 0 ]; do
         return 1 2>/dev/null || exit 1
       fi
       VIDEO=("$2")
+      shift 2
+      ;;
+    -s|--skip-frames)
+      if [ "$#" -lt 2 ]; then
+        echo "Missing value for $1" >&2
+        return 1 2>/dev/null || exit 1
+      fi
+      SKIP_FRAMES="$2"
       shift 2
       ;;
     -h|--help)
@@ -39,7 +50,12 @@ done
 if [ -z "${VIDEO}" ]; then
     echo "Missing value for $1" >&2
     usage >&2
-    return 1
+    return 1 2>/dev/null || exit 1
+fi
+
+if ! [[ "$SKIP_FRAMES" =~ ^[0-9]+$ ]]; then
+    echo "--skip-frames must be a non-negative integer." >&2
+    return 1 2>/dev/null || exit 1
 fi
 
 if ! command -v ffmpeg >/dev/null 2>&1; then
@@ -56,13 +72,13 @@ PARENT_NAME="$(basename "$BASENAME")"
 # output directory
 OUTDIR="$BASENAME"
 
-SKIP="${2:-1}"   # if user passes a second argument use that, otherwise default=10
+FRAME_STEP=$((SKIP_FRAMES + 1))
 
 # make sure output directory exists
 mkdir -p "$OUTDIR"
 
 # extract all frames
 # you can change "png" to "jpg" or other format
-ffmpeg -i "$VIDEO" -vf "select='not(mod(n\,${SKIP}))'" -vsync vfr "$OUTDIR/${PARENT_NAME}_%08d.png"
+ffmpeg -i "$VIDEO" -vf "select='not(mod(n\,${FRAME_STEP}))'" -vsync vfr "$OUTDIR/${PARENT_NAME}_%08d.png"
 
 echo "Extracted frames into $OUTDIR/"
