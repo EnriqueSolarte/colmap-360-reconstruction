@@ -7,7 +7,9 @@ import pytest
 from PIL import Image
 
 from colmap.camera import camera_from_equirectangular
+from colmap.panorama import pipeline as panorama_pipeline
 from colmap.panorama_reconstruct import (
+    build_panorama_import_report,
     COLMAP_IMAGE_PAIR_ID_PRIME,
     FeaturePipelineOptions,
     GeneratedImageBatch,
@@ -29,11 +31,15 @@ from colmap.panorama_reconstruct import (
     read_generated_image_batch,
     read_image_records_by_name,
     run_incremental_mapping,
+    run_panorama_reconstruction,
+    run_panorama_image_import,
     resolve_pipeline_execution,
     score_keyframe_anchors,
     write_equirectangular_metadata,
     write_image_pair_list,
 )
+from colmap.panorama.cli_import import main as import_main
+from colmap.panorama.cli_import import parse_import_args
 
 
 class FakeReconstructionStats:
@@ -223,6 +229,227 @@ def test_write_equirectangular_metadata_records_native_images(tmp_path) -> None:
     assert metadata["import_options"]["copy_backend"] == "hardlink_or_symlink"
     assert metadata["panorama_images"][0]["colmap_image_name"] == "a.png"
     assert "views" not in metadata
+
+
+def test_panorama_import_report_marks_skipped_colmap_stages(tmp_path) -> None:
+    paths = {
+        "workspace": tmp_path,
+        "image_dir": tmp_path / "images",
+        "metadata": tmp_path / "panorama_equirectangular_config.json",
+        "import_report": tmp_path / "panorama_equirectangular_import_report.json",
+    }
+
+    report = build_panorama_import_report(
+        input_image_path=tmp_path / "input",
+        paths=paths,
+        camera=camera_from_equirectangular(16, 8),
+        panorama_paths=[tmp_path / "input" / "a.png"],
+        image_names=["a.png"],
+        image_limit=None,
+        import_workers=2,
+    )
+
+    assert report["status"] == f"{NATIVE_CAMERA_SETUP}_import_only"
+    assert report["camera"]["model"] == "EQUIRECTANGULAR"
+    assert report["options"]["import_workers"] == 2
+    assert report["panorama_count"] == 1
+    assert "feature_extraction" in report["skipped_stages"]
+    assert report["generated_image_names"] == ["a.png"]
+
+
+def test_run_panorama_image_import_writes_metadata_report_without_colmap_outputs(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    input_dir = tmp_path / "input"
+    workspace = tmp_path / "workspace"
+    nested_dir = input_dir / "nested"
+    nested_dir.mkdir(parents=True)
+    Image.new("RGB", (16, 8), color=(255, 0, 0)).save(input_dir / "a.png")
+    Image.new("RGB", (16, 8), color=(0, 255, 0)).save(nested_dir / "b.jpg")
+
+    def fail_if_pycolmap_is_required():
+        raise AssertionError("import-only mode should not require pycolmap")
+
+    monkeypatch.setattr(
+        "colmap.panorama.pycolmap_adapter.require_pycolmap",
+        fail_if_pycolmap_is_required,
+    )
+    monkeypatch.setattr(
+        "colmap.panorama.pipeline.require_pycolmap",
+        fail_if_pycolmap_is_required,
+    )
+
+    report = run_panorama_image_import(
+        input_dir,
+        workspace,
+        import_workers=2,
+    )
+
+    metadata_path = workspace / "panorama_equirectangular_config.json"
+    report_path = workspace / "panorama_equirectangular_import_report.json"
+    stored_report = json.loads(report_path.read_text(encoding="utf-8"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    assert report["status"] == f"{NATIVE_CAMERA_SETUP}_import_only"
+    assert report["panorama_count"] == 2
+    assert report["options"]["import_workers"] == 2
+    assert stored_report["generated_image_names"] == ["a.png", "nested/b.jpg"]
+    assert metadata["panorama_images"][1]["colmap_image_name"] == "nested/b.jpg"
+    assert os.path.samefile(input_dir / "a.png", workspace / "images" / "a.png")
+    assert os.path.samefile(
+        nested_dir / "b.jpg",
+        workspace / "images" / "nested" / "b.jpg",
+    )
+    assert not (workspace / "database.db").exists()
+    assert not (workspace / "sparse").exists()
+    assert "feature_extraction" in stored_report["skipped_stages"]
+
+
+def test_run_panorama_image_import_refuses_existing_outputs_without_overwrite(
+    tmp_path,
+) -> None:
+    input_dir = tmp_path / "input"
+    workspace = tmp_path / "workspace"
+    input_dir.mkdir()
+    Image.new("RGB", (16, 8), color=(255, 0, 0)).save(input_dir / "a.png")
+    run_panorama_image_import(input_dir, workspace)
+
+    with pytest.raises(FileExistsError, match="Pass --overwrite"):
+        run_panorama_image_import(input_dir, workspace)
+
+
+def test_run_panorama_reconstruction_uses_shared_import_pipeline(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    input_dir = tmp_path / "input"
+    workspace = tmp_path / "workspace"
+    input_dir.mkdir()
+    import_calls = []
+    extract_calls = []
+
+    class FakePycolmap:
+        __version__ = "fake"
+
+        class CameraMode:
+            SINGLE = "single"
+
+        class ImageReaderOptions:
+            def __init__(self):
+                self.camera_model = None
+                self.camera_params = None
+
+        @staticmethod
+        def set_random_seed(_seed):
+            return None
+
+        @staticmethod
+        def extract_features(*args, **kwargs):
+            extract_calls.append((args, kwargs))
+
+    def fake_import_panorama_images_to_workspace(**kwargs):
+        import_calls.append(kwargs)
+        return (
+            [input_dir / "a.png"],
+            camera_from_equirectangular(16, 8),
+            ["a.png"],
+        )
+
+    monkeypatch.setattr(panorama_pipeline, "require_pycolmap", lambda: FakePycolmap)
+    monkeypatch.setattr(panorama_pipeline, "configure_ssl_cert_file", lambda _path: None)
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "resolve_pipeline_execution",
+        lambda _pycolmap, _options: {
+            "requested_device": "auto",
+            "resolved_device": "cpu",
+            "device": "cpu",
+            "cuda_available": False,
+            "gpu_index": "-1",
+            "gpu_bundle_adjustment": False,
+            "bundle_adjustment_gpu_index": "-1",
+        },
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "import_panorama_images_to_workspace",
+        fake_import_panorama_images_to_workspace,
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "create_feature_extraction_options",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "read_generated_image_batch",
+        lambda _database, image_names: GeneratedImageBatch(
+            names=tuple(image_names),
+            records_by_name={"a.png": (1, 1)},
+        ),
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "read_feature_stats_by_database_camera",
+        lambda _database: {"camera_1": {"image_count": 1, "total_features": 10}},
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "equirectangular_feature_health_summary",
+        lambda _report, expected_image_count: {
+            "expected_panorama_images": expected_image_count,
+            "panorama_images_with_features": expected_image_count,
+        },
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "create_feature_matching_options",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(panorama_pipeline, "match_features", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "create_mapper_options",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "run_incremental_mapping",
+        lambda *_args, **_kwargs: {0: FakeReconstructionStats()},
+    )
+    monkeypatch.setattr(panorama_pipeline, "write_best_model", lambda *_args: None)
+    monkeypatch.setattr(panorama_pipeline, "score_keyframe_anchors", lambda *_args: [])
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "build_panorama_report",
+        lambda **_kwargs: {
+            "workspace": str(workspace),
+            "camera_setup": NATIVE_CAMERA_SETUP,
+            "camera": {"model": "EQUIRECTANGULAR"},
+            "panorama_count": 1,
+            "options": {"resolved_device": "cpu"},
+            "feature_health": {
+                "panorama_images_with_features": 1,
+                "expected_panorama_images": 1,
+            },
+            "best_sparse_path": str(workspace / "sparse_best"),
+            "best_model": {"num_registered_images": 1, "num_points3D": 0},
+        },
+    )
+
+    run_panorama_reconstruction(
+        input_dir,
+        workspace,
+        import_workers=3,
+    )
+
+    assert len(import_calls) == 1
+    assert import_calls[0]["input_image_path"] == input_dir
+    assert import_calls[0]["paths"]["workspace"] == workspace
+    assert import_calls[0]["image_limit"] is None
+    assert import_calls[0]["import_workers"] == 3
+    assert len(extract_calls) == 1
 
 
 def test_generated_image_batch_preserves_database_identity(tmp_path) -> None:
@@ -772,6 +999,62 @@ def test_parse_args_rejects_invalid_feature_extraction_tuning_options(
 def test_parse_args_rejects_invalid_import_workers(tmp_path, value) -> None:
     with pytest.raises(SystemExit):
         parse_args(["--input-image-path", str(tmp_path), "--import-workers", value])
+
+
+def test_parse_import_args_accepts_import_options(tmp_path) -> None:
+    args = parse_import_args(
+        [
+            "--input-image-path",
+            str(tmp_path),
+            "--image-limit",
+            "3",
+            "--import-workers",
+            "2",
+        ]
+    )
+
+    assert args.image_limit == 3
+    assert args.import_workers == 2
+    assert args.overwrite is False
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--image-limit", "0"),
+        ("--import-workers", "0"),
+        ("--import-workers", "-1"),
+    ],
+)
+def test_parse_import_args_rejects_invalid_options(tmp_path, option, value) -> None:
+    with pytest.raises(SystemExit):
+        parse_import_args(["--input-image-path", str(tmp_path), option, value])
+
+
+def test_panorama_import_cli_writes_import_workspace(tmp_path, capsys) -> None:
+    input_dir = tmp_path / "input"
+    workspace = tmp_path / "workspace"
+    input_dir.mkdir()
+    Image.new("RGB", (16, 8), color=(255, 0, 0)).save(input_dir / "a.png")
+
+    assert (
+        import_main(
+            [
+                "--input-image-path",
+                str(input_dir),
+                "--workspace",
+                str(workspace),
+            ]
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "panorama images: 1" in output
+    assert "report:" in output
+    assert (workspace / "panorama_equirectangular_config.json").is_file()
+    assert (workspace / "panorama_equirectangular_import_report.json").is_file()
+    assert not (workspace / "database.db").exists()
 
 
 @pytest.mark.parametrize(

@@ -33,6 +33,7 @@ from colmap.panorama.image_import import (
     prefixed_panorama_relative_name,
     timestamp_from_image_name,
 )
+from colmap.panorama.import_pipeline import run_panorama_image_import
 from colmap.panorama.paths import panorama_workspace_paths
 from colmap.panorama.pipeline import record_elapsed_stage, run_panorama_reconstruction
 from colmap.panorama.pycolmap_adapter import (
@@ -51,6 +52,7 @@ from colmap.panorama.pycolmap_adapter import (
     write_best_model,
 )
 from colmap.panorama.reports import (
+    build_panorama_import_report,
     build_panorama_report,
     equirectangular_feature_health_summary,
     format_elapsed_seconds,
@@ -87,6 +89,7 @@ __all__ = [
     "PROJECT_ROOT",
     "PanoramaArgumentDefaultsHelpFormatter",
     "PipelineExecutionOptions",
+    "build_panorama_import_report",
     "build_panorama_report",
     "colmap_frame_id_for_image",
     "configure_ssl_cert_file",
@@ -124,6 +127,7 @@ __all__ = [
     "require_pycolmap",
     "resolve_pipeline_execution",
     "round_report_float",
+    "run_panorama_image_import",
     "run_incremental_mapping",
     "run_panorama_reconstruction",
     "score_keyframe_anchors",

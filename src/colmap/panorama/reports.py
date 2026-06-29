@@ -100,6 +100,50 @@ def write_equirectangular_metadata(
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
+def build_panorama_import_report(
+    *,
+    input_image_path: Path,
+    paths: dict[str, Path],
+    camera: ColmapCamera,
+    panorama_paths: Sequence[Path],
+    image_names: Sequence[str],
+    image_limit: int | None,
+    import_workers: int,
+) -> dict[str, Any]:
+    return {
+        "status": f"{NATIVE_CAMERA_SETUP}_import_only",
+        "camera_setup": NATIVE_CAMERA_SETUP,
+        "input_image_path": str(input_image_path),
+        "workspace": str(paths["workspace"]),
+        "image_dir": str(paths["image_dir"]),
+        "metadata_path": str(paths["metadata"]),
+        "report_path": str(paths["import_report"]),
+        "camera": camera.report(),
+        "options": {
+            "image_limit": image_limit,
+            "import_workers": import_workers,
+            "copy_backend": "hardlink_or_symlink",
+        },
+        "panorama_count": len(panorama_paths),
+        "generated_image_count": len(image_names),
+        "generated_image_names": list(image_names),
+        "panorama_images": [
+            {
+                "source_path": str(panorama_path),
+                "colmap_image_name": image_name,
+            }
+            for panorama_path, image_name in zip(panorama_paths, image_names)
+        ],
+        "skipped_stages": [
+            "feature_extraction",
+            "matching",
+            "incremental_mapping",
+            "best_model_write",
+            "keyframe_scoring",
+        ],
+    }
+
+
 def build_panorama_report(
     *,
     pycolmap_version: str,

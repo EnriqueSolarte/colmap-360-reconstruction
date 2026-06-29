@@ -36,10 +36,12 @@ Current gaps:
    are not exposed.
 2. Image import is serial even though resolution checks and hardlink/symlink
    creation can be parallelized safely with ordered result collection.
-3. There is no reusable feature-only or batch-extraction workflow for testing
+3. There is no isolated import-only path for validating image discovery,
+   resolution checks, link creation, and metadata without running COLMAP.
+4. There is no reusable feature-only or batch-extraction workflow for testing
    extraction independently from matching and mapping.
-4. There is no safe batch-worker orchestration.
-5. There is no validated database-sharding and merge path for parallel
+5. There is no safe batch-worker orchestration.
+6. There is no validated database-sharding and merge path for parallel
    extraction.
 
 ## Important Constraints
@@ -131,6 +133,55 @@ Success criteria:
    rejection, and existing-output failure behavior.
 3. Metadata remains byte-shape compatible except for any explicitly added import
    worker reporting.
+
+## Stage 2.1: Isolated Image Import
+
+Add an import-only execution path that stops after panorama discovery,
+resolution validation, hardlink/symlink import, metadata writing, and a small
+import report. It must not run feature extraction, feature matching, or
+incremental mapping.
+
+Purpose:
+
+1. Validate input image discovery and timestamp ordering without paying COLMAP
+   feature extraction cost.
+2. Validate mixed-resolution rejection and workspace image layout before longer
+   reconstruction runs.
+3. Give `--import-workers` a direct smoke-test path on real datasets.
+4. Create a clean foundation for later feature-only and sharded extraction
+   helpers to reuse imported images.
+
+Possible shape:
+
+1. Add a small import-only helper that shares the same import implementation as
+   reconstruction.
+2. Expose it as either:
+   - a dedicated command such as `colmap-panorama-import`, or
+   - an explicit reconstruction flag such as `--import-only`.
+3. Write `panorama_equirectangular_config.json`.
+4. Write an import report containing image count, camera model/params,
+   `image_limit`, `import_workers`, elapsed import time, and generated image
+   names.
+5. Exit before `pycolmap.extract_features(...)`.
+
+Preferred default:
+
+1. Use a dedicated command if this starts to grow its own reporting or user
+   workflow.
+2. Use `--import-only` only if the implementation can stay very small and does
+   not make the reconstruction pipeline branchy.
+
+Success criteria:
+
+1. Import-only execution creates `workspace/images/` and
+   `panorama_equirectangular_config.json`.
+2. No COLMAP database is required and no feature extraction, matching, sparse
+   mapping, or best-model writing is attempted.
+3. Tests prove pycolmap feature extraction is not called in this mode.
+4. The import report records enough information to compare serial and
+   multi-worker import behavior.
+5. The normal reconstruction path remains unchanged when import-only mode is not
+   requested.
 
 ## Stage 3: Feature-Only Batch Extraction Helper And Merge Validation
 
@@ -250,6 +301,7 @@ Measure before and after each performance stage:
 10. Import elapsed seconds.
 11. Shard extraction elapsed seconds by worker/batch.
 12. Merge elapsed seconds.
+13. Import-only elapsed seconds and imported image count.
 
 Representative runs should include:
 
@@ -275,7 +327,7 @@ Representative runs should include:
 
 ## Recommended Next Slice
 
-Implement Stage 1 only, then Stage 2 if the first slice is clean:
+Implement Stage 1 only, then Stage 2, then Stage 2.1 if each slice is clean:
 
 1. Expose `num_threads` and `max_image_size` through
    `FeaturePipelineOptions`, the CLI, pycolmap option construction, and the
@@ -283,6 +335,9 @@ Implement Stage 1 only, then Stage 2 if the first slice is clean:
 2. Add tests for option parsing, option propagation, and report output.
 3. After that is verified, add opt-in multi-worker import with deterministic
    result ordering and focused import tests.
+4. After multi-worker import is verified, add an isolated import-only path that
+   writes metadata/report output and explicitly skips feature extraction,
+   matching, and mapping.
 
 Do not expose `--feature-workers` in reconstruction until the Stage 3 helper
 proves camera/image identity and matching behavior after database merge.

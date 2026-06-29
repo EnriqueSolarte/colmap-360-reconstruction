@@ -12,7 +12,7 @@ from colmap.panorama.database import (
     read_feature_stats_by_database_camera,
     read_generated_image_batch,
 )
-from colmap.panorama.image_import import import_equirectangular_panorama_images
+from colmap.panorama.import_pipeline import import_panorama_images_to_workspace
 from colmap.panorama.paths import panorama_workspace_paths
 from colmap.panorama.pycolmap_adapter import (
     configure_ssl_cert_file,
@@ -30,7 +30,6 @@ from colmap.panorama.reports import (
     equirectangular_feature_health_summary,
     format_elapsed_seconds,
     format_elapsed_seconds_by_stage,
-    write_equirectangular_metadata,
 )
 from colmap.panorama.scoring import score_keyframe_anchors
 from colmap.panorama.types import FeaturePipelineOptions, PipelineExecutionOptions
@@ -80,20 +79,11 @@ def run_panorama_reconstruction(
     record_elapsed_stage(elapsed_seconds_by_stage, "setup", stage_started_at)
 
     stage_started_at = time.perf_counter()
-    panorama_paths, camera, generated_image_names = import_equirectangular_panorama_images(
+    panorama_paths, camera, generated_image_names = import_panorama_images_to_workspace(
         input_image_path=input_image_path,
-        output_image_dir=paths["image_dir"],
+        paths=paths,
         image_limit=image_limit,
         import_workers=import_workers,
-    )
-    write_equirectangular_metadata(
-        paths["metadata"],
-        input_image_path,
-        camera,
-        panorama_paths,
-        generated_image_names,
-        image_limit=image_limit,
-        relative_name_prefix=None,
     )
     record_elapsed_stage(
         elapsed_seconds_by_stage,

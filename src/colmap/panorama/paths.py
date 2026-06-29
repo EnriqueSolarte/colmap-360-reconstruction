@@ -14,6 +14,7 @@ def panorama_workspace_paths(workspace: Path) -> dict[str, Path]:
         "best_sparse": workspace / "sparse_best",
         "raw_ply": workspace / "cloud_colmap_raw.ply",
         "report": workspace / "panorama_equirectangular_report.json",
+        "import_report": workspace / "panorama_equirectangular_import_report.json",
         "metadata": workspace / "panorama_equirectangular_config.json",
         "match_pairs": workspace / "match_pairs.txt",
     }
