@@ -294,3 +294,144 @@ Start with Stage 1 only:
 4. Run the targeted tests.
 
 Do not proceed to Stage 2 until Stage 1 is reviewed and accepted.
+
+## Implementation Summary
+
+Status as of 2026-06-29: all planned restructuring stages have been executed.
+
+The former `src/colmap/panorama_reconstruct.py` implementation has been split
+into the `src/colmap/panorama/` package. The old module remains as a
+compatibility facade that re-exports the previous public helpers and preserves
+the `python -m colmap.panorama_reconstruct` execution path.
+
+Implemented modules:
+
+- `constants.py`: common constants and filename timestamp pattern.
+- `types.py`: shared dataclasses and score report float formatting helpers.
+- `paths.py`: workspace path construction.
+- `image_import.py`: panorama discovery, timestamp sorting, resolution checks,
+  relative naming, and hardlink/symlink import.
+- `database.py`: COLMAP SQLite reads, database image identity reads, feature
+  statistics, pair-id decoding, and frame connection reads.
+- `reports.py`: metadata writing, report construction, model statistics,
+  feature-health summary, image-pair-list writing, and elapsed-time formatting.
+- `pycolmap_adapter.py`: optional `pycolmap` import boundary, SSL setup, feature
+  and matcher option construction, mapper option construction, GPU resolution,
+  feature matching, incremental mapping, and best-model writing.
+- `scoring.py`: keyframe anchor scoring and score math.
+- `pipeline.py`: high-level `run_panorama_reconstruction` orchestration.
+- `cli.py`: argument parsing, defaults, and console output.
+
+The compatibility facade `panorama_reconstruct.py` is intentionally still
+present. It is no longer the implementation owner; it is the backwards-compatible
+import and execution surface.
+
+## Why This Is Better
+
+The implementation is materially easier to reason about than the original
+single-file script. The original file mixed CLI parsing, image import, SQLite
+queries, pycolmap calls, scoring, report writing, timing, and pipeline control
+in one place. That meant a change to one concern required scanning unrelated
+code and increased the chance of accidentally modifying behavior outside the
+intended area.
+
+The new layout improves practical maintainability in these ways:
+
+- Changing image import behavior now starts in `image_import.py`, not in a
+  1,000+ line script.
+- Changing COLMAP database reads now starts in `database.py`.
+- Changing feature extraction, matching, mapping, CUDA selection, or pycolmap
+  compatibility now starts in `pycolmap_adapter.py`.
+- Changing report schema or metadata writing now starts in `reports.py`.
+- Changing keyframe anchor scoring now starts in `scoring.py`.
+- Changing CLI flags or printed output now starts in `cli.py`.
+- The high-level pipeline now reads as a stage sequence instead of being
+  interrupted by unrelated helper definitions.
+
+This is especially useful for the future rig-based panorama work. That work
+will likely need to touch image generation/import, database identity, pycolmap
+rig options, matching, and reports. With the split, those changes can be made
+and reviewed in the module that owns the relevant concern.
+
+The refactor also keeps behavior stable:
+
+- The console script target can continue pointing at
+  `colmap.panorama_reconstruct:main`.
+- Existing imports from `colmap.panorama_reconstruct` still work.
+- The report schema was not intentionally changed.
+- Matching, mapping, feature, GPU, and reconstruction defaults were not
+  intentionally changed.
+
+## What Is Still Not Ideal
+
+This implementation is better, but it is not finished architecture.
+
+The most important remaining weaknesses are:
+
+- `pipeline.py` is still long. It is now long for a better reason: it contains
+  the actual orchestration sequence. But it still mixes stage timing, report
+  finalization, pycolmap calls, and workspace setup. Do not split it further
+  casually; if it is split, the next split should be around real pipeline stages
+  with tests, not just smaller files.
+- Tests still import most helpers through `colmap.panorama_reconstruct`. That
+  protects backwards compatibility, but it does not strongly document the new
+  module-level APIs. Future cleanup should migrate tests gradually to the owning
+  modules while keeping a smaller facade-compatibility test.
+- `types.py` contains `round_report_float` and `optional_report_float` because
+  `KeyframeAnchorScore.report()` uses them. That is pragmatic, but conceptually
+  these helpers are report formatting. A later cleanup could move score report
+  serialization out of the dataclass, or leave this as acceptable coupling.
+- `reports.py` builds large nested dictionaries directly. That preserves the
+  existing report schema, but it is still easy to accidentally change fields.
+  If report stability becomes important, add focused tests for required keys and
+  report-schema compatibility.
+- `database.py` returns loose dictionaries such as
+  `dict[int, dict[str, int | set[int]]]` for frame connection stats. That
+  preserves behavior, but a small dataclass could make scoring safer later.
+  Do not add that abstraction unless scoring changes require it.
+- `pycolmap_adapter.py` includes both pycolmap option/call wrappers and
+  `write_best_model`, which performs filesystem writes around pycolmap
+  reconstruction output. This is acceptable for now because it is still at the
+  COLMAP boundary, but it is not a pure adapter.
+- `pipeline.py` still performs a `json.dumps(report, indent=2)` before writing
+  the final report. This appears to be a validation step inherited from the
+  original implementation. It is harmless but awkward; if report writing is
+  cleaned up later, make that intent explicit or remove it with tests.
+
+## Verification Performed
+
+After the restructuring, the targeted panorama tests passed:
+
+```text
+python -m pytest tests/test_colmap_panorama_reconstruct.py
+38 passed
+```
+
+The full test suite also passed:
+
+```text
+python -m pytest
+111 passed
+```
+
+The old module execution path was checked:
+
+```text
+python -m colmap.panorama_reconstruct --help
+```
+
+The help output rendered successfully with the existing CLI options.
+
+## Practical Next Steps
+
+Recommended next cleanup order:
+
+1. Add or migrate tests to import from the owning modules directly, while keeping
+   one compatibility test for `colmap.panorama_reconstruct`.
+2. Add report-schema-focused tests before changing `reports.py`.
+3. Consider extracting explicit pipeline stage helpers only if a new feature
+   needs to modify one stage independently.
+4. Revisit `types.py` versus `reports.py` ownership for score report formatting
+   only if scoring/report serialization changes.
+5. Keep `panorama_reconstruct.py` as the facade until external callers and tests
+   have clearly moved to the new module paths.
