@@ -62,6 +62,8 @@ def create_feature_extraction_options(
     extraction_options.type = pycolmap_module.FeatureExtractorType.SIFT
     extraction_options.use_gpu = use_gpu
     extraction_options.gpu_index = gpu_index
+    extraction_options.max_image_size = options.max_image_size
+    extraction_options.num_threads = options.num_threads
     extraction_options.sift.max_num_features = options.max_num_features
     return extraction_options
 

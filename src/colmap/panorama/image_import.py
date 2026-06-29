@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 
@@ -57,7 +58,10 @@ def import_equirectangular_panorama_images(
     image_limit: int | None = None,
     fail_on_existing: bool = False,
     relative_name_prefix: Path | None = None,
+    import_workers: int = 1,
 ) -> tuple[list[Path], ColmapCamera, list[str]]:
+    if import_workers <= 0:
+        raise ValueError("import_workers must be positive")
     panorama_paths = panorama_image_paths(input_image_path)
     if image_limit is not None:
         panorama_paths = panorama_paths[:image_limit]
@@ -66,12 +70,8 @@ def import_equirectangular_panorama_images(
 
     first_width, first_height = image_resolution(panorama_paths[0])
     camera = camera_from_equirectangular(first_width, first_height)
-    image_names: list[str] = []
-    for panorama_path in tqdm(
-        panorama_paths,
-        desc="Importing equirectangular panoramas",
-        unit="image",
-    ):
+
+    def import_panorama(panorama_path: Path) -> str:
         width, height = image_resolution(panorama_path)
         if (width, height) != (first_width, first_height):
             raise ValueError(
@@ -91,7 +91,26 @@ def import_equirectangular_panorama_images(
             )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         hardlink_or_symlink_file(str(panorama_path), str(output_path))
-        image_names.append(relative_name.as_posix())
+        return relative_name.as_posix()
+
+    progress_options = {
+        "desc": "Importing equirectangular panoramas",
+        "unit": "image",
+        "total": len(panorama_paths),
+    }
+    if import_workers == 1:
+        image_names = [
+            import_panorama(panorama_path)
+            for panorama_path in tqdm(panorama_paths, **progress_options)
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=import_workers) as executor:
+            image_names = list(
+                tqdm(
+                    executor.map(import_panorama, panorama_paths),
+                    **progress_options,
+                ),
+            )
 
     return panorama_paths, camera, image_names
 

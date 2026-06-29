@@ -90,6 +90,36 @@ def test_native_equirectangular_import_keeps_original_images(tmp_path) -> None:
     assert os.path.samefile(nested_dir / "b.jpg", image_dir / "nested" / "b.jpg")
 
 
+def test_native_equirectangular_import_workers_preserve_sorted_order(tmp_path) -> None:
+    input_dir = tmp_path / "input"
+    image_dir = tmp_path / "workspace" / "images"
+    input_dir.mkdir()
+    for name, color in (
+        ("plain-b.png", (255, 0, 0)),
+        ("shelf-2000000000000_00000001.png", (0, 255, 0)),
+        ("shelf-1000000000000_00000002.png", (0, 0, 255)),
+        ("plain-a.png", (255, 255, 0)),
+    ):
+        Image.new("RGB", (16, 8), color=color).save(input_dir / name)
+
+    panorama_paths, camera, image_names = import_equirectangular_panorama_images(
+        input_dir,
+        image_dir,
+        import_workers=2,
+    )
+
+    assert [path.name for path in panorama_paths] == [
+        "shelf-1000000000000_00000002.png",
+        "shelf-2000000000000_00000001.png",
+        "plain-a.png",
+        "plain-b.png",
+    ]
+    assert camera.model == "EQUIRECTANGULAR"
+    assert image_names == [path.name for path in panorama_paths]
+    for image_name in image_names:
+        assert os.path.samefile(input_dir / image_name, image_dir / image_name)
+
+
 def test_native_equirectangular_import_symlinks_when_hardlink_fails(
     tmp_path,
     monkeypatch,
@@ -121,6 +151,35 @@ def test_native_equirectangular_import_rejects_mixed_sizes(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="expected 16x8"):
         import_equirectangular_panorama_images(input_dir, image_dir)
+
+
+def test_native_equirectangular_import_workers_reject_mixed_sizes(tmp_path) -> None:
+    input_dir = tmp_path / "input"
+    image_dir = tmp_path / "workspace" / "images"
+    input_dir.mkdir()
+    Image.new("RGB", (16, 8)).save(input_dir / "a.png")
+    Image.new("RGB", (32, 16)).save(input_dir / "b.png")
+
+    with pytest.raises(ValueError, match="expected 16x8"):
+        import_equirectangular_panorama_images(
+            input_dir,
+            image_dir,
+            import_workers=2,
+        )
+
+
+def test_native_equirectangular_import_rejects_invalid_worker_count(tmp_path) -> None:
+    input_dir = tmp_path / "input"
+    image_dir = tmp_path / "workspace" / "images"
+    input_dir.mkdir()
+    Image.new("RGB", (16, 8)).save(input_dir / "a.png")
+
+    with pytest.raises(ValueError, match="import_workers must be positive"):
+        import_equirectangular_panorama_images(
+            input_dir,
+            image_dir,
+            import_workers=0,
+        )
 
 
 def test_panorama_image_paths_sort_by_filename_timestamp(tmp_path) -> None:
@@ -279,6 +338,7 @@ def test_panorama_report_marks_native_equirectangular_camera(tmp_path) -> None:
             "expected_panorama_images": 2,
         },
         image_limit=None,
+        import_workers=1,
         generated_image_batch=batch,
         reconstructions={0: FakeReconstructionStats()},
         best_model_id=0,
@@ -291,6 +351,9 @@ def test_panorama_report_marks_native_equirectangular_camera(tmp_path) -> None:
     assert report["camera"]["params"] == [16.0, 8.0]
     assert report["metadata_path"].endswith("panorama_equirectangular_config.json")
     assert report["options"]["camera_mode"] == "SINGLE"
+    assert report["options"]["max_image_size"] == -1
+    assert report["options"]["num_threads"] == -1
+    assert report["options"]["import_workers"] == 1
     assert report["options"]["rig_verification"] is False
     assert report["generated_image_count"] == 2
     assert "virtual_camera_count" not in report
@@ -383,6 +446,8 @@ def test_sift_feature_options_disable_rig_matching_constraints() -> None:
     pycolmap = pytest.importorskip("pycolmap")
     options = FeaturePipelineOptions(
         max_num_features=4096,
+        max_image_size=2048,
+        num_threads=4,
         guided_matching=True,
     )
 
@@ -391,6 +456,8 @@ def test_sift_feature_options_disable_rig_matching_constraints() -> None:
 
     assert extraction.type == pycolmap.FeatureExtractorType.SIFT
     assert extraction.sift.max_num_features == 4096
+    assert extraction.max_image_size == 2048
+    assert extraction.num_threads == 4
     assert matching.type == pycolmap.FeatureMatcherType.SIFT_BRUTEFORCE
     assert matching.guided_matching is True
     assert matching.rig_verification is False
@@ -643,12 +710,68 @@ def test_parse_args_accepts_image_limit(tmp_path) -> None:
     assert args.loop_detection is True
     assert args.feature_extractor == "sift"
     assert args.feature_matcher == "sift-bruteforce"
+    assert args.max_image_size == -1
+    assert args.num_threads == -1
+    assert args.import_workers == 1
     assert args.device == "auto"
     assert args.gpu_index == "-1"
     assert args.gpu_bundle_adjustment is True
     assert not hasattr(args, "initial_session")
     assert not hasattr(args, "match_scope")
     assert not hasattr(args, "virtual_image_format")
+
+
+def test_parse_args_accepts_feature_extraction_tuning_options(tmp_path) -> None:
+    args = parse_args(
+        [
+            "--input-image-path",
+            str(tmp_path),
+            "--max-image-size",
+            "2048",
+            "--num-threads",
+            "4",
+        ]
+    )
+
+    assert args.max_image_size == 2048
+    assert args.num_threads == 4
+
+
+def test_parse_args_accepts_import_workers(tmp_path) -> None:
+    args = parse_args(
+        [
+            "--input-image-path",
+            str(tmp_path),
+            "--import-workers",
+            "4",
+        ]
+    )
+
+    assert args.import_workers == 4
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--max-image-size", "-2"),
+        ("--max-image-size", "0"),
+        ("--num-threads", "-2"),
+        ("--num-threads", "0"),
+    ],
+)
+def test_parse_args_rejects_invalid_feature_extraction_tuning_options(
+    tmp_path,
+    option,
+    value,
+) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(["--input-image-path", str(tmp_path), option, value])
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_parse_args_rejects_invalid_import_workers(tmp_path, value) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(["--input-image-path", str(tmp_path), "--import-workers", value])
 
 
 @pytest.mark.parametrize(

@@ -19,6 +19,8 @@ class FeaturePipelineOptions:
     extractor: str = "sift"
     matcher: str = "sift-bruteforce"
     max_num_features: int = 8192
+    max_image_size: int = -1
+    num_threads: int = -1
     guided_matching: bool = False
 
 

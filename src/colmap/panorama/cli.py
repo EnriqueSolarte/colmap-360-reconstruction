@@ -99,6 +99,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Maximum SIFT features per panorama image.",
     )
     parser.add_argument(
+        "--max-image-size",
+        type=int,
+        default=-1,
+        help=(
+            "Maximum image size before feature extraction. Use -1 for "
+            "COLMAP's automatic setting."
+        ),
+    )
+    parser.add_argument(
+        "--num-threads",
+        type=int,
+        default=-1,
+        help=(
+            "Number of threads for feature extraction. Use -1 for COLMAP's "
+            "automatic setting."
+        ),
+    )
+    parser.add_argument(
         "--guided-matching",
         action="store_true",
         help="Enable guided feature matching after geometric verification.",
@@ -134,6 +152,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Use only the first N sorted panoramas for smoke testing.",
     )
     parser.add_argument(
+        "--import-workers",
+        type=int,
+        default=1,
+        help="Number of worker threads for importing panorama images.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Delete and rebuild the equirectangular workspace.",
@@ -143,8 +167,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--input-image-path must be an existing directory: {args.input_image_path}")
     if args.image_limit is not None and args.image_limit <= 0:
         parser.error("--image-limit must be positive")
+    if args.import_workers <= 0:
+        parser.error("--import-workers must be positive")
     if args.max_num_features <= 0:
         parser.error("--max-num-features must be positive")
+    if args.max_image_size < -1 or args.max_image_size == 0:
+        parser.error("--max-image-size must be -1 or positive")
+    if args.num_threads < -1 or args.num_threads == 0:
+        parser.error("--num-threads must be -1 or positive")
     if args.vocab_tree_path is not None and not args.vocab_tree_path.is_file():
         parser.error(f"--vocab-tree-path does not exist: {args.vocab_tree_path}")
     if args.ssl_cert_file is not None and not args.ssl_cert_file.is_file():
@@ -166,6 +196,8 @@ def main(argv: list[str] | None = None) -> int:
             extractor=args.feature_extractor,
             matcher=args.feature_matcher,
             max_num_features=args.max_num_features,
+            max_image_size=args.max_image_size,
+            num_threads=args.num_threads,
             guided_matching=args.guided_matching,
         ),
         execution_options=PipelineExecutionOptions(
@@ -174,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
             gpu_bundle_adjustment=args.gpu_bundle_adjustment,
         ),
         image_limit=args.image_limit,
+        import_workers=args.import_workers,
         overwrite=args.overwrite,
     )
     print(f"workspace: {report['workspace']}")

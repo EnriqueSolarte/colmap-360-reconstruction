@@ -59,6 +59,7 @@ def run_panorama_reconstruction(
     feature_options: FeaturePipelineOptions = FeaturePipelineOptions(),
     execution_options: PipelineExecutionOptions = PipelineExecutionOptions(),
     image_limit: int | None = None,
+    import_workers: int = 1,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
@@ -83,6 +84,7 @@ def run_panorama_reconstruction(
         input_image_path=input_image_path,
         output_image_dir=paths["image_dir"],
         image_limit=image_limit,
+        import_workers=import_workers,
     )
     write_equirectangular_metadata(
         paths["metadata"],
@@ -215,6 +217,7 @@ def run_panorama_reconstruction(
         feature_report=feature_report,
         feature_health=feature_health,
         image_limit=image_limit,
+        import_workers=import_workers,
         generated_image_batch=generated_image_batch,
         reconstructions=reconstructions,
         best_model_id=best_model_id,
