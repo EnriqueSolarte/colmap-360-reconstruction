@@ -1,6 +1,8 @@
-# Native Equirectangular Pipeline Summary
-
 Date: 2026-06-29
+Project version: v0.1.0
+Description: Summarizes the completed native equirectangular COLMAP pipeline rewrite.
+
+# Native Equirectangular Pipeline Summary
 
 ## Goal
 

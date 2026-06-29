@@ -34,6 +34,13 @@ FILENAME_TIMESTAMP_PATTERN = re.compile(r"(?<!\d)(\d{10,})(?!\d)")
 NATIVE_CAMERA_SETUP = "native_equirectangular"
 
 
+class PanoramaArgumentDefaultsHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
+    def _get_help_string(self, action: argparse.Action) -> str | None:
+        if action.required and action.default is None:
+            return action.help
+        return super()._get_help_string(action)
+
+
 @dataclass(frozen=True)
 class FeaturePipelineOptions:
     extractor: str = "sift"
@@ -1185,7 +1192,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         description=(
             "Run COLMAP reconstruction directly from equirectangular panorama "
             "images using COLMAP's native EQUIRECTANGULAR camera model."
-        )
+        ),
+        formatter_class=PanoramaArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "-i",
@@ -1199,7 +1207,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--workspace",
         type=Path,
         default=DEFAULT_WORKSPACE,
-        help=f"COLMAP equirectangular workspace (default: {DEFAULT_WORKSPACE})",
+        help="COLMAP equirectangular workspace.",
     )
     parser.add_argument(
         "--matcher",
@@ -1272,7 +1280,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="-1",
         help=(
             "CUDA GPU index, or comma-separated indices for multi-GPU feature "
-            "extraction and matching (default: -1, all GPUs)."
+            "extraction and matching. Use -1 for all GPUs."
         ),
     )
     parser.add_argument(
