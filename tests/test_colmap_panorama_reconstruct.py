@@ -103,7 +103,7 @@ def test_native_equirectangular_import_symlinks_when_hardlink_fails(
     def raise_cross_device_link(_source, _destination):
         raise OSError("cross-device link")
 
-    monkeypatch.setattr("colmap.panorama_reconstruct.os.link", raise_cross_device_link)
+    monkeypatch.setattr("colmap.panorama.image_import.os.link", raise_cross_device_link)
 
     import_equirectangular_panorama_images(input_dir, image_dir)
 
