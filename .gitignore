@@ -31,6 +31,7 @@ ENV/
 .idea/
 *.code-workspace
 # .agent-workspace
+.archived/
 .DS_Store
 Thumbs.db
 

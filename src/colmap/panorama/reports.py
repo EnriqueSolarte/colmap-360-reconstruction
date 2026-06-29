@@ -144,6 +144,93 @@ def build_panorama_import_report(
     }
 
 
+def build_panorama_feature_report(
+    *,
+    pycolmap_version: str,
+    input_image_path: Path,
+    paths: dict[str, Path],
+    camera: ColmapCamera,
+    panorama_count: int,
+    feature_options: FeaturePipelineOptions,
+    execution: dict[str, Any],
+    feature_report: dict[str, dict[str, float | int]],
+    feature_health: dict[str, Any],
+    image_limit: int | None,
+    import_workers: int,
+    feature_workers: int,
+    feature_batch_size: int | None,
+    feature_shard_result: Any | None,
+    generated_image_batch: GeneratedImageBatch,
+) -> dict[str, Any]:
+    database_report = read_database_stats(paths["database"])
+    feature_extraction_mode = (
+        "sharded_database" if feature_shard_result is not None else "single_database"
+    )
+    return {
+        "status": f"{NATIVE_CAMERA_SETUP}_features_only",
+        "camera_setup": NATIVE_CAMERA_SETUP,
+        "pycolmap_version": pycolmap_version,
+        "input_image_path": str(input_image_path),
+        "workspace": str(paths["workspace"]),
+        "image_dir": str(paths["image_dir"]),
+        "database_path": str(paths["database"]),
+        "metadata_path": str(paths["metadata"]),
+        "report_path": str(paths["feature_report"]),
+        "camera": camera.report(),
+        "options": {
+            "feature_extractor": feature_options.extractor,
+            "feature_matcher": feature_options.matcher,
+            "max_num_features": feature_options.max_num_features,
+            "max_image_size": feature_options.max_image_size,
+            "num_threads": feature_options.num_threads,
+            "guided_matching": feature_options.guided_matching,
+            "image_limit": image_limit,
+            "import_workers": import_workers,
+            "feature_workers": feature_workers,
+            "feature_batch_size": feature_batch_size,
+            "feature_extraction_mode": feature_extraction_mode,
+            "requested_device": execution["requested_device"],
+            "resolved_device": execution["resolved_device"],
+            "cuda_available": execution["cuda_available"],
+            "gpu_index": execution["gpu_index"],
+            "camera_mode": "SINGLE",
+        },
+        "panorama_count": panorama_count,
+        "generated_image_count": panorama_count,
+        "database_image_count": database_report["images"],
+        "new_database_image_count": len(generated_image_batch.names),
+        "new_database_image_ids": generated_image_batch.image_ids,
+        "new_database_camera_ids": generated_image_batch.camera_ids,
+        "new_database_image_names": list(generated_image_batch.names),
+        "database": database_report,
+        "features_by_camera": feature_report,
+        "feature_health": feature_health,
+        "feature_shards": feature_shard_report(feature_shard_result),
+        "skipped_stages": [
+            "matching",
+            "incremental_mapping",
+            "best_model_write",
+            "keyframe_scoring",
+        ],
+    }
+
+
+def feature_shard_report(feature_shard_result: Any | None) -> dict[str, Any] | None:
+    if feature_shard_result is None:
+        return None
+    return {
+        "batch_count": len(feature_shard_result.batches),
+        "batches": [list(batch) for batch in feature_shard_result.batches],
+        "shard_database_paths": [
+            str(path) for path in feature_shard_result.shard_database_paths
+        ],
+        "merged_database_path": str(feature_shard_result.merged_database_path),
+        "shard_elapsed_seconds": list(feature_shard_result.shard_elapsed_seconds),
+        "merge_elapsed_seconds": feature_shard_result.merge_elapsed_seconds,
+        "camera_policy": "multiple_identical_equirectangular_cameras_are_expected",
+    }
+
+
 def build_panorama_report(
     *,
     pycolmap_version: str,
@@ -162,6 +249,9 @@ def build_panorama_report(
     feature_health: dict[str, Any],
     image_limit: int | None,
     import_workers: int,
+    feature_workers: int,
+    feature_batch_size: int | None,
+    feature_shard_result: Any | None,
     generated_image_batch: GeneratedImageBatch,
     reconstructions: dict[int, Any],
     best_model_id: int,
@@ -173,6 +263,9 @@ def build_panorama_report(
         str(model_id): reconstruction_stats(reconstruction)
         for model_id, reconstruction in sorted(reconstructions.items())
     }
+    feature_extraction_mode = (
+        "sharded_database" if feature_shard_result is not None else "single_database"
+    )
     return {
         "status": f"raw_colmap_{NATIVE_CAMERA_SETUP}_unscaled",
         "warning": (
@@ -213,6 +306,9 @@ def build_panorama_report(
             "render_backend": "source_equirectangular_images",
             "image_limit": image_limit,
             "import_workers": import_workers,
+            "feature_workers": feature_workers,
+            "feature_batch_size": feature_batch_size,
+            "feature_extraction_mode": feature_extraction_mode,
             "requested_device": execution["requested_device"],
             "resolved_device": execution["resolved_device"],
             "cuda_available": execution["cuda_available"],
@@ -239,6 +335,7 @@ def build_panorama_report(
         "database": database_report,
         "features_by_camera": feature_report,
         "feature_health": feature_health,
+        "feature_shards": feature_shard_report(feature_shard_result),
         "model_count": len(reconstructions),
         "best_model_id": best_model_id,
         "models": model_stats,

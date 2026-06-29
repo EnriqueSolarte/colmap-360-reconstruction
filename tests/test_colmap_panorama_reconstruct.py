@@ -7,11 +7,15 @@ import pytest
 from PIL import Image
 
 from colmap.camera import camera_from_equirectangular
+from colmap.panorama import cli_features as panorama_cli_features
+from colmap.panorama import feature_pipeline as panorama_feature_pipeline
 from colmap.panorama import pipeline as panorama_pipeline
 from colmap.panorama_reconstruct import (
+    build_panorama_feature_report,
     build_panorama_import_report,
     COLMAP_IMAGE_PAIR_ID_PRIME,
     FeaturePipelineOptions,
+    FeatureShardExtractionResult,
     GeneratedImageBatch,
     NATIVE_CAMERA_SETUP,
     PipelineExecutionOptions,
@@ -21,25 +25,32 @@ from colmap.panorama_reconstruct import (
     create_feature_matching_options,
     create_mapper_options,
     equirectangular_feature_health_summary,
+    extract_panorama_features_to_database,
+    extract_panorama_features_to_sharded_database,
     format_elapsed_seconds,
     format_elapsed_seconds_by_stage,
     import_equirectangular_panorama_images,
     match_features,
+    merge_feature_shard_databases,
     panorama_image_paths,
     parse_args,
     read_feature_stats_by_database_camera,
     read_generated_image_batch,
     read_image_records_by_name,
     run_incremental_mapping,
+    run_panorama_feature_extraction,
     run_panorama_reconstruction,
     run_panorama_image_import,
     resolve_pipeline_execution,
     score_keyframe_anchors,
+    split_image_names_into_batches,
     write_equirectangular_metadata,
     write_image_pair_list,
 )
 from colmap.panorama.cli_import import main as import_main
 from colmap.panorama.cli_import import parse_import_args
+from colmap.panorama.cli_features import main as feature_main
+from colmap.panorama.cli_features import parse_feature_args
 
 
 class FakeReconstructionStats:
@@ -377,7 +388,7 @@ def test_run_panorama_reconstruction_uses_shared_import_pipeline(
         fake_import_panorama_images_to_workspace,
     )
     monkeypatch.setattr(
-        panorama_pipeline,
+        panorama_feature_pipeline,
         "create_feature_extraction_options",
         lambda *_args, **_kwargs: object(),
     )
@@ -450,6 +461,552 @@ def test_run_panorama_reconstruction_uses_shared_import_pipeline(
     assert import_calls[0]["image_limit"] is None
     assert import_calls[0]["import_workers"] == 3
     assert len(extract_calls) == 1
+
+
+def test_run_panorama_reconstruction_uses_sharded_feature_extraction_when_requested(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    input_dir = tmp_path / "input"
+    workspace = tmp_path / "workspace"
+    input_dir.mkdir()
+    sharded_calls = []
+    report_calls = []
+
+    class FakePycolmap:
+        __version__ = "fake"
+
+        @staticmethod
+        def set_random_seed(_seed):
+            return None
+
+    def fake_import_panorama_images_to_workspace(**_kwargs):
+        return (
+            [input_dir / "a.png", input_dir / "b.png", input_dir / "c.png"],
+            camera_from_equirectangular(16, 8),
+            ["a.png", "b.png", "c.png"],
+        )
+
+    def fake_extract_panorama_features_to_sharded_database(*_args, **kwargs):
+        sharded_calls.append(kwargs)
+        return FeatureShardExtractionResult(
+            batches=(("a.png", "b.png"), ("c.png",)),
+            shard_database_paths=(
+                workspace / "feature_shards" / "features_0000.db",
+                workspace / "feature_shards" / "features_0001.db",
+            ),
+            merged_database_path=workspace / "database.db",
+            shard_elapsed_seconds=(1.0, 1.5),
+            merge_elapsed_seconds=0.25,
+        )
+
+    def fake_build_panorama_report(**kwargs):
+        report_calls.append(kwargs)
+        shard_result = kwargs["feature_shard_result"]
+        return {
+            "workspace": str(workspace),
+            "camera_setup": NATIVE_CAMERA_SETUP,
+            "camera": {"model": "EQUIRECTANGULAR"},
+            "panorama_count": 3,
+            "options": {
+                "feature_workers": kwargs["feature_workers"],
+                "feature_batch_size": kwargs["feature_batch_size"],
+                "feature_extraction_mode": "sharded_database",
+            },
+            "feature_shards": {
+                "batch_count": len(shard_result.batches),
+                "camera_policy": (
+                    "multiple_identical_equirectangular_cameras_are_expected"
+                ),
+            },
+            "feature_health": {
+                "panorama_images_with_features": 3,
+                "expected_panorama_images": 3,
+            },
+            "best_sparse_path": str(workspace / "sparse_best"),
+            "best_model": {"num_registered_images": 3, "num_points3D": 0},
+        }
+
+    monkeypatch.setattr(panorama_pipeline, "require_pycolmap", lambda: FakePycolmap)
+    monkeypatch.setattr(panorama_pipeline, "configure_ssl_cert_file", lambda _path: None)
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "resolve_pipeline_execution",
+        lambda _pycolmap, _options: {
+            "requested_device": "auto",
+            "resolved_device": "cpu",
+            "device": "cpu",
+            "cuda_available": False,
+            "gpu_index": "-1",
+            "gpu_bundle_adjustment": False,
+            "bundle_adjustment_gpu_index": "-1",
+        },
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "import_panorama_images_to_workspace",
+        fake_import_panorama_images_to_workspace,
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "extract_panorama_features_to_database",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError),
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "extract_panorama_features_to_sharded_database",
+        fake_extract_panorama_features_to_sharded_database,
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "read_generated_image_batch",
+        lambda _database, image_names: GeneratedImageBatch(
+            names=tuple(image_names),
+            records_by_name={
+                "a.png": (1, 1),
+                "b.png": (2, 1),
+                "c.png": (3, 2),
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "read_feature_stats_by_database_camera",
+        lambda _database: {
+            "camera_1": {"image_count": 2, "total_features": 20},
+            "camera_2": {"image_count": 1, "total_features": 10},
+        },
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "equirectangular_feature_health_summary",
+        lambda _report, expected_image_count: {
+            "expected_panorama_images": expected_image_count,
+            "panorama_images_with_features": expected_image_count,
+            "camera_count": 2,
+        },
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "create_feature_matching_options",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(panorama_pipeline, "match_features", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "create_mapper_options",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "run_incremental_mapping",
+        lambda *_args, **_kwargs: {0: FakeReconstructionStats()},
+    )
+    monkeypatch.setattr(panorama_pipeline, "write_best_model", lambda *_args: None)
+    monkeypatch.setattr(panorama_pipeline, "score_keyframe_anchors", lambda *_args: [])
+    monkeypatch.setattr(panorama_pipeline, "build_panorama_report", fake_build_panorama_report)
+
+    report = run_panorama_reconstruction(
+        input_dir,
+        workspace,
+        feature_workers=2,
+        feature_batch_size=2,
+    )
+
+    assert len(sharded_calls) == 1
+    assert sharded_calls[0]["database_path"] == workspace / "database.db"
+    assert sharded_calls[0]["shard_dir"] == workspace / "feature_shards"
+    assert sharded_calls[0]["image_names"] == ["a.png", "b.png", "c.png"]
+    assert sharded_calls[0]["batch_size"] == 2
+    assert sharded_calls[0]["feature_workers"] == 2
+    assert report_calls[0]["feature_workers"] == 2
+    assert report_calls[0]["feature_batch_size"] == 2
+    assert report_calls[0]["feature_shard_result"].merge_elapsed_seconds == 0.25
+    assert report["options"]["feature_extraction_mode"] == "sharded_database"
+    assert report["feature_shards"]["camera_policy"].startswith("multiple_identical")
+
+
+def test_extract_panorama_features_to_database_passes_optional_image_names(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    calls = []
+
+    class FakePycolmap:
+        class CameraMode:
+            SINGLE = "single"
+
+        class ImageReaderOptions:
+            def __init__(self):
+                self.camera_model = None
+                self.camera_params = None
+
+        @staticmethod
+        def extract_features(*args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        panorama_feature_pipeline,
+        "create_feature_extraction_options",
+        lambda *_args, **_kwargs: "options",
+    )
+
+    extract_panorama_features_to_database(
+        FakePycolmap,
+        database_path=tmp_path / "database.db",
+        image_dir=tmp_path / "images",
+        camera=camera_from_equirectangular(16, 8),
+        feature_options=FeaturePipelineOptions(),
+        execution={"resolved_device": "cpu", "gpu_index": "-1", "device": "cpu"},
+        image_names=["a.png"],
+    )
+
+    args, kwargs = calls[0]
+    assert args[0] == tmp_path / "database.db"
+    assert args[1] == tmp_path / "images"
+    assert kwargs["reader_options"].camera_model == "EQUIRECTANGULAR"
+    assert kwargs["reader_options"].camera_params == "16,8"
+    assert kwargs["camera_mode"] == "single"
+    assert kwargs["extraction_options"] == "options"
+    assert kwargs["device"] == "cpu"
+    assert kwargs["image_names"] == ["a.png"]
+
+
+def test_split_image_names_into_batches_preserves_order() -> None:
+    assert split_image_names_into_batches(
+        ["a.png", "b.png", "c.png", "d.png", "e.png"],
+        batch_size=2,
+    ) == (("a.png", "b.png"), ("c.png", "d.png"), ("e.png",))
+
+    with pytest.raises(ValueError, match="batch_size"):
+        split_image_names_into_batches(["a.png"], batch_size=0)
+
+
+def test_merge_feature_shard_databases_merges_iteratively(tmp_path) -> None:
+    shard_paths = [
+        tmp_path / "shard_0.db",
+        tmp_path / "shard_1.db",
+        tmp_path / "shard_2.db",
+    ]
+    for index, shard_path in enumerate(shard_paths):
+        shard_path.write_text(f"shard {index}", encoding="utf-8")
+    merged_database_path = tmp_path / "database.db"
+    merge_calls = []
+
+    class FakeDatabaseHandle:
+        def __init__(self, path):
+            self.path = Path(path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    class FakeDatabase:
+        @staticmethod
+        def open(path):
+            return FakeDatabaseHandle(path)
+
+        @staticmethod
+        def merge(first_database, second_database, merged_database):
+            merge_calls.append(
+                (
+                    first_database.path,
+                    second_database.path,
+                    merged_database.path,
+                )
+            )
+            merged_database.path.write_text(
+                f"{first_database.path.name}+{second_database.path.name}",
+                encoding="utf-8",
+            )
+
+    class FakePycolmap:
+        Database = FakeDatabase
+
+    merge_feature_shard_databases(
+        FakePycolmap,
+        shard_database_paths=shard_paths,
+        merged_database_path=merged_database_path,
+    )
+
+    assert merged_database_path.is_file()
+    assert len(merge_calls) == 2
+    assert merge_calls[0][0] == shard_paths[0]
+    assert merge_calls[0][1] == shard_paths[1]
+    assert merge_calls[1][0].name == "merged_0000.db"
+    assert merge_calls[1][1] == shard_paths[2]
+
+
+def test_extract_panorama_features_to_sharded_database_extracts_batches_and_merges(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    extract_calls = []
+    merge_calls = []
+
+    def fake_extract_panorama_features_to_database(*_args, **kwargs):
+        extract_calls.append(kwargs)
+        kwargs["database_path"].write_text("shard", encoding="utf-8")
+
+    def fake_merge_feature_shard_databases(*_args, **kwargs):
+        merge_calls.append(kwargs)
+        kwargs["merged_database_path"].write_text("merged", encoding="utf-8")
+
+    monkeypatch.setattr(
+        panorama_feature_pipeline,
+        "extract_panorama_features_to_database",
+        fake_extract_panorama_features_to_database,
+    )
+    monkeypatch.setattr(
+        panorama_feature_pipeline,
+        "merge_feature_shard_databases",
+        fake_merge_feature_shard_databases,
+    )
+
+    result = extract_panorama_features_to_sharded_database(
+        object(),
+        database_path=tmp_path / "database.db",
+        image_dir=tmp_path / "images",
+        shard_dir=tmp_path / "feature_shards",
+        camera=camera_from_equirectangular(16, 8),
+        feature_options=FeaturePipelineOptions(),
+        execution={"resolved_device": "cpu", "gpu_index": "-1", "device": "cpu"},
+        image_names=["a.png", "b.png", "c.png"],
+        batch_size=2,
+    )
+
+    assert isinstance(result, FeatureShardExtractionResult)
+    assert result.batches == (("a.png", "b.png"), ("c.png",))
+    assert result.shard_database_paths == (
+        tmp_path / "feature_shards" / "features_0000.db",
+        tmp_path / "feature_shards" / "features_0001.db",
+    )
+    assert result.merged_database_path == tmp_path / "database.db"
+    assert [call["image_names"] for call in extract_calls] == [
+        ("a.png", "b.png"),
+        ("c.png",),
+    ]
+    assert merge_calls[0]["shard_database_paths"] == list(result.shard_database_paths)
+    assert merge_calls[0]["merged_database_path"] == result.merged_database_path
+
+
+def test_sharded_feature_database_result_can_be_passed_to_matching(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    def fake_extract_panorama_features_to_database(*_args, **kwargs):
+        kwargs["database_path"].write_text("shard", encoding="utf-8")
+
+    def fake_merge_feature_shard_databases(*_args, **kwargs):
+        kwargs["merged_database_path"].write_text("merged", encoding="utf-8")
+
+    monkeypatch.setattr(
+        panorama_feature_pipeline,
+        "extract_panorama_features_to_database",
+        fake_extract_panorama_features_to_database,
+    )
+    monkeypatch.setattr(
+        panorama_feature_pipeline,
+        "merge_feature_shard_databases",
+        fake_merge_feature_shard_databases,
+    )
+    match_calls = []
+
+    class FakePycolmap:
+        @staticmethod
+        def match_exhaustive(database_path, **kwargs):
+            match_calls.append((database_path, kwargs))
+
+    result = extract_panorama_features_to_sharded_database(
+        FakePycolmap,
+        database_path=tmp_path / "database.db",
+        image_dir=tmp_path / "images",
+        shard_dir=tmp_path / "feature_shards",
+        camera=camera_from_equirectangular(16, 8),
+        feature_options=FeaturePipelineOptions(),
+        execution={"resolved_device": "cpu", "gpu_index": "-1", "device": "cpu"},
+        image_names=["a.png", "b.png"],
+        batch_size=1,
+    )
+    match_features(
+        FakePycolmap,
+        result.merged_database_path,
+        matcher="exhaustive",
+        matching_options=object(),
+        overlap=15,
+        loop_detection=True,
+        vocab_tree_path=None,
+        device="cpu",
+    )
+
+    assert match_calls[0][0] == tmp_path / "database.db"
+    assert (tmp_path / "database.db").read_text(encoding="utf-8") == "merged"
+
+
+def test_run_panorama_feature_extraction_writes_feature_report_without_mapping(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    input_dir = tmp_path / "input"
+    workspace = tmp_path / "workspace"
+    input_dir.mkdir()
+    Image.new("RGB", (16, 8), color=(255, 0, 0)).save(input_dir / "a.png")
+
+    class FakePycolmap:
+        __version__ = "fake"
+        has_cuda = False
+
+        class Device:
+            cpu = "cpu"
+            cuda = "cuda"
+
+        class CameraMode:
+            SINGLE = "single"
+
+        class ImageReaderOptions:
+            def __init__(self):
+                self.camera_model = None
+                self.camera_params = None
+
+        @staticmethod
+        def set_random_seed(_seed):
+            return None
+
+        @staticmethod
+        def extract_features(database_path, _image_dir, **_kwargs):
+            with sqlite3.connect(database_path) as connection:
+                connection.execute("CREATE TABLE cameras(camera_id INTEGER PRIMARY KEY)")
+                connection.execute(
+                    "CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+                )
+                connection.execute(
+                    "CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER)"
+                )
+                connection.execute(
+                    "CREATE TABLE descriptors(image_id INTEGER PRIMARY KEY, rows INTEGER)"
+                )
+                connection.execute("INSERT INTO cameras(camera_id) VALUES (1)")
+                connection.execute(
+                    "INSERT INTO images(image_id, name, camera_id) VALUES (1, 'a.png', 1)"
+                )
+                connection.execute(
+                    "INSERT INTO keypoints(image_id, rows) VALUES (1, 12)"
+                )
+                connection.execute(
+                    "INSERT INTO descriptors(image_id, rows) VALUES (1, 12)"
+                )
+
+    monkeypatch.setattr(
+        panorama_feature_pipeline,
+        "require_pycolmap",
+        lambda: FakePycolmap,
+    )
+    monkeypatch.setattr(
+        panorama_feature_pipeline,
+        "configure_ssl_cert_file",
+        lambda _path: None,
+    )
+    monkeypatch.setattr(
+        panorama_feature_pipeline,
+        "create_feature_extraction_options",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    report = run_panorama_feature_extraction(
+        input_dir,
+        workspace,
+        import_workers=2,
+    )
+
+    stored_report = json.loads(
+        (workspace / "panorama_equirectangular_feature_report.json").read_text(
+            encoding="utf-8",
+        )
+    )
+    assert report["status"] == f"{NATIVE_CAMERA_SETUP}_features_only"
+    assert report["database"]["images"] == 1
+    assert report["feature_health"]["panorama_images_with_features"] == 1
+    assert stored_report["new_database_image_names"] == ["a.png"]
+    assert "matching" in stored_report["skipped_stages"]
+    assert (workspace / "database.db").is_file()
+    assert (workspace / "panorama_equirectangular_config.json").is_file()
+    assert not (workspace / "sparse").exists()
+    assert not (workspace / "sparse_best").exists()
+
+
+def test_run_panorama_feature_extraction_can_reuse_import_workspace(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    input_dir = tmp_path / "input"
+    workspace = tmp_path / "workspace"
+    input_dir.mkdir()
+    Image.new("RGB", (16, 8), color=(255, 0, 0)).save(input_dir / "a.png")
+    run_panorama_image_import(input_dir, workspace)
+
+    class FakePycolmap:
+        __version__ = "fake"
+        has_cuda = False
+
+        class Device:
+            cpu = "cpu"
+            cuda = "cuda"
+
+        class CameraMode:
+            SINGLE = "single"
+
+        class ImageReaderOptions:
+            pass
+
+        @staticmethod
+        def set_random_seed(_seed):
+            return None
+
+        @staticmethod
+        def extract_features(database_path, _image_dir, **_kwargs):
+            with sqlite3.connect(database_path) as connection:
+                connection.execute("CREATE TABLE cameras(camera_id INTEGER PRIMARY KEY)")
+                connection.execute(
+                    "CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+                )
+                connection.execute(
+                    "CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER)"
+                )
+                connection.execute(
+                    "CREATE TABLE descriptors(image_id INTEGER PRIMARY KEY, rows INTEGER)"
+                )
+                connection.execute("INSERT INTO cameras(camera_id) VALUES (1)")
+                connection.execute(
+                    "INSERT INTO images(image_id, name, camera_id) VALUES (1, 'a.png', 1)"
+                )
+                connection.execute(
+                    "INSERT INTO keypoints(image_id, rows) VALUES (1, 12)"
+                )
+                connection.execute(
+                    "INSERT INTO descriptors(image_id, rows) VALUES (1, 12)"
+                )
+
+    monkeypatch.setattr(
+        panorama_feature_pipeline,
+        "require_pycolmap",
+        lambda: FakePycolmap,
+    )
+    monkeypatch.setattr(
+        panorama_feature_pipeline,
+        "configure_ssl_cert_file",
+        lambda _path: None,
+    )
+    monkeypatch.setattr(
+        panorama_feature_pipeline,
+        "create_feature_extraction_options",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    report = run_panorama_feature_extraction(input_dir, workspace)
+
+    assert report["database_image_count"] == 1
 
 
 def test_generated_image_batch_preserves_database_identity(tmp_path) -> None:
@@ -566,6 +1123,9 @@ def test_panorama_report_marks_native_equirectangular_camera(tmp_path) -> None:
         },
         image_limit=None,
         import_workers=1,
+        feature_workers=1,
+        feature_batch_size=None,
+        feature_shard_result=None,
         generated_image_batch=batch,
         reconstructions={0: FakeReconstructionStats()},
         best_model_id=0,
@@ -581,10 +1141,98 @@ def test_panorama_report_marks_native_equirectangular_camera(tmp_path) -> None:
     assert report["options"]["max_image_size"] == -1
     assert report["options"]["num_threads"] == -1
     assert report["options"]["import_workers"] == 1
+    assert report["options"]["feature_workers"] == 1
+    assert report["options"]["feature_batch_size"] is None
+    assert report["options"]["feature_extraction_mode"] == "single_database"
+    assert report["feature_shards"] is None
     assert report["options"]["rig_verification"] is False
     assert report["generated_image_count"] == 2
     assert "virtual_camera_count" not in report
     assert "features_by_virtual_camera" not in report
+
+
+def test_panorama_report_records_sharded_feature_camera_policy(tmp_path) -> None:
+    database_path = tmp_path / "database.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
+            [(1, "a.png", 1), (2, "b.png", 2)],
+        )
+    paths = {
+        "workspace": tmp_path,
+        "image_dir": tmp_path / "images",
+        "database": database_path,
+        "sparse": tmp_path / "sparse",
+        "best_sparse": tmp_path / "sparse_best",
+        "raw_ply": tmp_path / "cloud_colmap_raw.ply",
+        "metadata": tmp_path / "panorama_equirectangular_config.json",
+    }
+    batch = GeneratedImageBatch(
+        names=("a.png", "b.png"),
+        records_by_name={"a.png": (1, 1), "b.png": (2, 2)},
+    )
+    shard_result = FeatureShardExtractionResult(
+        batches=(("a.png",), ("b.png",)),
+        shard_database_paths=(tmp_path / "shard_0.db", tmp_path / "shard_1.db"),
+        merged_database_path=database_path,
+        shard_elapsed_seconds=(1.0, 1.5),
+        merge_elapsed_seconds=0.25,
+    )
+
+    report = build_panorama_report(
+        pycolmap_version="test",
+        input_image_path=tmp_path / "input",
+        paths=paths,
+        camera=camera_from_equirectangular(16, 8),
+        panorama_count=2,
+        matcher="sequential",
+        overlap=15,
+        loop_detection=True,
+        vocab_tree_path=None,
+        ssl_cert_file=None,
+        feature_options=FeaturePipelineOptions(),
+        execution={
+            "requested_device": "auto",
+            "resolved_device": "cpu",
+            "cuda_available": False,
+            "gpu_index": "-1",
+            "gpu_bundle_adjustment": False,
+            "bundle_adjustment_gpu_index": "-1",
+        },
+        feature_report={
+            "camera_1": {"image_count": 1, "total_features": 10},
+            "camera_2": {"image_count": 1, "total_features": 12},
+        },
+        feature_health={
+            "camera_setup": NATIVE_CAMERA_SETUP,
+            "panorama_images_with_features": 2,
+            "expected_panorama_images": 2,
+            "camera_count": 2,
+        },
+        image_limit=None,
+        import_workers=1,
+        feature_workers=2,
+        feature_batch_size=1,
+        feature_shard_result=shard_result,
+        generated_image_batch=batch,
+        reconstructions={0: FakeReconstructionStats()},
+        best_model_id=0,
+        best_reconstruction=FakeReconstructionStats(),
+        keyframe_scores=[],
+    )
+
+    assert report["options"]["feature_extraction_mode"] == "sharded_database"
+    assert report["options"]["feature_workers"] == 2
+    assert report["feature_shards"]["batch_count"] == 2
+    assert report["feature_shards"]["batches"] == [["a.png"], ["b.png"]]
+    assert report["feature_shards"]["merge_elapsed_seconds"] == 0.25
+    assert (
+        report["feature_shards"]["camera_policy"]
+        == "multiple_identical_equirectangular_cameras_are_expected"
+    )
 
 
 def test_score_keyframe_anchors_reports_quality_components(tmp_path) -> None:
@@ -940,6 +1588,8 @@ def test_parse_args_accepts_image_limit(tmp_path) -> None:
     assert args.max_image_size == -1
     assert args.num_threads == -1
     assert args.import_workers == 1
+    assert args.feature_workers == 1
+    assert args.feature_batch_size is None
     assert args.device == "auto"
     assert args.gpu_index == "-1"
     assert args.gpu_bundle_adjustment is True
@@ -977,6 +1627,22 @@ def test_parse_args_accepts_import_workers(tmp_path) -> None:
     assert args.import_workers == 4
 
 
+def test_parse_args_accepts_feature_workers(tmp_path) -> None:
+    args = parse_args(
+        [
+            "--input-image-path",
+            str(tmp_path),
+            "--feature-workers",
+            "3",
+            "--feature-batch-size",
+            "5",
+        ]
+    )
+
+    assert args.feature_workers == 3
+    assert args.feature_batch_size == 5
+
+
 @pytest.mark.parametrize(
     ("option", "value"),
     [
@@ -999,6 +1665,20 @@ def test_parse_args_rejects_invalid_feature_extraction_tuning_options(
 def test_parse_args_rejects_invalid_import_workers(tmp_path, value) -> None:
     with pytest.raises(SystemExit):
         parse_args(["--input-image-path", str(tmp_path), "--import-workers", value])
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--feature-workers", "0"),
+        ("--feature-workers", "-1"),
+        ("--feature-batch-size", "0"),
+        ("--feature-batch-size", "-1"),
+    ],
+)
+def test_parse_args_rejects_invalid_feature_workers(tmp_path, option, value) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(["--input-image-path", str(tmp_path), option, value])
 
 
 def test_parse_import_args_accepts_import_options(tmp_path) -> None:
@@ -1029,6 +1709,104 @@ def test_parse_import_args_accepts_import_options(tmp_path) -> None:
 def test_parse_import_args_rejects_invalid_options(tmp_path, option, value) -> None:
     with pytest.raises(SystemExit):
         parse_import_args(["--input-image-path", str(tmp_path), option, value])
+
+
+def test_parse_feature_args_accepts_feature_options(tmp_path) -> None:
+    args = parse_feature_args(
+        [
+            "--input-image-path",
+            str(tmp_path),
+            "--max-num-features",
+            "4096",
+            "--max-image-size",
+            "2048",
+            "--num-threads",
+            "4",
+            "--device",
+            "cpu",
+            "--gpu-index",
+            "0,1",
+            "--image-limit",
+            "3",
+            "--import-workers",
+            "2",
+        ]
+    )
+
+    assert args.max_num_features == 4096
+    assert args.max_image_size == 2048
+    assert args.num_threads == 4
+    assert args.device == "cpu"
+    assert args.gpu_index == "0,1"
+    assert args.image_limit == 3
+    assert args.import_workers == 2
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--image-limit", "0"),
+        ("--import-workers", "0"),
+        ("--max-num-features", "0"),
+        ("--max-image-size", "0"),
+        ("--max-image-size", "-2"),
+        ("--num-threads", "0"),
+        ("--num-threads", "-2"),
+    ],
+)
+def test_parse_feature_args_rejects_invalid_options(tmp_path, option, value) -> None:
+    with pytest.raises(SystemExit):
+        parse_feature_args(["--input-image-path", str(tmp_path), option, value])
+
+
+def test_panorama_features_cli_prints_feature_report(tmp_path, monkeypatch, capsys) -> None:
+    input_dir = tmp_path / "input"
+    workspace = tmp_path / "workspace"
+    input_dir.mkdir()
+
+    def fake_run_panorama_feature_extraction(**kwargs):
+        assert kwargs["input_image_path"] == input_dir
+        assert kwargs["workspace"] == workspace
+        return {
+            "workspace": str(workspace),
+            "camera_setup": NATIVE_CAMERA_SETUP,
+            "camera": {"model": "EQUIRECTANGULAR"},
+            "panorama_count": 1,
+            "options": {"resolved_device": "cpu"},
+            "feature_health": {
+                "panorama_images_with_features": 1,
+                "expected_panorama_images": 1,
+            },
+            "elapsed_time": "0.1s",
+            "metadata_path": str(workspace / "panorama_equirectangular_config.json"),
+            "database_path": str(workspace / "database.db"),
+            "report_path": str(
+                workspace / "panorama_equirectangular_feature_report.json"
+            ),
+        }
+
+    monkeypatch.setattr(
+        panorama_cli_features,
+        "run_panorama_feature_extraction",
+        fake_run_panorama_feature_extraction,
+    )
+
+    assert (
+        feature_main(
+            [
+                "--input-image-path",
+                str(input_dir),
+                "--workspace",
+                str(workspace),
+            ]
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "panorama images: 1" in output
+    assert "panorama images with features: 1/1" in output
+    assert "database:" in output
 
 
 def test_panorama_import_cli_writes_import_workspace(tmp_path, capsys) -> None:

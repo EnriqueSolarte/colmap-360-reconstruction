@@ -24,6 +24,14 @@ from colmap.panorama.database import (
     read_generated_image_batch,
     read_image_records_by_name,
 )
+from colmap.panorama.feature_pipeline import (
+    FeatureShardExtractionResult,
+    extract_panorama_features_to_database,
+    extract_panorama_features_to_sharded_database,
+    merge_feature_shard_databases,
+    run_panorama_feature_extraction,
+    split_image_names_into_batches,
+)
 from colmap.panorama.image_import import (
     hardlink_or_symlink_file,
     image_resolution,
@@ -52,6 +60,7 @@ from colmap.panorama.pycolmap_adapter import (
     write_best_model,
 )
 from colmap.panorama.reports import (
+    build_panorama_feature_report,
     build_panorama_import_report,
     build_panorama_report,
     equirectangular_feature_health_summary,
@@ -82,6 +91,7 @@ __all__ = [
     "DEFAULT_WORKSPACE",
     "FILENAME_TIMESTAMP_PATTERN",
     "FeaturePipelineOptions",
+    "FeatureShardExtractionResult",
     "GeneratedImageBatch",
     "IMAGE_EXTENSIONS",
     "KeyframeAnchorScore",
@@ -89,6 +99,7 @@ __all__ = [
     "PROJECT_ROOT",
     "PanoramaArgumentDefaultsHelpFormatter",
     "PipelineExecutionOptions",
+    "build_panorama_feature_report",
     "build_panorama_import_report",
     "build_panorama_report",
     "colmap_frame_id_for_image",
@@ -98,6 +109,8 @@ __all__ = [
     "create_mapper_options",
     "decode_colmap_image_pair_id",
     "equirectangular_feature_health_summary",
+    "extract_panorama_features_to_database",
+    "extract_panorama_features_to_sharded_database",
     "first_gpu_index",
     "format_elapsed_seconds",
     "format_elapsed_seconds_by_stage",
@@ -108,6 +121,7 @@ __all__ = [
     "log_capped_score",
     "main",
     "match_features",
+    "merge_feature_shard_databases",
     "normalized_entropy",
     "optional_report_float",
     "panorama_image_paths",
@@ -127,10 +141,12 @@ __all__ = [
     "require_pycolmap",
     "resolve_pipeline_execution",
     "round_report_float",
+    "run_panorama_feature_extraction",
     "run_panorama_image_import",
     "run_incremental_mapping",
     "run_panorama_reconstruction",
     "score_keyframe_anchors",
+    "split_image_names_into_batches",
     "timestamp_from_image_name",
     "validate_gpu_index",
     "validate_vocab_tree_path",

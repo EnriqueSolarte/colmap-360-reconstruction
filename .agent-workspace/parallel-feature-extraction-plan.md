@@ -27,22 +27,21 @@ and writes a reconstruction report in one command.
    `cpu`.
 5. Exposes `--gpu-index`, including comma-separated values such as `0,1` and
    `-1`.
-6. Records `feature_extraction` elapsed time in
+6. Exposes feature extraction tuning through `--max-image-size` and
+   `--num-threads`.
+7. Exposes opt-in parallel image import through `--import-workers`.
+8. Provides isolated import-only and feature-only commands for validating early
+   pipeline stages without running full matching/mapping.
+9. Records `feature_extraction` elapsed time in
    `panorama_equirectangular_report.json`.
 
 Current gaps:
 
-1. Feature extraction tuning options such as `num_threads` and `max_image_size`
-   are not exposed.
-2. Image import is serial even though resolution checks and hardlink/symlink
-   creation can be parallelized safely with ordered result collection.
-3. There is no isolated import-only path for validating image discovery,
-   resolution checks, link creation, and metadata without running COLMAP.
-4. There is no reusable feature-only or batch-extraction workflow for testing
-   extraction independently from matching and mapping.
-5. There is no safe batch-worker orchestration.
-6. There is no validated database-sharding and merge path for parallel
+1. There is no safe batch-worker orchestration.
+2. There is no validated database-sharding and merge path for parallel
    extraction.
+3. Feature-worker options are intentionally not exposed in reconstruction until
+   database merge behavior is validated.
 
 ## Important Constraints
 
@@ -221,8 +220,13 @@ Open questions to answer before Stage 4:
 
 1. Does `Database.merge` deduplicate identical cameras, or does each shard keep
    its own camera id?
+   - Answer from local `pycolmap 4.1.0` smoke test: each shard keeps its own
+     identical equirectangular camera row after merge.
 2. If multiple camera ids remain, does this affect matching, mapping, reporting,
    or the expectation that the native panorama pipeline uses one shared camera?
+   - Decision: accept multiple identical equirectangular cameras in sharded
+     mode instead of rewriting COLMAP's SQLite database after merge. Reports
+     must make the sharded camera policy explicit.
 3. Are image ids stable enough for reporting, or should reports treat merged
    image ids as final database-assigned ids only?
 4. Does merging preserve every table required by the current pycolmap version?
@@ -282,8 +286,10 @@ Success criteria:
 1. A small synthetic image set produces the same image count and nonzero feature
    rows as single-process extraction.
 2. The merged database can be consumed by COLMAP matching.
-3. Failed workers leave enough logs/report data to identify the failed batch.
-4. Parallel mode is opt-in and does not affect default reconstruction behavior.
+3. Reports explicitly state that multiple identical equirectangular camera ids
+   are expected in sharded mode.
+4. Failed workers leave enough logs/report data to identify the failed batch.
+5. Parallel mode is opt-in and does not affect default reconstruction behavior.
 
 ## Evaluation
 
@@ -327,17 +333,17 @@ Representative runs should include:
 
 ## Recommended Next Slice
 
-Implement Stage 1 only, then Stage 2, then Stage 2.1 if each slice is clean:
+Stage 1, Stage 2, Stage 2.1, the single-database feature-only helper, and Stage
+3 merge validation are implemented. The next slice is Stage 4 reconstruction
+integration:
 
-1. Expose `num_threads` and `max_image_size` through
-   `FeaturePipelineOptions`, the CLI, pycolmap option construction, and the
-   reconstruction report.
-2. Add tests for option parsing, option propagation, and report output.
-3. After that is verified, add opt-in multi-worker import with deterministic
-   result ordering and focused import tests.
-4. After multi-worker import is verified, add an isolated import-only path that
-   writes metadata/report output and explicitly skips feature extraction,
-   matching, and mapping.
+1. Add opt-in `--feature-workers` to reconstruction.
+2. Add optional `--feature-batch-size` for explicit shard sizing.
+3. Keep the default `feature_workers=1` path as single-database extraction.
+4. In sharded mode, extract disjoint image-name batches into shard DBs and merge
+   them into `database.db` before matching.
+5. Record shard batches, shard database paths, merge timing, and accepted
+   multiple-camera policy in reports.
 
-Do not expose `--feature-workers` in reconstruction until the Stage 3 helper
-proves camera/image identity and matching behavior after database merge.
+After Stage 4 integration, keep sharded feature extraction opt-in until it has
+been benchmarked on representative local datasets.

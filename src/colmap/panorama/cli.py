@@ -158,6 +158,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Number of worker threads for importing panorama images.",
     )
     parser.add_argument(
+        "--feature-workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of worker threads for sharded feature extraction. Values "
+            "greater than 1 extract into shard databases and merge them."
+        ),
+    )
+    parser.add_argument(
+        "--feature-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Images per feature shard. If omitted, batches are split across "
+            "--feature-workers."
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Delete and rebuild the equirectangular workspace.",
@@ -169,6 +187,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--image-limit must be positive")
     if args.import_workers <= 0:
         parser.error("--import-workers must be positive")
+    if args.feature_workers <= 0:
+        parser.error("--feature-workers must be positive")
+    if args.feature_batch_size is not None and args.feature_batch_size <= 0:
+        parser.error("--feature-batch-size must be positive")
     if args.max_num_features <= 0:
         parser.error("--max-num-features must be positive")
     if args.max_image_size < -1 or args.max_image_size == 0:
@@ -207,6 +229,8 @@ def main(argv: list[str] | None = None) -> int:
         ),
         image_limit=args.image_limit,
         import_workers=args.import_workers,
+        feature_workers=args.feature_workers,
+        feature_batch_size=args.feature_batch_size,
         overwrite=args.overwrite,
     )
     print(f"workspace: {report['workspace']}")

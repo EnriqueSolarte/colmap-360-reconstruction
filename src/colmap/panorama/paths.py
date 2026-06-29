@@ -10,11 +10,13 @@ def panorama_workspace_paths(workspace: Path) -> dict[str, Path]:
         "workspace": workspace,
         "image_dir": workspace / "images",
         "database": workspace / "database.db",
+        "feature_shards": workspace / "feature_shards",
         "sparse": workspace / "sparse",
         "best_sparse": workspace / "sparse_best",
         "raw_ply": workspace / "cloud_colmap_raw.ply",
         "report": workspace / "panorama_equirectangular_report.json",
         "import_report": workspace / "panorama_equirectangular_import_report.json",
+        "feature_report": workspace / "panorama_equirectangular_feature_report.json",
         "metadata": workspace / "panorama_equirectangular_config.json",
         "match_pairs": workspace / "match_pairs.txt",
     }

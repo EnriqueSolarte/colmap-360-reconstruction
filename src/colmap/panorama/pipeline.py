@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import time
 from pathlib import Path
@@ -12,11 +13,15 @@ from colmap.panorama.database import (
     read_feature_stats_by_database_camera,
     read_generated_image_batch,
 )
+from colmap.panorama.feature_pipeline import (
+    FeatureShardExtractionResult,
+    extract_panorama_features_to_database,
+    extract_panorama_features_to_sharded_database,
+)
 from colmap.panorama.import_pipeline import import_panorama_images_to_workspace
 from colmap.panorama.paths import panorama_workspace_paths
 from colmap.panorama.pycolmap_adapter import (
     configure_ssl_cert_file,
-    create_feature_extraction_options,
     create_feature_matching_options,
     create_mapper_options,
     match_features,
@@ -59,10 +64,17 @@ def run_panorama_reconstruction(
     execution_options: PipelineExecutionOptions = PipelineExecutionOptions(),
     image_limit: int | None = None,
     import_workers: int = 1,
+    feature_workers: int = 1,
+    feature_batch_size: int | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
+    if feature_workers <= 0:
+        raise ValueError("feature_workers must be positive")
+    if feature_batch_size is not None and feature_batch_size <= 0:
+        raise ValueError("feature_batch_size must be positive")
     started_at = time.perf_counter()
     elapsed_seconds_by_stage: dict[str, float] = {}
+    feature_shard_result: FeatureShardExtractionResult | None = None
     stage_started_at = started_at
     pycolmap_module = require_pycolmap()
     pycolmap_module.set_random_seed(0)
@@ -92,28 +104,40 @@ def run_panorama_reconstruction(
     )
 
     stage_started_at = time.perf_counter()
-    extraction_options = create_feature_extraction_options(
-        pycolmap_module,
-        feature_options,
-        use_gpu=execution["resolved_device"] == "cuda",
-        gpu_index=execution["gpu_index"],
-    )
-    reader_options = pycolmap_module.ImageReaderOptions()
-    reader_options.camera_model = camera.model
-    reader_options.camera_params = camera.params_string
-    pycolmap_module.extract_features(
-        paths["database"],
-        paths["image_dir"],
-        reader_options=reader_options,
-        camera_mode=pycolmap_module.CameraMode.SINGLE,
-        extraction_options=extraction_options,
-        device=execution["device"],
-    )
+    if feature_workers == 1:
+        extract_panorama_features_to_database(
+            pycolmap_module,
+            database_path=paths["database"],
+            image_dir=paths["image_dir"],
+            camera=camera,
+            feature_options=feature_options,
+            execution=execution,
+        )
+    else:
+        effective_feature_batch_size = feature_batch_size or math.ceil(
+            len(generated_image_names) / feature_workers,
+        )
+        feature_shard_result = extract_panorama_features_to_sharded_database(
+            pycolmap_module,
+            database_path=paths["database"],
+            image_dir=paths["image_dir"],
+            shard_dir=paths["feature_shards"],
+            camera=camera,
+            feature_options=feature_options,
+            execution=execution,
+            image_names=generated_image_names,
+            batch_size=effective_feature_batch_size,
+            feature_workers=feature_workers,
+        )
     record_elapsed_stage(
         elapsed_seconds_by_stage,
         "feature_extraction",
         stage_started_at,
     )
+    if feature_shard_result is not None:
+        elapsed_seconds_by_stage["feature_shard_merge"] = (
+            feature_shard_result.merge_elapsed_seconds
+        )
 
     stage_started_at = time.perf_counter()
     generated_image_batch = read_generated_image_batch(
@@ -208,6 +232,9 @@ def run_panorama_reconstruction(
         feature_health=feature_health,
         image_limit=image_limit,
         import_workers=import_workers,
+        feature_workers=feature_workers,
+        feature_batch_size=feature_batch_size,
+        feature_shard_result=feature_shard_result,
         generated_image_batch=generated_image_batch,
         reconstructions=reconstructions,
         best_model_id=best_model_id,
