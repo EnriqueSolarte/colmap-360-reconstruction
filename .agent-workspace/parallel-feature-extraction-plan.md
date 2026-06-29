@@ -345,5 +345,15 @@ integration:
 5. Record shard batches, shard database paths, merge timing, and accepted
    multiple-camera policy in reports.
 
+For the feature-only command, expose only `--feature-workers` publicly and
+compute shard batch size automatically from the imported image count:
+
+```text
+feature_batch_size = ceil(image_count / feature_workers)
+```
+
+This keeps `colmap-panorama-features` focused on profiling the feature stage
+without requiring users to choose both concurrency and chunk size.
+
 After Stage 4 integration, keep sharded feature extraction opt-in until it has
 been benchmarked on representative local datasets.

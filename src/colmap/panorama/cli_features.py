@@ -119,6 +119,16 @@ def parse_feature_args(argv: list[str]) -> argparse.Namespace:
         help="Number of worker threads for importing panorama images.",
     )
     parser.add_argument(
+        "--feature-workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of worker threads for sharded feature extraction. Values "
+            "greater than 1 split imported images into that many balanced "
+            "feature shards."
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Delete and rebuild the feature workspace.",
@@ -132,6 +142,8 @@ def parse_feature_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--image-limit must be positive")
     if args.import_workers <= 0:
         parser.error("--import-workers must be positive")
+    if args.feature_workers <= 0:
+        parser.error("--feature-workers must be positive")
     if args.max_num_features <= 0:
         parser.error("--max-num-features must be positive")
     if args.max_image_size < -1 or args.max_image_size == 0:
@@ -162,6 +174,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         image_limit=args.image_limit,
         import_workers=args.import_workers,
+        feature_workers=args.feature_workers,
         overwrite=args.overwrite,
     )
     print(f"workspace: {report['workspace']}")
