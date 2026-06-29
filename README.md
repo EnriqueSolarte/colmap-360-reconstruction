@@ -1,16 +1,14 @@
 # colmap-360-reconstruction
 
 Run a raw COLMAP sparse reconstruction from equirectangular panoramas by
-rendering fixed virtual pinhole views and registering them as a shared-center
-rig.
+using COLMAP's native `EQUIRECTANGULAR` camera model directly.
 
 The primary 360-image workflow is:
 
-1. Render twelve fixed virtual pinhole views from each equirectangular image.
-2. Assign every panorama direction to one virtual camera with feature masks.
-3. Force the virtual cameras into a known, shared-center COLMAP rig.
-4. Match panorama frames with rig verification and loop detection.
-5. Reconstruct, summarize, or visualize the raw sparse model.
+1. Hard-link or symlink source panoramas into the COLMAP workspace.
+2. Extract SIFT features with one shared native equirectangular camera.
+3. Match panorama images with sequential, exhaustive, or vocabulary-tree matching.
+4. Reconstruct, summarize, or visualize the raw sparse model.
 
 The COLMAP output is monocular and unscaled. Do not treat it as metric geometry
 until it has been aligned with an external scale source.
@@ -97,40 +95,23 @@ image = renderer.render(
 
 ## Reconstruct Directly From 360 Panoramas
 
-Use the maintained panorama-rig pipeline for equirectangular 360 images:
+Use the maintained native equirectangular pipeline for 360 images:
 
 ```bash
 colmap-panorama-reconstruct \
   --input-image-path /path/to/panoramas \
-  --workspace /workspace/data/colmap-panorama-rig \
+  --workspace /workspace/data/colmap-equirectangular \
   --matcher sequential \
   --overlap 15 \
   --overwrite
 ```
 
-The default overlapping layout follows COLMAP's panorama example: twelve
-fixed `PINHOLE` cameras cover the sphere, share a camera center, and retain
-known relative rotations. Feature-ownership masks prevent duplicate features
-in overlapping crops. SIFT matching uses rig verification, expands sequential
-pairs across complete panorama frames, and enables loop detection.
-
-Virtual-image rendering precomputes the twelve spherical remapping grids once,
-reuses them for every panorama, remaps complete RGB images with OpenCV, and
-encodes images concurrently. The default output is lossless PNG with fast
-compression:
-
-```bash
---virtual-image-format png \
---png-compression 1 \
---image-save-workers 12
-```
-
-For substantially faster and smaller, but lossy, virtual images:
-
-```bash
---virtual-image-format jpeg \
---jpeg-quality 95
-```
+The command imports each source panorama into the COLMAP workspace with a hard
+link when possible and a symbolic link fallback across filesystems. It then
+uses COLMAP's native `EQUIRECTANGULAR` camera model with one shared camera,
+`CameraMode.SINGLE`, and fixed equirectangular camera parameters derived from
+the panorama resolution. No virtual pinhole views, masks, rig configuration,
+or render-encoding arguments are used.
 
 COLMAP feature extraction, matching, and bundle adjustment use CUDA
 automatically when the installed pycolmap build supports it:
@@ -165,35 +146,11 @@ Start with a small smoke reconstruction before a full run:
 ```bash
 colmap-panorama-reconstruct \
   --input-image-path /path/to/panoramas \
-  --workspace /workspace/data/colmap-panorama-smoke \
+  --workspace /workspace/data/colmap-equirectangular-smoke \
   --image-limit 12 \
   --no-loop-detection \
   --overwrite
 ```
-
-Continue from a previous `colmap-panorama-reconstruct` session by passing the
-previous workspace, or its `sparse_best` model directory, as the initial map:
-
-```bash
-colmap-panorama-reconstruct \
-  --input-image-path /path/to/new-panoramas \
-  --workspace /workspace/data/colmap-panorama-continued \
-  --initial-session /workspace/data/colmap-panorama-rig \
-  --matcher sequential \
-  --overlap 15
-```
-
-The initial session must be a prior panorama-rig workspace from this command,
-not an arbitrary COLMAP or VSLAM export. The new input directory should contain
-additional panoramas. During seeded runs, newly generated virtual images are
-namespaced by the input folder name, such as `img-0001_shelf.png`, so repeated
-camera filenames from different capture folders can coexist. The current
-panorama-rig pipeline keeps virtual camera intrinsics fixed while COLMAP
-continues optimizing poses and sparse points from the previous model.
-Previous virtual images and masks are hardlinked into the new workspace by
-default to avoid duplicating large files. If hardlinks are not supported between
-the two workspace locations, the command falls back to normal copies. The
-database is always copied because continuation runs mutate it.
 
 Loop detection may download COLMAP's default vocabulary tree. To avoid that
 download and make runs reproducible, pass a local tree with
@@ -201,14 +158,14 @@ download and make runs reproducible, pass a local tree with
 COLMAP/libcurl at `/etc/ssl/certs/ca-certificates.crt` when available; override
 it with `--ssl-cert-file` when needed.
 
-The workspace includes `panorama_rig_config.json` and
-`panorama_rig_report.json`. The report records per-camera mask coverage,
-feature health, matching settings, registered panorama frames, and sparse
-model statistics.
+The workspace includes `panorama_equirectangular_config.json` and
+`panorama_equirectangular_report.json`. The metadata marks `camera_setup` as
+`native_equirectangular`, and the report records feature health, matching
+settings, registered panorama images, and sparse model statistics.
 
 ## Manually Select Pinhole Render Directions
 
-After a panorama-rig reconstruction exists, you can manually choose
+After an equirectangular panorama reconstruction exists, you can manually choose
 longitude/latitude directions from the registered panoramas and render those
 directions as pinhole images. This is useful when you want a curated set of
 perspective views for Gaussian Splatting or other pose-aware training
@@ -222,8 +179,8 @@ to the original equirectangular image files.
 ```bash
 manual-pinhole-render \
   --pano-dir /path/to/source-panoramas \
-  --scene-workspace /path/to/panorama-rig-workspace \
-  --output-dir /path/to/panorama-rig-workspace/pinhole-renders
+  --scene-workspace /path/to/equirectangular-workspace \
+  --output-dir /path/to/equirectangular-workspace/pinhole-renders
 ```
 
 To skip manual point-by-point selection and initialize a regular grid over
@@ -234,8 +191,8 @@ pending pinhole views per panorama.
 ```bash
 manual-pinhole-render \
   --pano-dir /path/to/source-panoramas \
-  --scene-workspace /path/to/panorama-rig-workspace \
-  --output-dir /path/to/panorama-rig-workspace/pinhole-renders \
+  --scene-workspace /path/to/equirectangular-workspace \
+  --output-dir /path/to/equirectangular-workspace/pinhole-renders \
   --auto-select
 ```
 
@@ -243,7 +200,7 @@ Then open the local browser selector:
 
 ```bash
 manual-pinhole-select \
-  --output-dir /path/to/panorama-rig-workspace/pinhole-renders \
+  --output-dir /path/to/equirectangular-workspace/pinhole-renders \
   --host 127.0.0.1 \
   --port 8766
 ```
@@ -306,7 +263,7 @@ When you are done selecting, render the final pinhole images:
 
 ```bash
 manual-pinhole-render \
-  --output-dir /path/to/panorama-rig-workspace/pinhole-renders \
+  --output-dir /path/to/equirectangular-workspace/pinhole-renders \
   --render-selections
 ```
 
@@ -314,7 +271,7 @@ To also export a COLMAP text model for Gaussian Splatting training:
 
 ```bash
 manual-pinhole-render \
-  --output-dir /path/to/panorama-rig-workspace/pinhole-renders \
+  --output-dir /path/to/equirectangular-workspace/pinhole-renders \
   --render-selections \
   --export-gaussian-splatting-colmap
 ```
@@ -333,7 +290,7 @@ pinhole-renders/gaussian_splatting_export.json
 
 Use this workflow when you already have:
 
-- an optimized panorama-rig COLMAP model, for example:
+- an optimized equirectangular panorama COLMAP model, for example:
 
 ```text
 /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/colmap/1781765016983-1781764929431-1781765089651-1781765215596-1781765283163-1781765391913-1781765475779-1781765557512/sparse_best
@@ -415,7 +372,7 @@ Summary mode works without Open3D:
 
 ```bash
 colmap-visualize \
-  --model /workspace/data/colmap-panorama-rig/sparse_best \
+  --model /workspace/data/colmap-equirectangular/sparse_best \
   --summary-only
 ```
 
@@ -423,19 +380,19 @@ Interactive visualization requires Open3D and GUI/OpenGL support:
 
 ```bash
 colmap-visualize \
-  --model /workspace/data/colmap-panorama-rig/sparse_best
+  --model /workspace/data/colmap-equirectangular/sparse_best
 ```
 
-For panorama-rig workspaces, the visualizer automatically draws each panorama
-frame as a small surface sphere with a local RGB arrow coordinate frame instead
-of drawing every virtual pinhole camera frustum. The sphere radius is one
+For equirectangular workspaces, the visualizer automatically draws each
+panorama as a small surface sphere with a local RGB arrow coordinate frame
+instead of drawing a pinhole camera frustum. The sphere radius is one
 quarter of the local frame size. The local frame is centered at the panorama
 view center: +x points right, +y points down, and +z points through the
 panorama center direction. You can override this if needed:
 
 ```bash
 colmap-visualize \
-  --model /workspace/data/colmap-panorama-rig/sparse_best \
+  --model /workspace/data/colmap-equirectangular/sparse_best \
   --camera-style sphere
 ```
 
@@ -443,8 +400,8 @@ To save a preview image:
 
 ```bash
 colmap-visualize \
-  --model /workspace/data/colmap-panorama-rig/sparse_best \
-  --save-image /workspace/data/colmap-panorama-rig/map-preview.png \
+  --model /workspace/data/colmap-equirectangular/sparse_best \
+  --save-image /workspace/data/colmap-equirectangular/map-preview.png \
   --summary-only
 ```
 

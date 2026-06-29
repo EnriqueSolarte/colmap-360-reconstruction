@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - environment dependent
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_WORKSPACE = PROJECT_ROOT / "data" / "colmap-panorama-rig"
+DEFAULT_WORKSPACE = PROJECT_ROOT / "data" / "colmap-equirectangular"
 DEFAULT_MODEL = DEFAULT_WORKSPACE / "sparse_best"
 CAMERA_STYLES = ("auto", "frustum", "sphere")
 PANORAMA_REFERENCE_FRAME_SCALE = 0.75
@@ -45,7 +45,7 @@ class PanoramaFrameGroup:
 
 
 @dataclass(frozen=True)
-class PanoramaRigViewMetadata:
+class PanoramaViewMetadata:
     image_prefix: str
     cam_from_pano_rotation: np.ndarray
 
@@ -105,7 +105,7 @@ def camera_geometries_from_reconstruction(
     scale: float,
     max_cameras: int,
     camera_style: str,
-    panorama_views: tuple[PanoramaRigViewMetadata, ...] = (),
+    panorama_views: tuple[PanoramaViewMetadata, ...] = (),
 ) -> tuple[list[o3d.geometry.Geometry], np.ndarray]:
     images = registered_images(reconstruction)
     if camera_style == "sphere":
@@ -163,12 +163,12 @@ def camera_geometries_from_reconstruction(
     return geometries, centers
 
 
-def panorama_rig_metadata_path(model_path: Path) -> Path | None:
-    """Return the nearby panorama-rig metadata path when this is our workspace."""
+def panorama_metadata_path(model_path: Path) -> Path | None:
+    """Return the nearby panorama metadata path when this is our workspace."""
     candidates = (
-        model_path / "panorama_rig_config.json",
-        model_path.parent / "panorama_rig_config.json",
-        model_path.parent.parent / "panorama_rig_config.json",
+        model_path / "panorama_equirectangular_config.json",
+        model_path.parent / "panorama_equirectangular_config.json",
+        model_path.parent.parent / "panorama_equirectangular_config.json",
     )
     for candidate in candidates:
         if candidate.is_file():
@@ -176,12 +176,12 @@ def panorama_rig_metadata_path(model_path: Path) -> Path | None:
     return None
 
 
-def panorama_views_from_metadata(path: Path | None) -> tuple[PanoramaRigViewMetadata, ...]:
+def panorama_views_from_metadata(path: Path | None) -> tuple[PanoramaViewMetadata, ...]:
     if path is None:
         return ()
     with path.open("r", encoding="utf-8") as metadata_file:
         metadata = json.load(metadata_file)
-    views: list[PanoramaRigViewMetadata] = []
+    views: list[PanoramaViewMetadata] = []
     for view in metadata.get("views", []):
         prefix = view.get("image_prefix")
         rotation = view.get("cam_from_pano_rotation")
@@ -193,7 +193,7 @@ def panorama_views_from_metadata(path: Path | None) -> tuple[PanoramaRigViewMeta
             continue
         if rotation_array.shape == (3, 3):
             views.append(
-                PanoramaRigViewMetadata(
+                PanoramaViewMetadata(
                     image_prefix=prefix,
                     cam_from_pano_rotation=rotation_array,
                 )
@@ -202,13 +202,13 @@ def panorama_views_from_metadata(path: Path | None) -> tuple[PanoramaRigViewMeta
 
 
 def panorama_prefixes_from_views(
-    panorama_views: tuple[PanoramaRigViewMetadata, ...],
+    panorama_views: tuple[PanoramaViewMetadata, ...],
 ) -> tuple[str, ...]:
     return tuple(view.image_prefix for view in panorama_views)
 
 
 def resolve_camera_style(model_path: Path, requested_style: str) -> tuple[str, Path | None]:
-    metadata_path = panorama_rig_metadata_path(model_path)
+    metadata_path = panorama_metadata_path(model_path)
     if requested_style == "auto":
         return ("sphere" if metadata_path is not None else "frustum"), metadata_path
     return requested_style, metadata_path
@@ -256,7 +256,7 @@ def panorama_group_centers(groups: list[PanoramaFrameGroup]) -> np.ndarray:
 
 def panorama_rotation_world_from_group(
     group: PanoramaFrameGroup,
-    panorama_views: tuple[PanoramaRigViewMetadata, ...],
+    panorama_views: tuple[PanoramaViewMetadata, ...],
 ) -> np.ndarray | None:
     for image in group.images:
         view = panorama_view_for_image(image.name, panorama_views)
@@ -276,8 +276,8 @@ def panorama_rotation_world_from_group(
 
 def panorama_view_for_image(
     image_name: str,
-    panorama_views: tuple[PanoramaRigViewMetadata, ...],
-) -> PanoramaRigViewMetadata | None:
+    panorama_views: tuple[PanoramaViewMetadata, ...],
+) -> PanoramaViewMetadata | None:
     for view in panorama_views:
         if image_name.startswith(view.image_prefix):
             return view
@@ -313,6 +313,13 @@ def draw_camera(
     )
     rotation_world_from_cam = rotation_cam_from_world.T
     center_world = np.asarray(image.projection_center(), dtype=np.float64)
+
+    if camera.model_name == "EQUIRECTANGULAR":
+        return draw_equirectangular_camera(
+            center_world,
+            rotation_world_from_cam,
+            scale=scale,
+        )
 
     fx, fy, cx, cy = pinhole_params(camera)
     width = float(camera.width)
@@ -357,6 +364,26 @@ def draw_camera(
     axis.transform(transform)
 
     return [frustum, axis]
+
+
+def draw_equirectangular_camera(
+    center: np.ndarray,
+    rotation_world_from_cam: np.ndarray,
+    *,
+    scale: float,
+) -> list[o3d.geometry.Geometry]:
+    sphere = draw_sphere_surface(
+        center,
+        radius=panorama_sphere_radius(scale),
+    )
+    axis = o3d.geometry.TriangleMesh.create_coordinate_frame(
+        size=panorama_reference_frame_size(scale),
+    )
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = np.asarray(rotation_world_from_cam, dtype=np.float64)
+    transform[:3, 3] = np.asarray(center, dtype=np.float64)
+    axis.transform(transform)
+    return [sphere, axis]
 
 
 def panorama_reference_frame_size(camera_scale: float) -> float:
@@ -778,7 +805,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="auto",
         help=(
             "Camera glyph style: auto uses panorama spheres when "
-            "panorama_rig_config.json is found, frustum draws pinhole cameras, "
+            "panorama_equirectangular_config.json is found, frustum draws pinhole cameras, "
             "sphere draws one surface sphere per panorama frame (default: auto)"
         ),
     )

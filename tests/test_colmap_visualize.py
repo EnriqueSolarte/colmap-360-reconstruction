@@ -62,6 +62,37 @@ class FakeOpen3D:
             return list(values)
 
 
+class FakeGeometry:
+    def __init__(self, kind, **metadata):
+        self.kind = kind
+        self.metadata = metadata
+        self.transforms = []
+
+    def paint_uniform_color(self, color):
+        self.metadata["color"] = color
+
+    def compute_vertex_normals(self):
+        self.metadata["normals_computed"] = True
+
+    def transform(self, transform):
+        self.transforms.append(np.asarray(transform, dtype=np.float64))
+
+
+class FakeTriangleMesh:
+    @staticmethod
+    def create_sphere(radius, resolution):
+        return FakeGeometry("sphere", radius=radius, resolution=resolution)
+
+    @staticmethod
+    def create_coordinate_frame(size):
+        return FakeGeometry("coordinate_frame", size=size)
+
+
+class FakeOpen3DGeometry:
+    class geometry:
+        TriangleMesh = FakeTriangleMesh
+
+
 class FakeReconstruction:
     def __init__(self, model_path):
         self.model_path = model_path
@@ -79,6 +110,14 @@ class FakeReconstruction:
 
 class FakePycolmap:
     Reconstruction = FakeReconstruction
+
+
+class FakeCamera:
+    def __init__(self, model_name, width=2048, height=1024, params=()):
+        self.model_name = model_name
+        self.width = width
+        self.height = height
+        self.params = params
 
 
 def test_point_cloud_can_include_untracked_points(monkeypatch):
@@ -124,7 +163,7 @@ def test_camera_style_accepts_sphere():
 def test_auto_camera_style_uses_nearby_panorama_metadata(tmp_path):
     model_path = tmp_path / "sparse_best"
     model_path.mkdir()
-    (tmp_path / "panorama_rig_config.json").write_text(
+    (tmp_path / "panorama_equirectangular_config.json").write_text(
         '{"views": [{"image_prefix": "pano_camera00/"}]}\n',
         encoding="utf-8",
     )
@@ -132,7 +171,7 @@ def test_auto_camera_style_uses_nearby_panorama_metadata(tmp_path):
     style, metadata_path = visualize_map.resolve_camera_style(model_path, "auto")
 
     assert style == "sphere"
-    assert metadata_path == tmp_path / "panorama_rig_config.json"
+    assert metadata_path == tmp_path / "panorama_equirectangular_config.json"
 
 
 def test_panorama_frame_groups_collapse_virtual_camera_images():
@@ -163,6 +202,24 @@ def test_panorama_sphere_radius_is_one_quarter_of_reference_frame():
     assert reference_frame_size == 6.0
     assert sphere_radius == 1.5
     assert sphere_radius == reference_frame_size / 4.0
+
+
+def test_draw_camera_accepts_equirectangular_camera(monkeypatch):
+    monkeypatch.setattr(visualize_map, "o3d", FakeOpen3DGeometry)
+    image = FakeImage("panorama.jpg", [1.0, 2.0, 3.0])
+    camera = FakeCamera("EQUIRECTANGULAR")
+
+    geometries = visualize_map.draw_camera(image, camera, scale=8.0)
+
+    assert [geometry.kind for geometry in geometries] == [
+        "sphere",
+        "coordinate_frame",
+    ]
+    assert geometries[0].metadata["radius"] == 1.5
+    assert geometries[0].transforms[0][:3, 3].tolist() == [1.0, 2.0, 3.0]
+    assert geometries[1].metadata["size"] == 6.0
+    assert np.allclose(geometries[1].transforms[0][:3, :3], np.eye(3))
+    assert geometries[1].transforms[0][:3, 3].tolist() == [1.0, 2.0, 3.0]
 
 
 def test_panorama_coordinate_frame_transform_uses_pano_axes_and_center():
@@ -199,7 +256,7 @@ def test_panorama_rotation_world_from_group_undoes_virtual_camera_rotation():
         center=np.zeros(3),
     )
     views = (
-        visualize_map.PanoramaRigViewMetadata(
+        visualize_map.PanoramaViewMetadata(
             image_prefix="pano_camera00/",
             cam_from_pano_rotation=cam_from_pano,
         ),

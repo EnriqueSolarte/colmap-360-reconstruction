@@ -1,107 +1,62 @@
 import json
 import os
 import sqlite3
-from math import pi
 from pathlib import Path
 
-import numpy as np
 import pytest
 from PIL import Image
 
-from colmap.camera import camera_from_fov
+from colmap.camera import camera_from_equirectangular
 from colmap.panorama_reconstruct import (
     COLMAP_IMAGE_PAIR_ID_PRIME,
     FeaturePipelineOptions,
-    GeneratedVirtualImageBatch,
-    PanoramaRenderOptions,
+    GeneratedImageBatch,
+    NATIVE_CAMERA_SETUP,
     PipelineExecutionOptions,
-    VirtualImageOutputOptions,
-    assign_camera_ids_by_prefix,
-    build_last_k_match_pairs,
-    build_rig_remap_maps,
-    build_initial_session_report,
     build_panorama_report,
-    combine_anchor_frame_sets,
-    build_rig_views,
     configure_ssl_cert_file,
-    copy_initial_panorama_session,
-    copytree_hardlink_or_copy,
     create_feature_extraction_options,
     create_feature_matching_options,
     create_mapper_options,
-    create_rig_config,
-    default_render_options,
-    feature_health_summary,
+    equirectangular_feature_health_summary,
     format_elapsed_seconds,
     format_elapsed_seconds_by_stage,
-    generated_virtual_image_names,
-    mask_statistics,
+    import_equirectangular_panorama_images,
     match_features,
-    read_camera_ids_by_prefix,
-    read_generated_virtual_image_batch,
-    read_keyframe_score_reports,
-    read_image_records_by_name,
-    read_last_old_rig_frame_image_sets,
-    read_rig_frame_image_sets_for_images,
     panorama_image_paths,
-    resolve_initial_panorama_session,
-    RigFrameImageSet,
-    run_incremental_mapping,
     parse_args,
-    pad_equirectangular_image,
-    read_rendered_rig_masks,
-    render_remapped_view,
-    render_panorama_rig_images,
-    replace_generated_frames_with_seed_rig_frames,
+    read_feature_stats_by_database_camera,
+    read_generated_image_batch,
+    read_image_records_by_name,
+    run_incremental_mapping,
     resolve_pipeline_execution,
-    rig_view_masks,
     score_keyframe_anchors,
-    select_top_keyframe_frame_sets,
-    validate_initial_session_compatible,
-    validate_rig_masks,
+    write_equirectangular_metadata,
+    write_image_pair_list,
 )
-from render_pinhole import EquirectangularToPinhole
 
 
-def create_previous_panorama_session(
-    workspace,
-    *,
-    options=None,
-    output_options=None,
-) -> None:
-    options = default_render_options("non-overlapping") if options is None else options
-    output_options = (
-        VirtualImageOutputOptions(save_workers=1)
-        if output_options is None
-        else output_options
-    )
-    workspace.mkdir()
-    (workspace / "images" / "pano_camera00").mkdir(parents=True)
-    (workspace / "masks" / "pano_camera00").mkdir(parents=True)
-    (workspace / "sparse_best").mkdir()
-    (workspace / "database.db").write_bytes(b"database")
-    for stem in ("cameras", "images", "points3D"):
-        (workspace / "sparse_best" / f"{stem}.bin").write_bytes(b"model")
-    metadata = {
-        "render_options": {
-            "num_yaw_steps": options.num_yaw_steps,
-            "pitches": list(options.pitches),
-            "width": options.width,
-            "height": options.height,
-            "fov_x": options.fov_x,
-            "fov_y": options.fov_y,
-            "interpolation": options.interpolation,
-            "virtual_image_format": output_options.image_format,
-        },
-        "views": [
-            {"index": view.index, "image_prefix": view.image_prefix}
-            for view in build_rig_views(options)
-        ],
-    }
-    (workspace / "panorama_rig_config.json").write_text(
-        json.dumps(metadata),
-        encoding="utf-8",
-    )
+class FakeReconstructionStats:
+    def num_images(self):
+        return 2
+
+    def num_reg_images(self):
+        return 2
+
+    def num_points3D(self):
+        return 5
+
+    def compute_num_observations(self):
+        return 10
+
+    def compute_mean_observations_per_reg_image(self):
+        return 5.0
+
+    def compute_mean_track_length(self):
+        return 2.0
+
+    def compute_mean_reprojection_error(self):
+        return 0.5
 
 
 def test_configure_ssl_cert_file_uses_explicit_bundle(tmp_path, monkeypatch) -> None:
@@ -114,269 +69,104 @@ def test_configure_ssl_cert_file_uses_explicit_bundle(tmp_path, monkeypatch) -> 
     assert os.environ["SSL_CERT_FILE"] == str(cert_file)
 
 
-def test_resolve_initial_panorama_session_accepts_workspace_or_model_path(tmp_path) -> None:
-    workspace = tmp_path / "previous"
-    create_previous_panorama_session(workspace)
+def test_native_equirectangular_import_keeps_original_images(tmp_path) -> None:
+    input_dir = tmp_path / "input"
+    image_dir = tmp_path / "workspace" / "images"
+    nested_dir = input_dir / "nested"
+    nested_dir.mkdir(parents=True)
+    Image.new("RGB", (16, 8), color=(255, 0, 0)).save(input_dir / "a.png")
+    Image.new("RGB", (16, 8), color=(0, 255, 0)).save(nested_dir / "b.jpg")
 
-    from_workspace = resolve_initial_panorama_session(workspace)
-    from_model = resolve_initial_panorama_session(workspace / "sparse_best")
-
-    assert from_workspace.workspace == workspace
-    assert from_workspace.model_path == workspace / "sparse_best"
-    assert from_model.workspace == workspace
-    assert from_model.model_path == workspace / "sparse_best"
-
-
-def test_resolve_initial_panorama_session_rejects_non_panorama_workspace(tmp_path) -> None:
-    model = tmp_path / "sparse_best"
-    model.mkdir()
-    for stem in ("cameras", "images", "points3D"):
-        (model / f"{stem}.bin").write_bytes(b"model")
-
-    with pytest.raises(ValueError, match="previous colmap-panorama-reconstruct"):
-        resolve_initial_panorama_session(model)
-
-
-def test_initial_session_copy_preserves_rig_and_frame_model_files(tmp_path) -> None:
-    previous = tmp_path / "previous"
-    create_previous_panorama_session(previous)
-    previous_image = previous / "images" / "pano_camera00" / "old.png"
-    previous_mask = previous / "masks" / "pano_camera00" / "old.png.png"
-    previous_image.write_bytes(b"image")
-    previous_mask.write_bytes(b"mask")
-    (previous / "sparse_best" / "rigs.bin").write_bytes(b"rigs")
-    (previous / "sparse_best" / "frames.bin").write_bytes(b"frames")
-    output = tmp_path / "output"
-    paths = {
-        "image_dir": output / "images",
-        "mask_dir": output / "masks",
-        "database": output / "database.db",
-        "initial_sparse": output / "initial_sparse",
-    }
-    paths["image_dir"].mkdir(parents=True)
-    paths["mask_dir"].mkdir(parents=True)
-    session = resolve_initial_panorama_session(previous)
-
-    copy_initial_panorama_session(session, paths)
-
-    assert (paths["initial_sparse"] / "cameras.bin").is_file()
-    assert (paths["initial_sparse"] / "images.bin").is_file()
-    assert (paths["initial_sparse"] / "points3D.bin").is_file()
-    assert (paths["initial_sparse"] / "rigs.bin").read_bytes() == b"rigs"
-    assert (paths["initial_sparse"] / "frames.bin").read_bytes() == b"frames"
-    assert os.path.samefile(
-        previous_image,
-        paths["image_dir"] / "pano_camera00" / "old.png",
-    )
-    assert os.path.samefile(
-        previous_mask,
-        paths["mask_dir"] / "pano_camera00" / "old.png.png",
+    panorama_paths, camera, image_names = import_equirectangular_panorama_images(
+        input_dir,
+        image_dir,
     )
 
+    assert [path.name for path in panorama_paths] == ["a.png", "b.jpg"]
+    assert camera.model == "EQUIRECTANGULAR"
+    assert camera.params == (16.0, 8.0)
+    assert image_names == ["a.png", "nested/b.jpg"]
+    assert os.path.samefile(input_dir / "a.png", image_dir / "a.png")
+    assert os.path.samefile(nested_dir / "b.jpg", image_dir / "nested" / "b.jpg")
 
-def test_initial_session_tree_copy_falls_back_when_hardlink_fails(
+
+def test_native_equirectangular_import_symlinks_when_hardlink_fails(
     tmp_path,
     monkeypatch,
 ) -> None:
-    source = tmp_path / "source"
-    destination = tmp_path / "destination"
-    source.mkdir()
-    source_file = source / "image.png"
-    source_file.write_bytes(b"image")
+    input_dir = tmp_path / "input"
+    image_dir = tmp_path / "workspace" / "images"
+    input_dir.mkdir()
+    source_image = input_dir / "a.png"
+    Image.new("RGB", (16, 8), color=(255, 0, 0)).save(source_image)
 
     def raise_cross_device_link(_source, _destination):
         raise OSError("cross-device link")
 
     monkeypatch.setattr("colmap.panorama_reconstruct.os.link", raise_cross_device_link)
 
-    copytree_hardlink_or_copy(source, destination)
+    import_equirectangular_panorama_images(input_dir, image_dir)
 
-    destination_file = destination / "image.png"
-    assert destination_file.read_bytes() == b"image"
-    assert not os.path.samefile(source_file, destination_file)
-
-
-def test_initial_panorama_session_must_match_current_render_options(tmp_path) -> None:
-    workspace = tmp_path / "previous"
-    previous_options = default_render_options("non-overlapping")
-    create_previous_panorama_session(workspace, options=previous_options)
-    session = resolve_initial_panorama_session(workspace)
-    current_options = PanoramaRenderOptions(
-        num_yaw_steps=previous_options.num_yaw_steps,
-        pitches=previous_options.pitches,
-        width=previous_options.width + 1,
-        height=previous_options.height,
-        fov_x=previous_options.fov_x,
-        fov_y=previous_options.fov_y,
-    )
-
-    with pytest.raises(ValueError, match="render settings do not match"):
-        validate_initial_session_compatible(
-            session,
-            current_options,
-            VirtualImageOutputOptions(save_workers=1),
-        )
+    imported_image = image_dir / "a.png"
+    assert imported_image.is_symlink()
+    assert os.path.samefile(source_image, imported_image)
 
 
-def test_initial_session_report_marks_existing_poses_fixed(tmp_path) -> None:
-    workspace = tmp_path / "previous"
-    create_previous_panorama_session(workspace)
-    session = resolve_initial_panorama_session(workspace)
-    paths = {"initial_sparse": tmp_path / "continued" / "initial_sparse"}
-    metadata = {
-        "views": [
-            {"index": view.index, "image_prefix": view.image_prefix}
-            for view in build_rig_views(default_render_options("non-overlapping"))
-        ],
-    }
+def test_native_equirectangular_import_rejects_mixed_sizes(tmp_path) -> None:
+    input_dir = tmp_path / "input"
+    image_dir = tmp_path / "workspace" / "images"
+    input_dir.mkdir()
+    Image.new("RGB", (16, 8)).save(input_dir / "a.png")
+    Image.new("RGB", (32, 16)).save(input_dir / "b.png")
 
-    report = build_initial_session_report(session, paths, metadata)
-
-    assert report["copied_model_preserves_rig_frames"] is True
-    assert report["existing_camera_poses_refinable"] is False
-    assert report["intrinsics_refinable"] is False
+    with pytest.raises(ValueError, match="expected 16x8"):
+        import_equirectangular_panorama_images(input_dir, image_dir)
 
 
-def test_overlapping_preset_builds_fixed_virtual_camera_rig() -> None:
-    options = default_render_options("overlapping")
+def test_panorama_image_paths_sort_by_filename_timestamp(tmp_path) -> None:
+    input_dir = tmp_path / "panos"
+    input_dir.mkdir()
+    for name in (
+        "plain-b.png",
+        "shelf-2000000000000_00000001.png",
+        "shelf-1000000000000_00000002.png",
+        "plain-a.png",
+    ):
+        (input_dir / name).write_bytes(b"image")
 
-    views = build_rig_views(options)
-
-    assert len(views) == 12
-    assert views[0].image_prefix == "pano_camera00/"
-    assert views[-1].image_prefix == "pano_camera11/"
-    assert all(view.cam_from_pano_rotation.shape == (3, 3) for view in views)
-
-
-def test_non_overlapping_preset_builds_four_equatorial_views() -> None:
-    options = default_render_options("non-overlapping")
-
-    views = build_rig_views(options)
-
-    assert len(views) == 4
-    assert [view.pitch for view in views] == [0.0, 0.0, 0.0, 0.0]
-    assert [view.yaw for view in views] == pytest.approx([0.0, pi / 2, -pi, -pi / 2])
-
-
-def test_rig_view_masks_are_binary_and_match_camera_shape() -> None:
-    options = default_render_options("non-overlapping")
-    views = build_rig_views(options)
-    camera = camera_from_fov(width=32, height=24, fov_x=pi / 2, fov_y=pi / 2)
-
-    masks = rig_view_masks(camera, views)
-
-    assert set(masks) == {0, 1, 2, 3}
-    for mask in masks.values():
-        assert mask.shape == (24, 32)
-        assert mask.dtype == np.uint8
-        assert set(np.unique(mask)).issubset({0, 255})
-
-
-def test_overlapping_rig_masks_assign_every_virtual_camera() -> None:
-    options = default_render_options("overlapping")
-    views = build_rig_views(options)
-    camera = camera_from_fov(
-        width=64,
-        height=64,
-        fov_x=options.fov_x,
-        fov_y=options.fov_y,
-    )
-
-    masks = rig_view_masks(camera, views)
-    validate_rig_masks(camera, views, masks)
-
-    assert len(masks) == 12
-    for mask in masks.values():
-        assert np.count_nonzero(mask) > 0
-        assert mask[camera.height // 2, camera.width // 2] == 255
-
-
-def test_validate_rig_masks_rejects_empty_virtual_camera() -> None:
-    options = default_render_options("non-overlapping")
-    views = build_rig_views(options)
-    camera = camera_from_fov(width=32, height=24, fov_x=pi / 2, fov_y=pi / 2)
-    masks = rig_view_masks(camera, views)
-    masks[2] = np.zeros_like(masks[2])
-
-    with pytest.raises(ValueError, match="Mask 2 is empty"):
-        validate_rig_masks(camera, views, masks)
-
-
-def test_mask_statistics_reports_active_fraction() -> None:
-    masks = {
-        0: np.asarray([[0, 255], [0, 255]], dtype=np.uint8),
-        1: np.full((2, 2), 255, dtype=np.uint8),
-    }
-
-    stats = mask_statistics(masks)
-
-    assert stats["0"] == {"active_pixels": 2, "active_fraction": 0.5}
-    assert stats["1"] == {"active_pixels": 4, "active_fraction": 1.0}
-
-
-def test_feature_health_summary_identifies_zero_feature_camera() -> None:
-    views = build_rig_views(default_render_options("non-overlapping"))
-    report = {
-        view.image_prefix.rstrip("/"): {"total_features": 10}
-        for view in views
-    }
-    report["pano_camera02"]["total_features"] = 0
-
-    health = feature_health_summary(views, report)
-
-    assert health["virtual_camera_count"] == 4
-    assert health["virtual_cameras_with_features"] == 3
-    assert health["zero_feature_virtual_cameras"] == ["pano_camera02"]
-
-
-def test_seeded_camera_ids_are_reused_by_virtual_camera_prefix(tmp_path) -> None:
-    database_path = tmp_path / "database.db"
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            "CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
-        )
-        connection.executemany(
-            "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
-            [
-                (1, "pano_camera00/old.png", 1),
-                (2, "pano_camera01/old.png", 2),
-            ],
-        )
-    views = build_rig_views(
-        PanoramaRenderOptions(
-            num_yaw_steps=2,
-            pitches=(0.0,),
-            width=8,
-            height=8,
-            fov_x=pi / 2,
-            fov_y=pi / 2,
-        )
-    )
-
-    camera_ids = read_camera_ids_by_prefix(database_path, views)
-    with sqlite3.connect(database_path) as connection:
-        connection.executemany(
-            "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
-            [
-                (3, "pano_camera00/img-0002_new.png", 13),
-                (4, "pano_camera01/img-0002_new.png", 14),
-            ],
-        )
-    assign_camera_ids_by_prefix(database_path, camera_ids)
-
-    with sqlite3.connect(database_path) as connection:
-        rows = connection.execute(
-            "SELECT name, camera_id FROM images ORDER BY image_id"
-        ).fetchall()
-    assert rows == [
-        ("pano_camera00/old.png", 1),
-        ("pano_camera01/old.png", 2),
-        ("pano_camera00/img-0002_new.png", 1),
-        ("pano_camera01/img-0002_new.png", 2),
+    assert [path.name for path in panorama_image_paths(input_dir)] == [
+        "shelf-1000000000000_00000002.png",
+        "shelf-2000000000000_00000001.png",
+        "plain-a.png",
+        "plain-b.png",
     ]
 
 
-def test_generated_virtual_image_batch_preserves_database_identity(tmp_path) -> None:
+def test_write_equirectangular_metadata_records_native_images(tmp_path) -> None:
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    panorama_paths = [input_dir / "a.png", input_dir / "b.png"]
+    path = tmp_path / "panorama_equirectangular_config.json"
+
+    write_equirectangular_metadata(
+        path,
+        input_dir,
+        camera_from_equirectangular(16, 8),
+        panorama_paths,
+        ["a.png", "b.png"],
+        image_limit=None,
+        relative_name_prefix=None,
+    )
+
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    assert metadata["camera_setup"] == NATIVE_CAMERA_SETUP
+    assert metadata["camera"]["model"] == "EQUIRECTANGULAR"
+    assert metadata["import_options"]["copy_backend"] == "hardlink_or_symlink"
+    assert metadata["panorama_images"][0]["colmap_image_name"] == "a.png"
+    assert "views" not in metadata
+
+
+def test_generated_image_batch_preserves_database_identity(tmp_path) -> None:
     database_path = tmp_path / "database.db"
     with sqlite3.connect(database_path) as connection:
         connection.execute(
@@ -384,58 +174,61 @@ def test_generated_virtual_image_batch_preserves_database_identity(tmp_path) -> 
         )
         connection.executemany(
             "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
-            [
-                (7, "pano_camera00/img-0002_shelf.png", 1),
-                (9, "pano_camera01/img-0002_shelf.png", 2),
-                (3, "pano_camera00/old.png", 1),
-            ],
+            [(7, "a.png", 1), (9, "b.png", 1), (3, "old.png", 1)],
         )
 
-    batch = read_generated_virtual_image_batch(
-        database_path,
-        (
-            "pano_camera00/img-0002_shelf.png",
-            "pano_camera01/img-0002_shelf.png",
-        ),
-    )
+    batch = read_generated_image_batch(database_path, ("a.png", "b.png"))
 
-    assert batch.names == (
-        "pano_camera00/img-0002_shelf.png",
-        "pano_camera01/img-0002_shelf.png",
-    )
+    assert batch.names == ("a.png", "b.png")
     assert batch.image_ids == [7, 9]
-    assert batch.camera_ids == [1, 2]
+    assert batch.camera_ids == [1, 1]
+    assert read_image_records_by_name(database_path, ("a.png",)) == {"a.png": (7, 1)}
 
 
-def test_panorama_report_includes_new_database_images(tmp_path) -> None:
-    class FakeReconstruction:
-        def num_images(self):
-            return 2
+def test_read_feature_stats_by_database_camera(tmp_path) -> None:
+    database_path = tmp_path / "database.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
+            [(1, "a.png", 1), (2, "b.png", 1)],
+        )
+        connection.executemany(
+            "INSERT INTO keypoints(image_id, rows) VALUES (?, ?)",
+            [(1, 12), (2, 8)],
+        )
 
-        def num_reg_images(self):
-            return 2
+    stats = read_feature_stats_by_database_camera(database_path)
 
-        def num_points3D(self):
-            return 5
+    assert stats == {
+        "camera_1": {
+            "image_count": 2,
+            "total_features": 20,
+            "mean_features_per_image": 10.0,
+        }
+    }
 
-        def compute_num_observations(self):
-            return 10
 
-        def compute_mean_observations_per_reg_image(self):
-            return 5.0
+def test_equirectangular_feature_health_summary_identifies_zero_feature_camera() -> None:
+    health = equirectangular_feature_health_summary(
+        {
+            "camera_1": {"image_count": 2, "total_features": 20},
+            "camera_2": {"image_count": 1, "total_features": 0},
+        },
+        expected_image_count=3,
+    )
 
-        def compute_mean_track_length(self):
-            return 2.0
+    assert health["camera_setup"] == NATIVE_CAMERA_SETUP
+    assert health["panorama_images_with_features"] == 3
+    assert health["zero_feature_cameras"] == ["camera_2"]
 
-        def compute_mean_reprojection_error(self):
-            return 0.5
 
-        def num_frames(self):
-            return 1
-
-        def num_reg_frames(self):
-            return 1
-
+def test_panorama_report_marks_native_equirectangular_camera(tmp_path) -> None:
     database_path = tmp_path / "database.db"
     with sqlite3.connect(database_path) as connection:
         connection.execute(
@@ -443,61 +236,34 @@ def test_panorama_report_includes_new_database_images(tmp_path) -> None:
         )
         connection.executemany(
             "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
-            [
-                (1, "pano_camera00/old.png", 1),
-                (2, "pano_camera01/old.png", 2),
-                (7, "pano_camera00/img-0002_shelf.png", 1),
-                (9, "pano_camera01/img-0002_shelf.png", 2),
-            ],
+            [(1, "a.png", 1), (2, "b.png", 1)],
         )
     paths = {
         "workspace": tmp_path,
         "image_dir": tmp_path / "images",
-        "mask_dir": tmp_path / "masks",
         "database": database_path,
         "sparse": tmp_path / "sparse",
-        "initial_sparse": tmp_path / "initial_sparse",
         "best_sparse": tmp_path / "sparse_best",
         "raw_ply": tmp_path / "cloud_colmap_raw.ply",
-        "rig_metadata": tmp_path / "panorama_rig_config.json",
+        "metadata": tmp_path / "panorama_equirectangular_config.json",
     }
-    options = PanoramaRenderOptions(
-        num_yaw_steps=2,
-        pitches=(0.0,),
-        width=8,
-        height=8,
-        fov_x=pi / 2,
-        fov_y=pi / 2,
-    )
-    views = build_rig_views(options)
-    batch = GeneratedVirtualImageBatch(
-        names=(
-            "pano_camera00/img-0002_shelf.png",
-            "pano_camera01/img-0002_shelf.png",
-        ),
-        records_by_name={
-            "pano_camera00/img-0002_shelf.png": (7, 1),
-            "pano_camera01/img-0002_shelf.png": (9, 2),
-        },
+    batch = GeneratedImageBatch(
+        names=("a.png", "b.png"),
+        records_by_name={"a.png": (1, 1), "b.png": (2, 1)},
     )
 
     report = build_panorama_report(
         pycolmap_version="test",
-        input_image_path=tmp_path / "img-0002",
+        input_image_path=tmp_path / "input",
         paths=paths,
-        camera=camera_from_fov(8, 8, pi / 2, pi / 2),
-        views=views,
-        panorama_count=1,
+        camera=camera_from_equirectangular(16, 8),
+        panorama_count=2,
         matcher="sequential",
-        match_scope="all",
-        last_k_frames=20,
-        top_k_frames=0,
         overlap=15,
         loop_detection=True,
         vocab_tree_path=None,
         ssl_cert_file=None,
         feature_options=FeaturePipelineOptions(),
-        output_options=VirtualImageOutputOptions(save_workers=1),
         execution={
             "requested_device": "auto",
             "resolved_device": "cpu",
@@ -506,44 +272,29 @@ def test_panorama_report_includes_new_database_images(tmp_path) -> None:
             "gpu_bundle_adjustment": False,
             "bundle_adjustment_gpu_index": "-1",
         },
-        masks_report={},
-        feature_report={},
-        feature_health={},
+        feature_report={"camera_1": {"image_count": 2, "total_features": 20}},
+        feature_health={
+            "camera_setup": NATIVE_CAMERA_SETUP,
+            "panorama_images_with_features": 2,
+            "expected_panorama_images": 2,
+        },
         image_limit=None,
-        new_image_prefix=Path("img-0002"),
         generated_image_batch=batch,
-        new_frame_sets=[],
-        selected_recent_frame_sets=[],
-        selected_keyframe_frame_sets=[],
-        selected_old_frame_sets=[],
-        selected_keyframe_score_reports=[],
-        keyframe_score_source=None,
-        matching_pair_count=None,
-        match_pairs_path=None,
-        initial_session=None,
-        initial_metadata=None,
-        reconstructions={0: FakeReconstruction()},
+        reconstructions={0: FakeReconstructionStats()},
         best_model_id=0,
-        best_reconstruction=FakeReconstruction(),
+        best_reconstruction=FakeReconstructionStats(),
         keyframe_scores=[],
     )
 
-    assert report["database_image_count"] == 4
-    assert report["options"]["match_scope"] == "all"
-    assert report["options"]["effective_pairing"] == "sequential"
-    assert report["options"]["top_k_frames"] == 0
-    assert report["selected_recent_frame_ids"] == []
-    assert report["selected_keyframe_ids"] == []
-    assert report["keyframe_score_count"] == 0
-    assert report["keyframe_scores"] == []
-    assert report["old_database_image_count"] == 2
-    assert report["new_database_image_count"] == 2
-    assert report["new_database_image_ids"] == [7, 9]
-    assert report["new_database_camera_ids"] == [1, 2]
-    assert report["new_database_image_names"] == [
-        "pano_camera00/img-0002_shelf.png",
-        "pano_camera01/img-0002_shelf.png",
-    ]
+    assert report["camera_setup"] == NATIVE_CAMERA_SETUP
+    assert report["camera"]["model"] == "EQUIRECTANGULAR"
+    assert report["camera"]["params"] == [16.0, 8.0]
+    assert report["metadata_path"].endswith("panorama_equirectangular_config.json")
+    assert report["options"]["camera_mode"] == "SINGLE"
+    assert report["options"]["rig_verification"] is False
+    assert report["generated_image_count"] == 2
+    assert "virtual_camera_count" not in report
+    assert "features_by_virtual_camera" not in report
 
 
 def test_score_keyframe_anchors_reports_quality_components(tmp_path) -> None:
@@ -571,10 +322,10 @@ def test_score_keyframe_anchors_reports_quality_components(tmp_path) -> None:
     class FakeReconstruction:
         def __init__(self):
             self._images = {
-                1: FakeImage(1, 10, "pano_camera00/a.png", [101, 102, -1]),
-                2: FakeImage(2, 10, "pano_camera01/a.png", [103]),
-                3: FakeImage(3, 11, "pano_camera00/b.png", [201]),
-                4: FakeImage(4, 11, "pano_camera01/b.png", [202]),
+                1: FakeImage(1, 10, "a.png", [101, 102, -1]),
+                2: FakeImage(2, 10, "b.png", [103]),
+                3: FakeImage(3, 11, "c.png", [201]),
+                4: FakeImage(4, 11, "d.png", [202]),
             }
             self.points3D = {
                 101: FakePoint3D(0.5),
@@ -611,8 +362,7 @@ def test_score_keyframe_anchors_reports_quality_components(tmp_path) -> None:
     scores = score_keyframe_anchors(
         database_path,
         FakeReconstruction(),
-        total_virtual_camera_count=2,
-        min_active_camera_points=1,
+        min_active_image_points=1,
         connectivity_frame_cap=2,
         verified_inlier_cap=100,
         triangulated_point_cap=10,
@@ -623,340 +373,13 @@ def test_score_keyframe_anchors_reports_quality_components(tmp_path) -> None:
     assert score_by_frame[10].connected_frame_count == 1
     assert score_by_frame[10].verified_inlier_count == 120
     assert score_by_frame[10].triangulated_point_count == 3
-    assert score_by_frame[10].active_virtual_camera_count == 2
-    assert score_by_frame[10].fov_distribution_score > 0.9
+    assert score_by_frame[10].active_image_count == 2
+    assert score_by_frame[10].image_distribution_score > 0.9
     assert score_by_frame[10].median_reprojection_error_px == 1.0
     assert score_by_frame[10].anchor_score > 0.0
 
 
-def test_last_k_frame_selection_excludes_generated_frames(tmp_path) -> None:
-    database_path = tmp_path / "database.db"
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            "CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
-        )
-        connection.execute(
-            "CREATE TABLE frames(frame_id INTEGER PRIMARY KEY, rig_id INTEGER)"
-        )
-        connection.execute(
-            """
-            CREATE TABLE frame_data(
-                frame_id INTEGER,
-                data_id INTEGER,
-                sensor_id INTEGER,
-                sensor_type INTEGER
-            )
-            """
-        )
-        connection.executemany(
-            "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
-            [
-                (1, "pano_camera00/old-1.png", 1),
-                (2, "pano_camera01/old-1.png", 2),
-                (3, "pano_camera00/old-2.png", 1),
-                (4, "pano_camera01/old-2.png", 2),
-                (5, "pano_camera00/old-3.png", 1),
-                (6, "pano_camera01/old-3.png", 2),
-                (7, "pano_camera00/new.png", 1),
-                (8, "pano_camera01/new.png", 2),
-            ],
-        )
-        connection.executemany(
-            "INSERT INTO frames(frame_id, rig_id) VALUES (?, 13)",
-            [(10,), (11,), (12,), (13,)],
-        )
-        connection.executemany(
-            """
-            INSERT INTO frame_data(frame_id, data_id, sensor_id, sensor_type)
-            VALUES (?, ?, ?, 0)
-            """,
-            [
-                (10, 1, 1),
-                (10, 2, 2),
-                (11, 3, 1),
-                (11, 4, 2),
-                (12, 5, 1),
-                (12, 6, 2),
-                (13, 7, 1),
-                (13, 8, 2),
-            ],
-        )
-
-    new_frames = read_rig_frame_image_sets_for_images(database_path, [7, 8])
-    old_frames = read_last_old_rig_frame_image_sets(
-        database_path,
-        excluded_image_ids=[7, 8],
-        limit=2,
-    )
-
-    assert [frame.frame_id for frame in new_frames] == [13]
-    assert [frame.frame_id for frame in old_frames] == [11, 12]
-    assert [frame.image_ids for frame in old_frames] == [(3, 4), (5, 6)]
-
-
-def test_last_k_match_pairs_use_new_overlap_and_old_anchors() -> None:
-    new_frames = [
-        RigFrameImageSet(20, (20, 21), ("new-a-0.png", "new-a-1.png")),
-        RigFrameImageSet(21, (22, 23), ("new-b-0.png", "new-b-1.png")),
-        RigFrameImageSet(22, (24, 25), ("new-c-0.png", "new-c-1.png")),
-    ]
-    old_frames = [
-        RigFrameImageSet(10, (10, 11), ("old-a-0.png", "old-a-1.png")),
-    ]
-
-    pairs = build_last_k_match_pairs(
-        new_frames,
-        old_frames,
-        new_frame_overlap=1,
-    )
-
-    assert len(pairs) == 20
-    assert ("new-a-0.png", "new-b-0.png") in pairs
-    assert ("new-b-1.png", "new-c-1.png") in pairs
-    assert ("new-a-0.png", "new-c-0.png") not in pairs
-    assert ("old-a-0.png", "new-a-0.png") in pairs
-    assert ("old-a-1.png", "new-c-1.png") in pairs
-
-
-def test_top_keyframe_selection_uses_score_order_and_database_frames(tmp_path) -> None:
-    database_path = tmp_path / "database.db"
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            "CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
-        )
-        connection.execute(
-            "CREATE TABLE frames(frame_id INTEGER PRIMARY KEY, rig_id INTEGER)"
-        )
-        connection.execute(
-            """
-            CREATE TABLE frame_data(
-                frame_id INTEGER,
-                data_id INTEGER,
-                sensor_id INTEGER,
-                sensor_type INTEGER
-            )
-            """
-        )
-        connection.executemany(
-            "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
-            [
-                (1, "pano_camera00/old-a.png", 1),
-                (2, "pano_camera01/old-a.png", 2),
-                (3, "pano_camera00/old-b.png", 1),
-                (4, "pano_camera01/old-b.png", 2),
-                (5, "pano_camera00/new.png", 1),
-            ],
-        )
-        connection.executemany(
-            "INSERT INTO frames(frame_id, rig_id) VALUES (?, 13)",
-            [(10,), (11,), (12,)],
-        )
-        connection.executemany(
-            """
-            INSERT INTO frame_data(frame_id, data_id, sensor_id, sensor_type)
-            VALUES (?, ?, ?, 0)
-            """,
-            [(10, 1, 1), (10, 2, 2), (11, 3, 1), (11, 4, 2), (12, 5, 1)],
-        )
-    report_path = tmp_path / "panorama_rig_report.json"
-    report_path.write_text(
-        json.dumps(
-            {
-                "keyframe_scores": [
-                    {"frame_id": 11, "anchor_score": 0.4},
-                    {"frame_id": 10, "anchor_score": 0.9},
-                    {"frame_id": 12, "anchor_score": 1.0},
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    score_reports = read_keyframe_score_reports(report_path)
-    selected_frames, selected_scores = select_top_keyframe_frame_sets(
-        database_path,
-        score_reports,
-        excluded_image_ids=[5],
-        limit=2,
-    )
-
-    assert [score["frame_id"] for score in score_reports] == [12, 10, 11]
-    assert [frame.frame_id for frame in selected_frames] == [10, 11]
-    assert [score["frame_id"] for score in selected_scores] == [10, 11]
-
-
-def test_combine_anchor_frame_sets_keeps_recent_order_and_deduplicates() -> None:
-    recent_frames = [
-        RigFrameImageSet(12, (12,), ("recent-a.png",)),
-        RigFrameImageSet(13, (13,), ("recent-b.png",)),
-    ]
-    keyframe_frames = [
-        RigFrameImageSet(13, (13,), ("recent-b.png",)),
-        RigFrameImageSet(4, (4,), ("keyframe.png",)),
-    ]
-
-    combined = combine_anchor_frame_sets(recent_frames, keyframe_frames)
-
-    assert [frame.frame_id for frame in combined] == [12, 13, 4]
-
-
-def test_seeded_generated_frames_are_moved_into_existing_rig(tmp_path) -> None:
-    database_path = tmp_path / "database.db"
-    with sqlite3.connect(database_path) as connection:
-        connection.execute("CREATE TABLE cameras(camera_id INTEGER PRIMARY KEY)")
-        connection.execute(
-            """
-            CREATE TABLE images(
-                image_id INTEGER PRIMARY KEY,
-                name TEXT,
-                camera_id INTEGER
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE rigs(
-                rig_id INTEGER PRIMARY KEY,
-                ref_sensor_id INTEGER,
-                ref_sensor_type INTEGER
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE rig_sensors(
-                rig_id INTEGER,
-                sensor_id INTEGER,
-                sensor_type INTEGER,
-                sensor_from_rig BLOB
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE frames(
-                frame_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                rig_id INTEGER
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE frame_data(
-                frame_id INTEGER,
-                data_id INTEGER,
-                sensor_id INTEGER,
-                sensor_type INTEGER
-            )
-            """
-        )
-        connection.executemany(
-            "INSERT INTO cameras(camera_id) VALUES (?)",
-            [(1,), (2,), (13,), (14,)],
-        )
-        connection.executemany(
-            "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
-            [
-                (1, "pano_camera00/old.png", 1),
-                (2, "pano_camera01/old.png", 2),
-                (3, "pano_camera00/img-0001_shelf.png", 13),
-                (4, "pano_camera01/img-0001_shelf.png", 14),
-            ],
-        )
-        connection.executemany(
-            "INSERT INTO rigs(rig_id, ref_sensor_id, ref_sensor_type) VALUES (?, ?, 0)",
-            [(13, 1), (14, 13), (15, 14)],
-        )
-        connection.execute(
-            "INSERT INTO rig_sensors(rig_id, sensor_id, sensor_type) VALUES (13, 2, 0)"
-        )
-        connection.executemany(
-            "INSERT INTO frames(frame_id, rig_id) VALUES (?, ?)",
-            [(577, 13), (625, 14), (626, 15)],
-        )
-        connection.executemany(
-            """
-            INSERT INTO frame_data(frame_id, data_id, sensor_id, sensor_type)
-            VALUES (?, ?, ?, 0)
-            """,
-            [(577, 1, 1), (577, 2, 2), (625, 3, 13), (626, 4, 14)],
-        )
-    input_dir = tmp_path / "img-0001"
-    panorama_path = input_dir / "shelf.png"
-    input_dir.mkdir()
-    panorama_path.write_bytes(b"image")
-    views = build_rig_views(
-        PanoramaRenderOptions(
-            num_yaw_steps=2,
-            pitches=(0.0,),
-            width=8,
-            height=8,
-            fov_x=pi / 2,
-            fov_y=pi / 2,
-        )
-    )
-    output_options = VirtualImageOutputOptions(save_workers=1)
-    image_names = generated_virtual_image_names(
-        input_dir,
-        [panorama_path],
-        views,
-        output_options,
-        Path("img-0001"),
-    )
-    generated_records = read_image_records_by_name(database_path, image_names)
-    assign_camera_ids_by_prefix(
-        database_path,
-        {"pano_camera00/": 1, "pano_camera01/": 2},
-    )
-
-    replace_generated_frames_with_seed_rig_frames(
-        database_path,
-        input_image_path=input_dir,
-        panorama_paths=[panorama_path],
-        views=views,
-        output_options=output_options,
-        relative_name_prefix=Path("img-0001"),
-        seed_camera_ids={"pano_camera00/": 1, "pano_camera01/": 2},
-        generated_records=generated_records,
-    )
-
-    with sqlite3.connect(database_path) as connection:
-        camera_rows = connection.execute(
-            "SELECT camera_id FROM cameras ORDER BY camera_id"
-        ).fetchall()
-        rig_rows = connection.execute(
-            "SELECT rig_id FROM rigs ORDER BY rig_id"
-        ).fetchall()
-        rows = connection.execute(
-            """
-            SELECT frames.rig_id, frame_data.data_id, frame_data.sensor_id
-            FROM frames
-            JOIN frame_data USING(frame_id)
-            WHERE frame_data.data_id IN (3, 4)
-            ORDER BY frame_data.data_id
-            """
-        ).fetchall()
-    assert camera_rows == [(1,), (2,)]
-    assert rig_rows == [(13,)]
-    assert rows == [(13, 3, 1), (13, 4, 2)]
-
-
-def test_create_rig_config_uses_pinhole_cameras() -> None:
-    pycolmap = pytest.importorskip("pycolmap")
-    options = default_render_options("non-overlapping")
-    views = build_rig_views(options)
-    camera = camera_from_fov(options.width, options.height, options.fov_x, options.fov_y)
-
-    rig_config = create_rig_config(pycolmap, camera, views)
-
-    assert len(rig_config.cameras) == 4
-    assert rig_config.cameras[0].ref_sensor is True
-    assert rig_config.cameras[0].image_prefix == "pano_camera00/"
-    assert rig_config.cameras[0].camera.model_name == "PINHOLE"
-    assert rig_config.cameras[1].cam_from_rig is not None
-
-
-def test_sift_feature_options_preserve_rig_matching_constraints() -> None:
+def test_sift_feature_options_disable_rig_matching_constraints() -> None:
     pycolmap = pytest.importorskip("pycolmap")
     options = FeaturePipelineOptions(
         max_num_features=4096,
@@ -970,8 +393,8 @@ def test_sift_feature_options_preserve_rig_matching_constraints() -> None:
     assert extraction.sift.max_num_features == 4096
     assert matching.type == pycolmap.FeatureMatcherType.SIFT_BRUTEFORCE
     assert matching.guided_matching is True
-    assert matching.rig_verification is True
-    assert matching.skip_image_pairs_in_same_frame is True
+    assert matching.rig_verification is False
+    assert matching.skip_image_pairs_in_same_frame is False
 
 
 def test_gpu_feature_options_propagate_multi_gpu_indices() -> None:
@@ -1085,63 +508,11 @@ def test_mapper_options_enable_gpu_bundle_adjustment() -> None:
     assert options.ba_refine_focal_length is False
 
 
-def test_mapper_options_disable_multiple_models_when_continuing_seed() -> None:
-    pycolmap = pytest.importorskip("pycolmap")
-    execution = {
-        "gpu_bundle_adjustment": False,
-        "bundle_adjustment_gpu_index": "-1",
-    }
-
-    options = create_mapper_options(
-        pycolmap,
-        execution,
-        continue_existing_model=True,
-    )
-
-    assert options.multiple_models is False
-    assert options.max_num_models == 1
-    assert options.fix_existing_frames is True
-    assert options.mapper.fix_existing_frames is True
-
-
-def test_precomputed_rig_remaps_match_existing_renderer() -> None:
-    height, width = 24, 48
-    image = np.arange(height * width * 3, dtype=np.uint8).reshape(height, width, 3)
-    options = PanoramaRenderOptions(
-        num_yaw_steps=2,
-        pitches=(-pi / 6, pi / 6),
-        width=12,
-        height=10,
-        fov_x=pi / 2,
-        fov_y=pi / 2,
-    )
-    views = build_rig_views(options)
-    maps = build_rig_remap_maps(image.shape[:2], options, views)
-    padded = pad_equirectangular_image(image)
-    existing_renderer = EquirectangularToPinhole(image)
-
-    for view in views:
-        expected = existing_renderer.render(
-            height=options.height,
-            width=options.width,
-            longitude=view.yaw,
-            latitude=view.pitch,
-            fov_x=options.fov_x,
-            fov_y=options.fov_y,
-            interpolation=options.interpolation,
-        )
-        actual = render_remapped_view(padded, maps[view.index])
-
-        np.testing.assert_array_equal(actual, expected)
-
-
-def test_sequential_matching_expands_rig_and_enables_loop_detection(
-    tmp_path,
-) -> None:
+def test_sequential_matching_uses_native_image_pairs(tmp_path) -> None:
     class SequentialPairingOptions:
         def __init__(self):
             self.overlap = 0
-            self.expand_rig_images = False
+            self.expand_rig_images = True
             self.loop_detection = False
             self.vocab_tree_path = None
 
@@ -1171,7 +542,6 @@ def test_sequential_matching_expands_rig_and_enables_loop_detection(
         FakePycolmap,
         tmp_path / "database.db",
         matcher="sequential",
-        match_scope="all",
         matching_options=matching_options,
         overlap=25,
         loop_detection=True,
@@ -1180,13 +550,13 @@ def test_sequential_matching_expands_rig_and_enables_loop_detection(
 
     _database, _matching, pairing, device = FakePycolmap.calls[0]
     assert pairing.overlap == 25
-    assert pairing.expand_rig_images is True
+    assert pairing.expand_rig_images is False
     assert pairing.loop_detection is True
     assert pairing.vocab_tree_path == vocab_tree
     assert device == "cpu"
 
 
-def test_last_k_matching_uses_imported_image_pairs(tmp_path) -> None:
+def test_imported_pair_matching_uses_image_pair_file(tmp_path) -> None:
     class ImportedPairingOptions:
         def __init__(self):
             self.match_list_path = None
@@ -1210,14 +580,13 @@ def test_last_k_matching_uses_imported_image_pairs(tmp_path) -> None:
 
     FakePycolmap.ImportedPairingOptions = ImportedPairingOptions
     pair_list = tmp_path / "pairs.txt"
-    pair_list.write_text("a.png b.png\n", encoding="utf-8")
+    write_image_pair_list(pair_list, [("a.png", "b.png")])
     matching_options = object()
 
     match_features(
         FakePycolmap,
         tmp_path / "database.db",
         matcher="sequential",
-        match_scope="last-k",
         matching_options=matching_options,
         overlap=25,
         loop_detection=True,
@@ -1225,13 +594,14 @@ def test_last_k_matching_uses_imported_image_pairs(tmp_path) -> None:
         image_pairs_path=pair_list,
     )
 
+    assert pair_list.read_text(encoding="utf-8") == "a.png b.png\n"
     _database, matching, pairing, device = FakePycolmap.calls[0]
     assert matching is matching_options
     assert pairing.match_list_path == pair_list
     assert device == "cpu"
 
 
-def test_run_incremental_mapping_passes_initial_model_path(tmp_path) -> None:
+def test_run_incremental_mapping_passes_mapper_options(tmp_path) -> None:
     class FakePycolmap:
         calls = []
 
@@ -1244,7 +614,6 @@ def test_run_incremental_mapping_passes_initial_model_path(tmp_path) -> None:
         "database": tmp_path / "database.db",
         "sparse": tmp_path / "sparse",
     }
-    initial_model = tmp_path / "initial_sparse"
     mapper_options = object()
 
     result = run_incremental_mapping(
@@ -1252,354 +621,56 @@ def test_run_incremental_mapping_passes_initial_model_path(tmp_path) -> None:
         paths,
         image_dir=tmp_path / "images",
         mapper_options=mapper_options,
-        initial_model_path=initial_model,
     )
 
     assert result == {"ok": True}
     _database, _images, _sparse, kwargs = FakePycolmap.calls[0]
     assert kwargs["options"] is mapper_options
-    assert kwargs["input_path"] == initial_model
+    assert "input_path" not in kwargs
 
 
 def test_parse_args_accepts_image_limit(tmp_path) -> None:
-    previous = tmp_path / "previous"
-    previous.mkdir()
-
     args = parse_args(
         [
             "--input-image-path",
             str(tmp_path),
             "--image-limit",
             "3",
-            "--initial-session",
-            str(previous),
         ]
     )
 
     assert args.image_limit == 3
-    assert args.initial_session == previous
-    assert args.match_scope == "all"
-    assert args.last_k_frames == 20
-    assert args.top_k_frames == 0
     assert args.loop_detection is True
     assert args.feature_extractor == "sift"
     assert args.feature_matcher == "sift-bruteforce"
-    assert args.virtual_image_format == "png"
-    assert args.png_compression == 1
-    assert args.jpeg_quality == 95
-    assert args.image_save_workers == 12
     assert args.device == "auto"
     assert args.gpu_index == "-1"
     assert args.gpu_bundle_adjustment is True
+    assert not hasattr(args, "initial_session")
+    assert not hasattr(args, "match_scope")
+    assert not hasattr(args, "virtual_image_format")
 
 
-def test_parse_args_accepts_last_k_match_scope(tmp_path) -> None:
-    previous = tmp_path / "previous"
-    previous.mkdir()
-
-    args = parse_args(
-        [
-            "--input-image-path",
-            str(tmp_path),
-            "--initial-session",
-            str(previous),
-            "--match-scope",
-            "last-k",
-            "--last-k-frames",
-            "7",
-        ]
-    )
-
-    assert args.match_scope == "last-k"
-    assert args.last_k_frames == 7
-
-
-def test_parse_args_accepts_top_k_match_scope(tmp_path) -> None:
-    previous = tmp_path / "previous"
-    previous.mkdir()
-
-    args = parse_args(
-        [
-            "--input-image-path",
-            str(tmp_path),
-            "--initial-session",
-            str(previous),
-            "--match-scope",
-            "top-k",
-            "--top-k-frames",
-            "5",
-        ]
-    )
-
-    assert args.match_scope == "top-k"
-    assert args.top_k_frames == 5
-
-
-def test_parse_args_accepts_hybrid_k_with_disabled_recent_or_top_k(tmp_path) -> None:
-    previous = tmp_path / "previous"
-    previous.mkdir()
-
-    top_only = parse_args(
-        [
-            "--input-image-path",
-            str(tmp_path),
-            "--initial-session",
-            str(previous),
-            "--match-scope",
-            "hybrid-k",
-            "--last-k-frames",
-            "0",
-            "--top-k-frames",
-            "3",
-        ]
-    )
-    recent_only = parse_args(
-        [
-            "--input-image-path",
-            str(tmp_path),
-            "--initial-session",
-            str(previous),
-            "--match-scope",
-            "hybrid-k",
-            "--last-k-frames",
-            "3",
-            "--top-k-frames",
-            "0",
-        ]
-    )
-
-    assert top_only.last_k_frames == 0
-    assert top_only.top_k_frames == 3
-    assert recent_only.last_k_frames == 3
-    assert recent_only.top_k_frames == 0
-
-
-def test_parse_args_rejects_last_k_without_initial_session(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "legacy_arg",
+    [
+        "--pano-render-type",
+        "--num-yaw-steps",
+        "--pitches-deg",
+        "--width",
+        "--height",
+        "--fov-x",
+        "--fov-y",
+        "--match-scope",
+        "--last-k-frames",
+        "--top-k-frames",
+        "--virtual-image-format",
+        "--png-compression",
+        "--jpeg-quality",
+        "--image-save-workers",
+        "--initial-session",
+    ],
+)
+def test_parse_args_rejects_legacy_rig_arguments(tmp_path, legacy_arg) -> None:
     with pytest.raises(SystemExit):
-        parse_args(
-            [
-                "--input-image-path",
-                str(tmp_path),
-                "--match-scope",
-                "last-k",
-            ]
-        )
-
-
-def test_parse_args_rejects_empty_top_k_and_hybrid_k(tmp_path) -> None:
-    previous = tmp_path / "previous"
-    previous.mkdir()
-
-    with pytest.raises(SystemExit):
-        parse_args(
-            [
-                "--input-image-path",
-                str(tmp_path),
-                "--initial-session",
-                str(previous),
-                "--match-scope",
-                "top-k",
-            ]
-        )
-    with pytest.raises(SystemExit):
-        parse_args(
-            [
-                "--input-image-path",
-                str(tmp_path),
-                "--initial-session",
-                str(previous),
-                "--match-scope",
-                "hybrid-k",
-                "--last-k-frames",
-                "0",
-                "--top-k-frames",
-                "0",
-            ]
-        )
-
-
-def test_render_panorama_rig_images_respects_image_limit(tmp_path, monkeypatch) -> None:
-    progress_state = {}
-
-    class RecordingProgress:
-        def __init__(self, *, total, desc, unit):
-            progress_state.update(total=total, desc=desc, unit=unit, updates=0)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return None
-
-        def update(self):
-            progress_state["updates"] += 1
-
-    monkeypatch.setattr("colmap.panorama_reconstruct.tqdm", RecordingProgress)
-    input_dir = tmp_path / "panos"
-    image_dir = tmp_path / "images"
-    mask_dir = tmp_path / "masks"
-    input_dir.mkdir()
-    image = np.zeros((16, 32, 3), dtype=np.uint8)
-    Image.fromarray(image).save(input_dir / "b.png")
-    Image.fromarray(image).save(input_dir / "a.png")
-    options = PanoramaRenderOptions(
-        num_yaw_steps=1,
-        pitches=(0.0,),
-        width=8,
-        height=8,
-        fov_x=pi / 2,
-        fov_y=pi / 2,
-    )
-
-    panorama_paths, _camera, views = render_panorama_rig_images(
-        input_image_path=input_dir,
-        output_image_dir=image_dir,
-        mask_dir=mask_dir,
-        options=options,
-        image_limit=1,
-    )
-
-    assert [path.name for path in panorama_paths] == ["a.png"]
-    assert len(views) == 1
-    assert (image_dir / "pano_camera00" / "a.png").exists()
-    assert not (image_dir / "pano_camera00" / "b.png").exists()
-    assert (mask_dir / "pano_camera00" / "a.png.png").exists()
-
-    masks = read_rendered_rig_masks(mask_dir, input_dir, panorama_paths[0], views)
-    assert set(masks) == {0}
-    assert masks[0].shape == (8, 8)
-    assert progress_state == {
-        "total": 1,
-        "desc": "Rendering virtual pinhole views",
-        "unit": "view",
-        "updates": 1,
-    }
-
-
-def test_panorama_image_paths_sort_by_filename_timestamp(tmp_path) -> None:
-    input_dir = tmp_path / "panos"
-    input_dir.mkdir()
-    for name in (
-        "plain-b.png",
-        "shelf-2000000000000_00000001.png",
-        "shelf-1000000000000_00000002.png",
-        "plain-a.png",
-    ):
-        (input_dir / name).write_bytes(b"image")
-
-    assert [path.name for path in panorama_image_paths(input_dir)] == [
-        "shelf-1000000000000_00000002.png",
-        "shelf-2000000000000_00000001.png",
-        "plain-a.png",
-        "plain-b.png",
-    ]
-
-
-def test_render_panorama_rig_images_rejects_existing_seeded_views(tmp_path) -> None:
-    input_dir = tmp_path / "panos"
-    image_dir = tmp_path / "images"
-    mask_dir = tmp_path / "masks"
-    input_dir.mkdir()
-    (image_dir / "pano_camera00").mkdir(parents=True)
-    (mask_dir / "pano_camera00").mkdir(parents=True)
-    image = np.zeros((16, 32, 3), dtype=np.uint8)
-    Image.fromarray(image).save(input_dir / "pano.png")
-    (image_dir / "pano_camera00" / "pano.png").write_bytes(b"old")
-    options = PanoramaRenderOptions(
-        num_yaw_steps=1,
-        pitches=(0.0,),
-        width=8,
-        height=8,
-        fov_x=pi / 2,
-        fov_y=pi / 2,
-    )
-
-    with pytest.raises(FileExistsError, match="overwrite previous session files"):
-        render_panorama_rig_images(
-            input_image_path=input_dir,
-            output_image_dir=image_dir,
-            mask_dir=mask_dir,
-            options=options,
-            fail_on_existing=True,
-        )
-
-
-def test_render_panorama_rig_images_can_namespace_seeded_views(tmp_path) -> None:
-    input_dir = tmp_path / "img-0001"
-    image_dir = tmp_path / "images"
-    mask_dir = tmp_path / "masks"
-    input_dir.mkdir()
-    (image_dir / "pano_camera00").mkdir(parents=True)
-    (mask_dir / "pano_camera00").mkdir(parents=True)
-    image = np.zeros((16, 32, 3), dtype=np.uint8)
-    Image.fromarray(image).save(input_dir / "shelf.png")
-    (image_dir / "pano_camera00" / "shelf.png").write_bytes(b"old")
-    options = PanoramaRenderOptions(
-        num_yaw_steps=1,
-        pitches=(0.0,),
-        width=8,
-        height=8,
-        fov_x=pi / 2,
-        fov_y=pi / 2,
-    )
-
-    panorama_paths, _camera, views = render_panorama_rig_images(
-        input_image_path=input_dir,
-        output_image_dir=image_dir,
-        mask_dir=mask_dir,
-        options=options,
-        fail_on_existing=True,
-        relative_name_prefix=Path(input_dir.name),
-    )
-
-    assert (image_dir / "pano_camera00" / "shelf.png").read_bytes() == b"old"
-    assert (image_dir / "pano_camera00" / "img-0001_shelf.png").exists()
-    masks = read_rendered_rig_masks(
-        mask_dir,
-        input_dir,
-        panorama_paths[0],
-        views,
-        relative_name_prefix=Path(input_dir.name),
-    )
-    assert masks[0].shape == (8, 8)
-
-
-def test_render_panorama_rig_images_supports_jpeg_output(tmp_path) -> None:
-    input_dir = tmp_path / "panos"
-    image_dir = tmp_path / "images"
-    mask_dir = tmp_path / "masks"
-    input_dir.mkdir()
-    image = np.zeros((16, 32, 3), dtype=np.uint8)
-    Image.fromarray(image).save(input_dir / "pano.png")
-    render_options = PanoramaRenderOptions(
-        num_yaw_steps=1,
-        pitches=(0.0,),
-        width=8,
-        height=8,
-        fov_x=pi / 2,
-        fov_y=pi / 2,
-    )
-    output_options = VirtualImageOutputOptions(
-        image_format="jpeg",
-        jpeg_quality=95,
-        save_workers=1,
-    )
-
-    panorama_paths, _camera, views = render_panorama_rig_images(
-        input_image_path=input_dir,
-        output_image_dir=image_dir,
-        mask_dir=mask_dir,
-        options=render_options,
-        output_options=output_options,
-    )
-
-    assert (image_dir / "pano_camera00" / "pano.jpg").exists()
-    assert (mask_dir / "pano_camera00" / "pano.jpg.png").exists()
-    masks = read_rendered_rig_masks(
-        mask_dir,
-        input_dir,
-        panorama_paths[0],
-        views,
-        output_options,
-    )
-    assert masks[0].shape == (8, 8)
+        parse_args(["--input-image-path", str(tmp_path), legacy_arg, "1"])

@@ -12,7 +12,7 @@ class ColmapCamera:
     model: str
     width: int
     height: int
-    params: tuple[float, float, float, float]
+    params: tuple[float, ...]
     fov_x: float | None = None
     fov_y: float | None = None
 
@@ -21,12 +21,17 @@ class ColmapCamera:
         return ",".join(f"{value:.12g}" for value in self.params)
 
     def report(self) -> dict[str, Any]:
+        params_order = (
+            ["width", "height"]
+            if self.model == "EQUIRECTANGULAR"
+            else ["fx", "fy", "cx", "cy"]
+        )
         return {
             "model": self.model,
             "width": self.width,
             "height": self.height,
             "params": list(self.params),
-            "params_order": ["fx", "fy", "cx", "cy"],
+            "params_order": params_order,
             "fov_x": self.fov_x,
             "fov_y": self.fov_y,
             "shared_single_camera": True,
@@ -85,6 +90,17 @@ def camera_from_intrinsics(
         width=width,
         height=height,
         params=(fx, fy, cx, cy),
+    )
+
+
+def camera_from_equirectangular(width: int, height: int) -> ColmapCamera:
+    validate_positive_int(width, "width")
+    validate_positive_int(height, "height")
+    return ColmapCamera(
+        model="EQUIRECTANGULAR",
+        width=width,
+        height=height,
+        params=(float(width), float(height)),
     )
 
 
