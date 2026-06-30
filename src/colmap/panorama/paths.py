@@ -17,6 +17,7 @@ def panorama_workspace_paths(workspace: Path) -> dict[str, Path]:
         "report": workspace / "panorama_equirectangular_report.json",
         "import_report": workspace / "panorama_equirectangular_import_report.json",
         "feature_report": workspace / "panorama_equirectangular_feature_report.json",
+        "cluster_report": workspace / "panorama_keyframe_cluster_report.json",
         "metadata": workspace / "panorama_equirectangular_config.json",
         "match_pairs": workspace / "match_pairs.txt",
     }

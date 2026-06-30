@@ -7,6 +7,8 @@ import pytest
 from PIL import Image
 
 from colmap.camera import camera_from_equirectangular
+from colmap.panorama import cluster_pipeline as panorama_cluster_pipeline
+from colmap.panorama import cli_clusters as panorama_cli_clusters
 from colmap.panorama import cli_features as panorama_cli_features
 from colmap.panorama import feature_pipeline as panorama_feature_pipeline
 from colmap.panorama import pipeline as panorama_pipeline
@@ -17,13 +19,25 @@ from colmap.panorama_reconstruct import (
     FeaturePipelineOptions,
     FeatureShardExtractionResult,
     GeneratedImageBatch,
+    KeyframeCluster,
+    KeyframePairPlan,
+    KeyframeSelectionOptions,
     NATIVE_CAMERA_SETUP,
     PipelineExecutionOptions,
+    build_backbone_pairs_for_policy,
+    build_interval_keyframe_pair_plan,
+    build_interval_keyframes,
+    build_keyframe_pair_plan,
     build_panorama_report,
+    build_sequential_backbone_pairs,
+    build_sequential_vocabtree_clusters,
+    build_sequential_vocabtree_pair_plan,
+    build_vocabtree_candidate_pairs,
     configure_ssl_cert_file,
     create_feature_extraction_options,
     create_feature_matching_options,
     create_mapper_options,
+    deduplicate_image_pairs,
     equirectangular_feature_health_summary,
     extract_panorama_features_to_database,
     extract_panorama_features_to_sharded_database,
@@ -32,9 +46,13 @@ from colmap.panorama_reconstruct import (
     import_equirectangular_panorama_images,
     match_features,
     merge_feature_shard_databases,
+    nearest_keyframe_name,
+    image_id_pairs_to_name_pairs,
+    normalize_image_pair,
     panorama_image_paths,
     parse_args,
     read_feature_stats_by_database_camera,
+    read_feature_counts_by_image_name,
     read_generated_image_batch,
     read_image_records_by_name,
     run_incremental_mapping,
@@ -43,12 +61,16 @@ from colmap.panorama_reconstruct import (
     run_panorama_image_import,
     resolve_pipeline_execution,
     score_keyframe_anchors,
+    select_cluster_keyframe,
     split_image_names_into_batches,
     write_equirectangular_metadata,
     write_image_pair_list,
 )
 from colmap.panorama.cli_import import main as import_main
 from colmap.panorama.cli_import import parse_import_args
+from colmap.panorama.cli_clusters import main as cluster_main
+from colmap.panorama.cli_clusters import parse_cluster_args
+from colmap.panorama.cli_clusters import read_metadata_image_names
 from colmap.panorama.cli_features import main as feature_main
 from colmap.panorama.cli_features import parse_feature_args
 
@@ -74,6 +96,364 @@ class FakeReconstructionStats:
 
     def compute_mean_reprojection_error(self):
         return 0.5
+
+
+def write_cluster_cli_workspace(
+    workspace: Path,
+    image_names: tuple[str, ...],
+) -> None:
+    workspace.mkdir()
+    metadata = {
+        "schema_version": 2,
+        "camera_setup": NATIVE_CAMERA_SETUP,
+        "panorama_images": [
+            {
+                "source_path": str(workspace / "source" / image_name),
+                "colmap_image_name": image_name,
+            }
+            for image_name in image_names
+        ],
+    }
+    (workspace / "panorama_equirectangular_config.json").write_text(
+        json.dumps(metadata, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    with sqlite3.connect(workspace / "database.db") as connection:
+        connection.execute(
+            "CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
+            [
+                (image_index + 1, image_name, 1)
+                for image_index, image_name in enumerate(image_names)
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO keypoints(image_id, rows) VALUES (?, ?)",
+            [
+                (image_index + 1, (image_index + 1) * 10)
+                for image_index, _image_name in enumerate(image_names)
+            ],
+        )
+
+
+def test_normalize_image_pair_orders_pair_and_skips_self_pair() -> None:
+    assert normalize_image_pair(("b.png", "a.png")) == ("a.png", "b.png")
+    assert normalize_image_pair(("a.png", "b.png")) == ("a.png", "b.png")
+    assert normalize_image_pair(("a.png", "a.png")) is None
+
+
+def test_deduplicate_image_pairs_is_deterministic_and_unordered() -> None:
+    pairs = [
+        ("b.png", "a.png"),
+        ("a.png", "b.png"),
+        ("a.png", "a.png"),
+        ("c.png", "b.png"),
+    ]
+
+    assert deduplicate_image_pairs(pairs) == (
+        ("a.png", "b.png"),
+        ("b.png", "c.png"),
+    )
+
+
+def test_keyframe_pair_plan_reports_source_counts_and_all_pairs() -> None:
+    plan = KeyframePairPlan(
+        selection="interval",
+        effective_selection="interval",
+        keyframe_pairs=(("a.png", "c.png"), ("c.png", "a.png")),
+        vocabtree_pairs=(("b.png", "c.png"),),
+        sequential_backbone_pairs=(("a.png", "b.png"), ("b.png", "c.png")),
+        keyframes=("a.png", "c.png"),
+    )
+
+    assert plan.all_pairs == (
+        ("a.png", "c.png"),
+        ("b.png", "c.png"),
+        ("a.png", "b.png"),
+    )
+    assert plan.pair_counts_by_source == {
+        "keyframe": 1,
+        "vocabtree": 1,
+        "sequential_backbone": 2,
+        "all": 3,
+    }
+    assert plan.report_keyframes() == [
+        {"image_name": "a.png", "selection": "interval"},
+        {"image_name": "c.png", "selection": "interval"},
+    ]
+
+
+def test_image_id_pairs_to_name_pairs_uses_generated_batch_identity() -> None:
+    batch = GeneratedImageBatch(
+        names=("a.png", "b.png", "c.png"),
+        records_by_name={
+            "a.png": (7, 1),
+            "b.png": (3, 1),
+            "c.png": (5, 1),
+        },
+    )
+
+    assert image_id_pairs_to_name_pairs(
+        [(3, 7), (7, 999), (5, 5), (3, 5)],
+        batch,
+    ) == (
+        ("a.png", "b.png"),
+        ("b.png", "c.png"),
+    )
+
+
+def test_cluster_pipeline_builds_interval_keyframe_pair_plan(tmp_path) -> None:
+    batch = GeneratedImageBatch(
+        names=("a.png", "b.png", "c.png"),
+        records_by_name={
+            "a.png": (1, 1),
+            "b.png": (2, 1),
+            "c.png": (3, 1),
+        },
+    )
+
+    plan = build_keyframe_pair_plan(
+        object(),
+        database_path=tmp_path / "database.db",
+        generated_image_batch=batch,
+        keyframe_options=KeyframeSelectionOptions(
+            selection="interval",
+            interval=2,
+            overlap=1,
+            backbone_policy="gaps",
+            backbone_overlap=1,
+        ),
+        vocab_tree_path=None,
+    )
+
+    assert plan.effective_selection == "interval"
+    assert plan.keyframes == ("a.png", "c.png")
+    assert plan.all_pairs == (
+        ("a.png", "b.png"),
+        ("a.png", "c.png"),
+        ("b.png", "c.png"),
+    )
+
+
+def test_keyframe_cluster_report_records_keyframe_and_source() -> None:
+    cluster = KeyframeCluster(
+        cluster_id=2,
+        image_names=("a.png", "b.png"),
+        image_ids=(10, 11),
+        keyframe_image_name="b.png",
+        keyframe_image_id=11,
+        source="sequential-vocabtree",
+    )
+
+    assert cluster.report() == {
+        "cluster_id": 2,
+        "image_count": 2,
+        "image_names": ["a.png", "b.png"],
+        "keyframe_image_name": "b.png",
+        "keyframe_image_id": 11,
+        "source": "sequential-vocabtree",
+    }
+
+
+def test_keyframe_selection_options_defaults_match_rollout_plan() -> None:
+    options = KeyframeSelectionOptions()
+
+    assert options.selection == "interval"
+    assert options.interval == 10
+    assert options.overlap == 3
+    assert options.backbone_policy == "gaps"
+    assert options.backbone_overlap == 1
+
+
+def test_build_sequential_backbone_pairs_uses_ordered_overlap() -> None:
+    assert build_sequential_backbone_pairs(
+        ("a.png", "b.png", "c.png", "d.png"),
+        2,
+    ) == (
+        ("a.png", "b.png"),
+        ("a.png", "c.png"),
+        ("b.png", "c.png"),
+        ("b.png", "d.png"),
+        ("c.png", "d.png"),
+    )
+
+
+def test_build_interval_keyframes_includes_first_last_and_interval() -> None:
+    assert build_interval_keyframes(
+        ("a.png", "b.png", "c.png", "d.png", "e.png"),
+        2,
+    ) == ("a.png", "c.png", "e.png")
+    assert build_interval_keyframes(("a.png", "b.png", "c.png"), 10) == (
+        "a.png",
+        "c.png",
+    )
+
+
+def test_nearest_keyframe_name_prefers_earlier_keyframe_on_tie() -> None:
+    image_order = {"a.png": 0, "b.png": 1, "c.png": 2}
+
+    assert nearest_keyframe_name(
+        "b.png",
+        ("a.png", "c.png"),
+        image_order,
+    ) == "a.png"
+
+
+def test_interval_keyframe_pair_plan_builds_clusters_and_pairs() -> None:
+    plan = build_interval_keyframe_pair_plan(
+        ("a.png", "b.png", "c.png", "d.png", "e.png"),
+        KeyframeSelectionOptions(
+            selection="interval",
+            interval=2,
+            overlap=1,
+            backbone_policy="gaps",
+            backbone_overlap=1,
+        ),
+    )
+
+    assert plan.keyframes == ("a.png", "c.png", "e.png")
+    assert [cluster.image_names for cluster in plan.clusters] == [
+        ("a.png", "b.png"),
+        ("c.png", "d.png"),
+        ("e.png",),
+    ]
+    assert plan.keyframe_pairs == (
+        ("a.png", "b.png"),
+        ("c.png", "d.png"),
+        ("a.png", "c.png"),
+        ("c.png", "e.png"),
+    )
+    assert plan.sequential_backbone_pairs == (("b.png", "c.png"), ("d.png", "e.png"))
+
+
+def test_build_backbone_pairs_for_gaps_only_adds_missing_local_edges() -> None:
+    pairs = build_backbone_pairs_for_policy(
+        ("a.png", "b.png", "c.png"),
+        existing_pairs=(("a.png", "b.png"),),
+        policy="gaps",
+        overlap=1,
+    )
+
+    assert pairs == (("b.png", "c.png"),)
+
+
+def test_select_cluster_keyframe_uses_degree_features_middle_and_order() -> None:
+    keyframe = select_cluster_keyframe(
+        ("a.png", "b.png", "c.png"),
+        candidate_pairs=(
+            ("a.png", "b.png"),
+            ("b.png", "c.png"),
+        ),
+        feature_counts_by_name={"a.png": 30, "b.png": 10, "c.png": 50},
+    )
+
+    assert keyframe == "b.png"
+
+
+def test_select_cluster_keyframe_uses_feature_count_as_degree_tie_break() -> None:
+    keyframe = select_cluster_keyframe(
+        ("a.png", "b.png"),
+        candidate_pairs=(("a.png", "b.png"),),
+        feature_counts_by_name={"a.png": 30, "b.png": 50},
+    )
+
+    assert keyframe == "b.png"
+
+
+def test_sequential_vocabtree_clusters_split_when_recent_edges_disappear() -> None:
+    clusters = build_sequential_vocabtree_clusters(
+        ("a.png", "b.png", "c.png", "d.png", "e.png"),
+        candidate_pairs=(
+            ("a.png", "b.png"),
+            ("b.png", "c.png"),
+            ("d.png", "e.png"),
+        ),
+        options=KeyframeSelectionOptions(
+            selection="sequential-vocabtree",
+            cluster_recent_window=1,
+        ),
+        feature_counts_by_name={
+            "a.png": 10,
+            "b.png": 30,
+            "c.png": 20,
+            "d.png": 10,
+            "e.png": 20,
+        },
+    )
+
+    assert [cluster.image_names for cluster in clusters] == [
+        ("a.png", "b.png", "c.png"),
+        ("d.png", "e.png"),
+    ]
+    assert [cluster.keyframe_image_name for cluster in clusters] == [
+        "b.png",
+        "e.png",
+    ]
+
+
+def test_sequential_vocabtree_clusters_use_recent_window_for_visual_drift() -> None:
+    clusters = build_sequential_vocabtree_clusters(
+        ("a.png", "b.png", "c.png"),
+        candidate_pairs=(
+            ("a.png", "b.png"),
+            ("b.png", "c.png"),
+        ),
+        options=KeyframeSelectionOptions(
+            selection="sequential-vocabtree",
+            cluster_recent_window=1,
+        ),
+    )
+
+    assert [cluster.image_names for cluster in clusters] == [
+        ("a.png", "b.png", "c.png"),
+    ]
+
+
+def test_sequential_vocabtree_pair_plan_tracks_sources_and_backbone_gaps() -> None:
+    plan = build_sequential_vocabtree_pair_plan(
+        ("a.png", "b.png", "c.png", "d.png"),
+        candidate_pairs=(
+            ("a.png", "b.png"),
+            ("b.png", "c.png"),
+        ),
+        options=KeyframeSelectionOptions(
+            selection="sequential-vocabtree",
+            overlap=1,
+            backbone_policy="gaps",
+            backbone_overlap=1,
+            cluster_recent_window=1,
+        ),
+        feature_counts_by_name={
+            "a.png": 10,
+            "b.png": 30,
+            "c.png": 20,
+            "d.png": 5,
+        },
+    )
+
+    assert plan.selection == "sequential-vocabtree"
+    assert plan.keyframes == ("b.png", "d.png")
+    assert plan.keyframe_pairs == (
+        ("a.png", "b.png"),
+        ("b.png", "c.png"),
+        ("b.png", "d.png"),
+    )
+    assert plan.vocabtree_pairs == (
+        ("a.png", "b.png"),
+        ("b.png", "c.png"),
+    )
+    assert plan.sequential_backbone_pairs == (("c.png", "d.png"),)
+    assert plan.pair_counts_by_source == {
+        "keyframe": 3,
+        "vocabtree": 2,
+        "sequential_backbone": 1,
+        "all": 4,
+    }
 
 
 def test_configure_ssl_cert_file_uses_explicit_bundle(tmp_path, monkeypatch) -> None:
@@ -461,6 +841,230 @@ def test_run_panorama_reconstruction_uses_shared_import_pipeline(
     assert import_calls[0]["image_limit"] is None
     assert import_calls[0]["import_workers"] == 3
     assert len(extract_calls) == 1
+
+
+def test_run_panorama_reconstruction_interval_keyframes_write_pair_list(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    input_dir = tmp_path / "input"
+    workspace = tmp_path / "workspace"
+    input_dir.mkdir()
+    for name in ("a.png", "b.png", "c.png"):
+        Image.new("RGB", (16, 8), color=(255, 0, 0)).save(input_dir / name)
+    match_calls = []
+
+    class FakePycolmap:
+        __version__ = "fake"
+
+        @staticmethod
+        def set_random_seed(_seed):
+            return None
+
+    def fake_extract_panorama_features_to_database(*_args, **kwargs):
+        with sqlite3.connect(kwargs["database_path"]) as connection:
+            connection.execute("CREATE TABLE cameras(camera_id INTEGER PRIMARY KEY)")
+            connection.execute(
+                "CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+            )
+            connection.execute(
+                "CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER)"
+            )
+            connection.executemany("INSERT INTO cameras(camera_id) VALUES (?)", [(1,)])
+            connection.executemany(
+                "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
+                [(1, "a.png", 1), (2, "b.png", 1), (3, "c.png", 1)],
+            )
+            connection.executemany(
+                "INSERT INTO keypoints(image_id, rows) VALUES (?, ?)",
+                [(1, 10), (2, 20), (3, 30)],
+            )
+
+    def fake_match_features(*_args, **kwargs):
+        match_calls.append(kwargs)
+
+    monkeypatch.setattr(panorama_pipeline, "require_pycolmap", lambda: FakePycolmap)
+    monkeypatch.setattr(panorama_pipeline, "configure_ssl_cert_file", lambda _path: None)
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "resolve_pipeline_execution",
+        lambda _pycolmap, _options: {
+            "requested_device": "auto",
+            "resolved_device": "cpu",
+            "device": "cpu",
+            "cuda_available": False,
+            "gpu_index": "-1",
+            "gpu_bundle_adjustment": False,
+            "bundle_adjustment_gpu_index": "-1",
+        },
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "extract_panorama_features_to_database",
+        fake_extract_panorama_features_to_database,
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "create_feature_matching_options",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(panorama_pipeline, "match_features", fake_match_features)
+    monkeypatch.setattr(panorama_pipeline, "create_mapper_options", lambda *_args: object())
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "run_incremental_mapping",
+        lambda *_args, **_kwargs: {0: FakeReconstructionStats()},
+    )
+    monkeypatch.setattr(panorama_pipeline, "write_best_model", lambda *_args: None)
+    monkeypatch.setattr(panorama_pipeline, "score_keyframe_anchors", lambda *_args: [])
+
+    report = run_panorama_reconstruction(
+        input_dir,
+        workspace,
+        matcher="keyframes",
+        keyframe_options=KeyframeSelectionOptions(
+            selection="interval",
+            interval=2,
+            overlap=1,
+            backbone_policy="gaps",
+            backbone_overlap=1,
+        ),
+    )
+
+    pair_list = workspace / "match_pairs.txt"
+    assert match_calls[0]["image_pairs_path"] == pair_list
+    assert pair_list.read_text(encoding="utf-8") == (
+        "a.png b.png\n"
+        "a.png c.png\n"
+        "b.png c.png\n"
+    )
+    assert report["options"]["matcher"] == "keyframes"
+    assert report["options"]["effective_pairing"] == "interval"
+    assert report["options"]["matching_pair_count"] == 3
+    assert report["options"]["sequential_backbone_pair_count"] == 1
+    assert [keyframe["image_name"] for keyframe in report["keyframes"]] == [
+        "a.png",
+        "c.png",
+    ]
+
+
+def test_run_panorama_reconstruction_sequential_vocabtree_keyframes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    input_dir = tmp_path / "input"
+    workspace = tmp_path / "workspace"
+    input_dir.mkdir()
+    for name in ("a.png", "b.png", "c.png", "d.png"):
+        Image.new("RGB", (16, 8), color=(255, 0, 0)).save(input_dir / name)
+    vocab_tree = tmp_path / "tree.bin"
+    vocab_tree.write_bytes(b"tree")
+    match_calls = []
+
+    class FakePycolmap:
+        __version__ = "fake"
+
+        @staticmethod
+        def set_random_seed(_seed):
+            return None
+
+    def fake_extract_panorama_features_to_database(*_args, **kwargs):
+        with sqlite3.connect(kwargs["database_path"]) as connection:
+            connection.execute("CREATE TABLE cameras(camera_id INTEGER PRIMARY KEY)")
+            connection.execute(
+                "CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+            )
+            connection.execute(
+                "CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER)"
+            )
+            connection.executemany("INSERT INTO cameras(camera_id) VALUES (?)", [(1,)])
+            connection.executemany(
+                "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
+                [
+                    (1, "a.png", 1),
+                    (2, "b.png", 1),
+                    (3, "c.png", 1),
+                    (4, "d.png", 1),
+                ],
+            )
+            connection.executemany(
+                "INSERT INTO keypoints(image_id, rows) VALUES (?, ?)",
+                [(1, 10), (2, 30), (3, 20), (4, 5)],
+            )
+
+    monkeypatch.setattr(panorama_pipeline, "require_pycolmap", lambda: FakePycolmap)
+    monkeypatch.setattr(panorama_pipeline, "configure_ssl_cert_file", lambda _path: None)
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "resolve_pipeline_execution",
+        lambda _pycolmap, _options: {
+            "requested_device": "auto",
+            "resolved_device": "cpu",
+            "device": "cpu",
+            "cuda_available": False,
+            "gpu_index": "-1",
+            "gpu_bundle_adjustment": False,
+            "bundle_adjustment_gpu_index": "-1",
+        },
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "extract_panorama_features_to_database",
+        fake_extract_panorama_features_to_database,
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "create_feature_matching_options",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        panorama_cluster_pipeline,
+        "build_vocabtree_candidate_pairs",
+        lambda *_args, **_kwargs: ((1, 2), (2, 3)),
+    )
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "match_features",
+        lambda *_args, **kwargs: match_calls.append(kwargs),
+    )
+    monkeypatch.setattr(panorama_pipeline, "create_mapper_options", lambda *_args: object())
+    monkeypatch.setattr(
+        panorama_pipeline,
+        "run_incremental_mapping",
+        lambda *_args, **_kwargs: {0: FakeReconstructionStats()},
+    )
+    monkeypatch.setattr(panorama_pipeline, "write_best_model", lambda *_args: None)
+    monkeypatch.setattr(panorama_pipeline, "score_keyframe_anchors", lambda *_args: [])
+
+    report = run_panorama_reconstruction(
+        input_dir,
+        workspace,
+        matcher="keyframes",
+        vocab_tree_path=vocab_tree,
+        keyframe_options=KeyframeSelectionOptions(
+            selection="sequential-vocabtree",
+            overlap=1,
+            backbone_policy="gaps",
+            backbone_overlap=1,
+            cluster_recent_window=1,
+        ),
+    )
+
+    pair_list = workspace / "match_pairs.txt"
+    assert match_calls[0]["image_pairs_path"] == pair_list
+    assert pair_list.read_text(encoding="utf-8") == (
+        "a.png b.png\n"
+        "b.png c.png\n"
+        "b.png d.png\n"
+        "c.png d.png\n"
+    )
+    assert report["options"]["effective_pairing"] == "sequential-vocabtree"
+    assert report["options"]["vocabtree_pair_count"] == 2
+    assert report["options"]["sequential_backbone_pair_count"] == 1
+    assert [keyframe["image_name"] for keyframe in report["keyframes"]] == [
+        "b.png",
+        "d.png",
+    ]
 
 
 def test_run_panorama_reconstruction_uses_sharded_feature_extraction_when_requested(
@@ -1165,6 +1769,29 @@ def test_read_feature_stats_by_database_camera(tmp_path) -> None:
     }
 
 
+def test_read_feature_counts_by_image_name_preserves_requested_names(tmp_path) -> None:
+    database_path = tmp_path / "database.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, ?)",
+            [(1, "a.png", 1), (2, "b.png", 1)],
+        )
+        connection.execute("INSERT INTO keypoints(image_id, rows) VALUES (?, ?)", (1, 12))
+
+    counts = read_feature_counts_by_image_name(
+        database_path,
+        ("a.png", "b.png", "missing.png"),
+    )
+
+    assert counts == {"a.png": 12, "b.png": 0, "missing.png": 0}
+
+
 def test_equirectangular_feature_health_summary_identifies_zero_feature_camera() -> None:
     health = equirectangular_feature_health_summary(
         {
@@ -1651,6 +2278,111 @@ def test_imported_pair_matching_uses_image_pair_file(tmp_path) -> None:
     assert device == "cpu"
 
 
+def test_build_vocabtree_candidate_pairs_uses_pair_generator(tmp_path) -> None:
+    class VocabTreePairingOptions:
+        def __init__(self):
+            self.num_nearest_neighbors = 0
+            self.num_checks = 0
+            self.vocab_tree_path = None
+
+    class FakeDatabase:
+        opened_path = None
+        closed = False
+
+        @classmethod
+        def open(cls, path):
+            cls.opened_path = path
+            return cls()
+
+        def close(self):
+            type(self).closed = True
+
+    class VocabTreePairGenerator:
+        calls = []
+
+        def __init__(self, pairing_options, database, image_ids):
+            self.calls.append((pairing_options, database, image_ids))
+
+        def all_pairs(self):
+            return [(1, 2), (2, 2), (3, 4)]
+
+    class FakePycolmap:
+        pass
+
+    FakePycolmap.VocabTreePairingOptions = VocabTreePairingOptions
+    FakePycolmap.VocabTreePairGenerator = VocabTreePairGenerator
+    FakePycolmap.Database = FakeDatabase
+
+    vocab_tree = tmp_path / "tree.bin"
+    vocab_tree.write_bytes(b"tree")
+
+    pairs = build_vocabtree_candidate_pairs(
+        FakePycolmap,
+        tmp_path / "database.db",
+        [1, 2, 3, 4],
+        KeyframeSelectionOptions(
+            vocabtree_neighbors=7,
+            vocabtree_checks=32,
+        ),
+        vocab_tree_path=vocab_tree,
+    )
+
+    assert pairs == ((1, 2), (3, 4))
+    assert FakeDatabase.opened_path == tmp_path / "database.db"
+    assert FakeDatabase.closed is True
+    pairing_options, _database, image_ids = VocabTreePairGenerator.calls[0]
+    assert pairing_options.num_nearest_neighbors == 7
+    assert pairing_options.num_checks == 32
+    assert pairing_options.vocab_tree_path == vocab_tree
+    assert image_ids == [1, 2, 3, 4]
+
+
+def test_build_vocabtree_candidate_pairs_explains_legacy_flann_tree(
+    tmp_path,
+) -> None:
+    class VocabTreePairingOptions:
+        def __init__(self):
+            self.vocab_tree_path = None
+
+    class FakeDatabase:
+        closed = False
+
+        @classmethod
+        def open(cls, _path):
+            return cls()
+
+        def close(self):
+            type(self).closed = True
+
+    class VocabTreePairGenerator:
+        def __init__(self, *_args):
+            raise ValueError(
+                "Failed to read faiss index. This may be caused by reading "
+                "a legacy flann-based index."
+            )
+
+    class FakePycolmap:
+        pass
+
+    FakePycolmap.VocabTreePairingOptions = VocabTreePairingOptions
+    FakePycolmap.VocabTreePairGenerator = VocabTreePairGenerator
+    FakePycolmap.Database = FakeDatabase
+
+    vocab_tree = tmp_path / "tree.bin"
+    vocab_tree.write_bytes(b"tree")
+
+    with pytest.raises(ValueError, match="legacy FLANN-format tree"):
+        build_vocabtree_candidate_pairs(
+            FakePycolmap,
+            tmp_path / "database.db",
+            [1, 2],
+            KeyframeSelectionOptions(),
+            vocab_tree_path=vocab_tree,
+        )
+
+    assert FakeDatabase.closed is True
+
+
 def test_run_incremental_mapping_passes_mapper_options(tmp_path) -> None:
     class FakePycolmap:
         calls = []
@@ -1701,6 +2433,8 @@ def test_parse_args_accepts_image_limit(tmp_path) -> None:
     assert args.device == "auto"
     assert args.gpu_index == "-1"
     assert args.gpu_bundle_adjustment is True
+    assert args.keyframe_selection == "sequential-vocabtree"
+    assert args.keyframe_backbone_policy == "gaps"
     assert not hasattr(args, "initial_session")
     assert not hasattr(args, "match_scope")
     assert not hasattr(args, "virtual_image_format")
@@ -1720,6 +2454,111 @@ def test_parse_args_accepts_feature_extraction_tuning_options(tmp_path) -> None:
 
     assert args.max_image_size == 2048
     assert args.num_threads == 4
+
+
+def test_parse_args_accepts_keyframe_interval_mode_without_vocabtree(tmp_path) -> None:
+    args = parse_args(
+        [
+            "--input-image-path",
+            str(tmp_path),
+            "--matcher",
+            "keyframes",
+            "--keyframe-selection",
+            "interval",
+            "--keyframe-interval",
+            "5",
+            "--keyframe-overlap",
+            "2",
+            "--keyframe-backbone-policy",
+            "none",
+        ]
+    )
+
+    assert args.matcher == "keyframes"
+    assert args.keyframe_selection == "interval"
+    assert args.keyframe_interval == 5
+    assert args.keyframe_overlap == 2
+    assert args.keyframe_backbone_policy == "none"
+
+
+def test_parse_args_rejects_keyframe_vocabtree_without_vocab_tree_path(tmp_path) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--input-image-path",
+                str(tmp_path),
+                "--matcher",
+                "keyframes",
+                "--keyframe-selection",
+                "sequential-vocabtree",
+            ]
+        )
+
+
+def test_read_metadata_image_names_uses_imported_colmap_names(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    write_cluster_cli_workspace(workspace, ("a.png", "b.png"))
+
+    assert read_metadata_image_names(
+        workspace / "panorama_equirectangular_config.json",
+    ) == ("a.png", "b.png")
+
+
+def test_parse_cluster_args_accepts_interval_mode_without_vocabtree(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    write_cluster_cli_workspace(workspace, ("a.png", "b.png", "c.png"))
+
+    args = parse_cluster_args(
+        [
+            "--workspace",
+            str(workspace),
+            "--keyframe-selection",
+            "interval",
+            "--keyframe-interval",
+            "2",
+            "--keyframe-overlap",
+            "1",
+        ]
+    )
+
+    assert args.workspace == workspace
+    assert args.keyframe_selection == "interval"
+    assert args.keyframe_interval == 2
+    assert args.keyframe_overlap == 1
+
+
+def test_parse_cluster_args_rejects_vocabtree_mode_without_tree(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    write_cluster_cli_workspace(workspace, ("a.png", "b.png"))
+
+    with pytest.raises(SystemExit):
+        parse_cluster_args(
+            [
+                "--workspace",
+                str(workspace),
+                "--keyframe-selection",
+                "sequential-vocabtree",
+            ]
+        )
+
+
+def test_parse_cluster_args_accepts_vocabtree_mode_with_tree(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    write_cluster_cli_workspace(workspace, ("a.png", "b.png"))
+    vocab_tree = tmp_path / "tree.bin"
+    vocab_tree.write_bytes(b"tree")
+
+    args = parse_cluster_args(
+        [
+            "--workspace",
+            str(workspace),
+            "--vocab-tree-path",
+            str(vocab_tree),
+        ]
+    )
+
+    assert args.keyframe_selection == "sequential-vocabtree"
+    assert args.vocab_tree_path == vocab_tree
 
 
 def test_parse_args_accepts_import_workers(tmp_path) -> None:
@@ -1923,6 +2762,109 @@ def test_panorama_features_cli_prints_feature_report(tmp_path, monkeypatch, caps
     assert "panorama images: 1" in output
     assert "panorama images with features: 1/1" in output
     assert "database:" in output
+
+
+def test_panorama_clusters_cli_writes_pair_list_and_report(tmp_path, capsys) -> None:
+    workspace = tmp_path / "workspace"
+    write_cluster_cli_workspace(workspace, ("a.png", "b.png", "c.png"))
+
+    assert (
+        cluster_main(
+            [
+                "--workspace",
+                str(workspace),
+                "--keyframe-selection",
+                "interval",
+                "--keyframe-interval",
+                "2",
+                "--keyframe-overlap",
+                "1",
+                "--keyframe-backbone-policy",
+                "gaps",
+                "--keyframe-backbone-overlap",
+                "1",
+            ]
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "panorama images: 3" in output
+    assert "keyframes: 2" in output
+    assert "matching pairs: 3" in output
+    assert "effective pairing: interval" in output
+    assert (workspace / "match_pairs.txt").read_text(encoding="utf-8") == (
+        "a.png b.png\n"
+        "a.png c.png\n"
+        "b.png c.png\n"
+    )
+    report = json.loads(
+        (workspace / "panorama_keyframe_cluster_report.json").read_text(
+            encoding="utf-8",
+        )
+    )
+    assert report["options"]["effective_pairing"] == "interval"
+    assert report["options"]["matching_pair_count"] == 3
+    assert report["pair_counts_by_source"] == {
+        "keyframe": 2,
+        "vocabtree": 0,
+        "sequential_backbone": 1,
+        "all": 3,
+    }
+
+
+def test_panorama_clusters_cli_prints_vocabtree_plan(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    workspace = tmp_path / "workspace"
+    write_cluster_cli_workspace(workspace, ("a.png", "b.png"))
+    vocab_tree = tmp_path / "tree.bin"
+    vocab_tree.write_bytes(b"tree")
+
+    def fake_build_keyframe_pair_plan(*_args, **_kwargs):
+        return KeyframePairPlan(
+            selection="sequential-vocabtree",
+            effective_selection="sequential-vocabtree",
+            keyframe_pairs=(("a.png", "b.png"),),
+            vocabtree_pairs=(("a.png", "b.png"),),
+            keyframes=("a.png",),
+            clusters=(
+                KeyframeCluster(
+                    cluster_id=0,
+                    image_names=("a.png", "b.png"),
+                    keyframe_image_name="a.png",
+                    keyframe_image_id=1,
+                    source="sequential-vocabtree",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(panorama_cli_clusters, "require_pycolmap", lambda: object())
+    monkeypatch.setattr(
+        panorama_cli_clusters,
+        "build_keyframe_pair_plan",
+        fake_build_keyframe_pair_plan,
+    )
+
+    assert (
+        cluster_main(
+            [
+                "--workspace",
+                str(workspace),
+                "--vocab-tree-path",
+                str(vocab_tree),
+            ]
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "effective pairing: sequential-vocabtree" in output
+    assert (workspace / "match_pairs.txt").read_text(encoding="utf-8") == (
+        "a.png b.png\n"
+    )
 
 
 def test_panorama_import_cli_writes_import_workspace(tmp_path, capsys) -> None:

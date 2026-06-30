@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from colmap.panorama import cluster_pipeline
 from colmap.panorama.database import (
     read_feature_stats_by_database_camera,
     read_generated_image_batch,
@@ -19,6 +20,10 @@ from colmap.panorama.feature_pipeline import (
     extract_panorama_features_to_sharded_database,
 )
 from colmap.panorama.import_pipeline import import_panorama_images_to_workspace
+from colmap.panorama.keyframe_matching import (
+    KeyframePairPlan,
+    KeyframeSelectionOptions,
+)
 from colmap.panorama.paths import panorama_workspace_paths
 from colmap.panorama.pycolmap_adapter import (
     configure_ssl_cert_file,
@@ -35,6 +40,7 @@ from colmap.panorama.reports import (
     equirectangular_feature_health_summary,
     format_elapsed_seconds,
     format_elapsed_seconds_by_stage,
+    write_image_pair_list,
 )
 from colmap.panorama.scoring import score_keyframe_anchors
 from colmap.panorama.types import FeaturePipelineOptions, PipelineExecutionOptions
@@ -66,6 +72,7 @@ def run_panorama_reconstruction(
     import_workers: int = 1,
     feature_workers: int = 1,
     feature_batch_size: int | None = None,
+    keyframe_options: KeyframeSelectionOptions = KeyframeSelectionOptions(),
     overwrite: bool = False,
 ) -> dict[str, Any]:
     if feature_workers <= 0:
@@ -75,6 +82,7 @@ def run_panorama_reconstruction(
     started_at = time.perf_counter()
     elapsed_seconds_by_stage: dict[str, float] = {}
     feature_shard_result: FeatureShardExtractionResult | None = None
+    keyframe_pair_plan: KeyframePairPlan | None = None
     stage_started_at = started_at
     pycolmap_module = require_pycolmap()
     pycolmap_module.set_random_seed(0)
@@ -162,6 +170,22 @@ def run_panorama_reconstruction(
         use_gpu=execution["resolved_device"] == "cuda",
         gpu_index=execution["gpu_index"],
     )
+    image_pairs_path = None
+    if matcher == "keyframes":
+        keyframe_pair_plan = cluster_pipeline.build_keyframe_pair_plan(
+            pycolmap_module,
+            database_path=paths["database"],
+            generated_image_batch=generated_image_batch,
+            keyframe_options=keyframe_options,
+            vocab_tree_path=vocab_tree_path,
+        )
+        if not keyframe_pair_plan.all_pairs:
+            raise ValueError(
+                "keyframe matching requires at least one image pair; "
+                "use at least two panoramas or enable a fallback policy",
+            )
+        image_pairs_path = paths["match_pairs"]
+        write_image_pair_list(image_pairs_path, keyframe_pair_plan.all_pairs)
     match_features(
         pycolmap_module,
         paths["database"],
@@ -170,6 +194,7 @@ def run_panorama_reconstruction(
         overlap=overlap,
         loop_detection=loop_detection,
         vocab_tree_path=vocab_tree_path,
+        image_pairs_path=image_pairs_path,
         device=execution["device"],
     )
     record_elapsed_stage(
@@ -240,6 +265,10 @@ def run_panorama_reconstruction(
         best_model_id=best_model_id,
         best_reconstruction=best_reconstruction,
         keyframe_scores=keyframe_scores,
+        keyframe_options=(
+            keyframe_options if keyframe_pair_plan is not None else None
+        ),
+        keyframe_pair_plan=keyframe_pair_plan,
     )
     elapsed_seconds_by_stage["report_writing"] = 0.0
     elapsed_seconds = time.perf_counter() - started_at

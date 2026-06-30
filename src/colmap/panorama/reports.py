@@ -10,6 +10,7 @@ from typing import Any, Sequence
 from colmap.camera import ColmapCamera
 from colmap.panorama.constants import NATIVE_CAMERA_SETUP
 from colmap.panorama.database import read_database_stats
+from colmap.panorama.keyframe_matching import KeyframePairPlan, KeyframeSelectionOptions
 from colmap.panorama.types import (
     FeaturePipelineOptions,
     GeneratedImageBatch,
@@ -257,6 +258,8 @@ def build_panorama_report(
     best_model_id: int,
     best_reconstruction: Any,
     keyframe_scores: Sequence[KeyframeAnchorScore],
+    keyframe_options: KeyframeSelectionOptions | None = None,
+    keyframe_pair_plan: KeyframePairPlan | None = None,
 ) -> dict[str, Any]:
     database_report = read_database_stats(paths["database"])
     model_stats = {
@@ -265,6 +268,49 @@ def build_panorama_report(
     }
     feature_extraction_mode = (
         "sharded_database" if feature_shard_result is not None else "single_database"
+    )
+    keyframe_pair_counts = (
+        keyframe_pair_plan.pair_counts_by_source
+        if keyframe_pair_plan is not None
+        else {}
+    )
+    effective_pairing = (
+        keyframe_pair_plan.effective_selection
+        if keyframe_pair_plan is not None
+        else matcher
+    )
+    keyframe_options_report = (
+        {
+            "keyframe_selection": keyframe_options.selection,
+            "keyframe_selection_effective": (
+                None
+                if keyframe_pair_plan is None
+                else keyframe_pair_plan.effective_selection
+            ),
+            "keyframe_interval": keyframe_options.interval,
+            "keyframe_overlap": keyframe_options.overlap,
+            "keyframe_backbone_policy": keyframe_options.backbone_policy,
+            "keyframe_backbone_overlap": keyframe_options.backbone_overlap,
+            "keyframe_cluster_min_size": keyframe_options.cluster_min_size,
+            "keyframe_cluster_max_size": keyframe_options.cluster_max_size,
+            "keyframe_cluster_recent_window": keyframe_options.cluster_recent_window,
+            "keyframe_vocabtree_neighbors": keyframe_options.vocabtree_neighbors,
+            "keyframe_vocabtree_checks": keyframe_options.vocabtree_checks,
+            "matching_pair_count": keyframe_pair_counts.get("all", 0),
+            "keyframe_pair_count": keyframe_pair_counts.get("keyframe", 0),
+            "vocabtree_pair_count": keyframe_pair_counts.get("vocabtree", 0),
+            "sequential_backbone_pair_count": keyframe_pair_counts.get(
+                "sequential_backbone",
+                0,
+            ),
+            "match_pairs_path": (
+                str(paths["match_pairs"])
+                if keyframe_pair_plan is not None
+                else None
+            ),
+        }
+        if keyframe_options is not None
+        else {}
     )
     return {
         "status": f"raw_colmap_{NATIVE_CAMERA_SETUP}_unscaled",
@@ -286,7 +332,7 @@ def build_panorama_report(
         "camera": camera.report(),
         "options": {
             "matcher": matcher,
-            "effective_pairing": matcher,
+            "effective_pairing": effective_pairing,
             "sequential_overlap": overlap,
             "loop_detection": loop_detection,
             "vocab_tree_path": (
@@ -324,6 +370,7 @@ def build_panorama_report(
             "ba_refine_extra_params": False,
             "rig_verification": False,
             "skip_image_pairs_in_same_frame": False,
+            **keyframe_options_report,
         },
         "panorama_count": panorama_count,
         "generated_image_count": panorama_count,
@@ -342,6 +389,12 @@ def build_panorama_report(
         "best_model": reconstruction_stats(best_reconstruction),
         "keyframe_score_count": len(keyframe_scores),
         "keyframe_scores": [score.report() for score in keyframe_scores],
+        "keyframes": (
+            [] if keyframe_pair_plan is None else keyframe_pair_plan.report_keyframes()
+        ),
+        "keyframe_clusters": (
+            [] if keyframe_pair_plan is None else keyframe_pair_plan.report_clusters()
+        ),
     }
 
 

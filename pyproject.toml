@@ -28,6 +28,7 @@ visualize = [
 ]
 
 [project.scripts]
+colmap-panorama-clusters = "colmap.panorama.cli_clusters:main"
 colmap-panorama-features = "colmap.panorama.cli_features:main"
 colmap-panorama-import = "colmap.panorama.cli_import:main"
 colmap-panorama-reconstruct = "colmap.panorama_reconstruct:main"
@@ -36,6 +37,7 @@ manual-pinhole-render = "render_pinhole.tools.manual_pinhole_render:main"
 manual-pinhole-select = "render_pinhole.tools.manual_pinhole_select:main"
 tools-sampling = "tools.sampling_dir:main"
 tools-proc-video = "tools.proc_video:main"
+tools-download-colmap-vocab-tree = "tools.download_colmap_vocab_tree:main"
 
 
 [tool.hatch.build.targets.wheel]

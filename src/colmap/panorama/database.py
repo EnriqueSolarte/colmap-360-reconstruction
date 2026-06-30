@@ -166,3 +166,36 @@ def read_feature_stats_by_database_camera(
         f"camera_{camera_id}": stats
         for camera_id, stats in read_feature_stats_by_camera(database_path).items()
     }
+
+
+def read_feature_counts_by_image_name(
+    database_path: Path,
+    image_names: Sequence[str],
+) -> dict[str, int]:
+    with sqlite3.connect(database_path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if "images" not in tables:
+            return {image_name: 0 for image_name in image_names}
+        keypoint_join = (
+            "LEFT JOIN keypoints ON keypoints.image_id = images.image_id"
+            if "keypoints" in tables
+            else ""
+        )
+        feature_expr = "COALESCE(keypoints.rows, 0)" if "keypoints" in tables else "0"
+        rows = connection.execute(
+            f"""
+            SELECT images.name, {feature_expr}
+            FROM images
+            {keypoint_join}
+            """
+        ).fetchall()
+    counts_by_name = {str(name): int(count or 0) for name, count in rows}
+    return {
+        image_name: counts_by_name.get(image_name, 0)
+        for image_name in image_names
+    }

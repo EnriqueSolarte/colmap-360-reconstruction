@@ -158,6 +158,48 @@ download and make runs reproducible, pass a local tree with
 COLMAP/libcurl at `/etc/ssl/certs/ca-certificates.crt` when available; override
 it with `--ssl-cert-file` when needed.
 
+For larger ordered panorama captures, keyframe matching can reduce the pair
+list before COLMAP matching. The sequential-vocabtree selector clusters images
+in capture order using vocabulary-tree candidate pairs, selects a keyframe per
+cluster, and writes an imported pair list:
+
+```bash
+colmap-panorama-reconstruct \
+  --input-image-path /path/to/panoramas \
+  --workspace /workspace/data/colmap-equirectangular-keyframes \
+  --matcher keyframes \
+  --keyframe-selection sequential-vocabtree \
+  --vocab-tree-path /path/to/vocab_tree.bin \
+  --keyframe-backbone-policy gaps \
+  --keyframe-backbone-overlap 1 \
+  --overwrite
+```
+
+For deterministic testing without a vocabulary tree, use interval keyframes:
+
+```bash
+--matcher keyframes \
+--keyframe-selection interval
+```
+
+To run only the keyframe clustering/pair-planning stage after image import and
+feature extraction, use the standalone cluster command:
+
+```bash
+tools-download-colmap-vocab-tree \
+  --variant 256k \
+  --destination-dir /workspace/data/colmap-vocab-tree
+
+colmap-panorama-clusters \
+  --workspace /workspace/data/colmap-equirectangular-keyframes \
+  --vocab-tree-path /workspace/data/colmap-vocab-tree/vocab_tree_flickr100K_words256K.bin \
+  --keyframe-selection sequential-vocabtree
+```
+
+This writes `match_pairs.txt` for COLMAP matching and
+`panorama_keyframe_cluster_report.json` with the selected keyframes, clusters,
+and pair counts.
+
 The workspace includes `panorama_equirectangular_config.json` and
 `panorama_equirectangular_report.json`. The metadata marks `camera_setup` as
 `native_equirectangular`, and the report records feature health, matching

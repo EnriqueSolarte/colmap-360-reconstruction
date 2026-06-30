@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from colmap.panorama.keyframe_matching import KeyframeSelectionOptions
 from colmap.panorama.types import FeaturePipelineOptions, PipelineExecutionOptions
 
 try:  # Keep argument parsing and tests usable before pycolmap is installed.
@@ -216,6 +217,54 @@ def match_features(
         )
     else:
         raise ValueError("matcher must be 'sequential', 'exhaustive', or 'vocabtree'")
+
+
+def build_vocabtree_candidate_pairs(
+    pycolmap_module: Any,
+    database_path: Path,
+    image_ids: list[int],
+    options: KeyframeSelectionOptions,
+    *,
+    vocab_tree_path: Path | None,
+) -> tuple[tuple[int, int], ...]:
+    validate_vocab_tree_path(vocab_tree_path)
+    pairing_options = pycolmap_module.VocabTreePairingOptions()
+    pairing_options.num_nearest_neighbors = options.vocabtree_neighbors
+    pairing_options.num_checks = options.vocabtree_checks
+    if vocab_tree_path is not None:
+        pairing_options.vocab_tree_path = vocab_tree_path
+
+    database = pycolmap_module.Database.open(database_path)
+    try:
+        try:
+            pair_generator = pycolmap_module.VocabTreePairGenerator(
+                pairing_options,
+                database,
+                image_ids,
+            )
+        except ValueError as error:
+            if "Failed to read faiss index" not in str(error):
+                raise
+            raise ValueError(
+                "COLMAP could not read the vocabulary tree as a FAISS index. "
+                "Your installed pycolmap/COLMAP expects the newer FAISS "
+                "vocabulary-tree format, but the provided tree appears to be "
+                "a legacy FLANN-format tree. "
+                f"vocab_tree_path={vocab_tree_path}. "
+                "Use a FAISS-compatible tree for this COLMAP build, upgrade "
+                "the legacy tree with COLMAP's vocab_tree_upgrader, or run "
+                "with --keyframe-selection interval until a compatible tree "
+                "is available."
+            ) from error
+        return tuple(
+            (int(image_id1), int(image_id2))
+            for image_id1, image_id2 in pair_generator.all_pairs()
+            if int(image_id1) != int(image_id2)
+        )
+    finally:
+        close = getattr(database, "close", None)
+        if close is not None:
+            close()
 
 
 def run_incremental_mapping(

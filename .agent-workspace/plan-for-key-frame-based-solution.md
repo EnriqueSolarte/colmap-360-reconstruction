@@ -1,254 +1,339 @@
-Date: 2026-06-29
+Date: 2026-06-30
 Project version: v0.1.0
-Description: Plans keyframe-based matching for the native equirectangular COLMAP pipeline.
+Description: Plan and implementation record for keyframe/vocabtree panorama matching.
 
-# Plan For Keyframe-Based 360 Reconstruction
+# Keyframe-Based Matching Plan And Implementation
 
 ## Goal
 
-Add keyframe-based matching to the native `EQUIRECTANGULAR` COLMAP pipeline.
-The feature extraction and camera setup remain unchanged: every panorama is
-imported directly, all panoramas use one shared native `EQUIRECTANGULAR`
-camera, and features are extracted for every panorama image.
+Add keyframe-based matching to the native `EQUIRECTANGULAR` panorama COLMAP
+pipeline.
 
-Keyframes affect only the matching-pair selection stage.
+The import and feature stages stay unchanged:
 
-## Core Idea
+- every panorama is imported directly into the COLMAP workspace;
+- all panoramas use one shared native `EQUIRECTANGULAR` camera;
+- features are extracted for every panorama image.
 
-Use a sparse but connected image-pair graph:
+Keyframes only change the matching-pair planning stage. Instead of matching all
+images or relying only on sequential neighbors, the pipeline builds a sparse
+pair graph, writes it to `match_pairs.txt`, and asks COLMAP to match only those
+imported pairs.
 
-1. Keep a sequential local-neighbor backbone so ordered capture continuity is
-   preserved.
-2. Use keyframes to add longer-range structure without matching all images.
-3. Prefer vocabtree-based visual clusters as the main keyframe source:
-   panoramas that retrieve each other through vocabtree form visual clusters,
-   and each cluster gets one representative keyframe.
+## Plan We Chose
 
-This gives us a scalable matching strategy for large 360 datasets while still
-keeping enough local edges for incremental mapping to start and grow reliably.
+The final design is keyframe/vocabtree first, sequential fallback second.
 
-## Proposed CLI
+The planned pair graph order is:
 
-Extend the existing `--matcher` choices:
+1. Select keyframes from ordered panorama images.
+2. Add image-to-keyframe pairs inside each cluster.
+3. Add keyframe-to-neighbor-keyframe pairs.
+4. In vocabtree mode, add vocabulary-tree visual-neighbor candidate pairs.
+5. Add local sequential fallback pairs according to a policy.
+6. Deduplicate all unordered image-name pairs.
+7. Write the final list to `workspace/match_pairs.txt`.
+
+The reason for this order: vocabtree/keyframes give the runtime reduction, while
+the sequential fallback is a safety net for weak or disconnected visual
+retrieval.
+
+## What Was Implemented
+
+Implemented modules:
+
+- `src/colmap/panorama/keyframe_matching.py`
+- `src/colmap/panorama/cluster_pipeline.py`
+- `src/colmap/panorama/cli_clusters.py`
+- updates to `src/colmap/panorama/pipeline.py`
+- updates to `src/colmap/panorama/cli.py`
+- updates to `src/colmap/panorama/pycolmap_adapter.py`
+- updates to `src/colmap/panorama/database.py`
+- updates to `src/colmap/panorama/reports.py`
+- compatibility exports in `src/colmap/panorama_reconstruct.py`
+- vocabulary-tree downloader in `src/tools/download_colmap_vocab_tree.py`
+
+Implemented command-line entry points:
 
 ```bash
---matcher {sequential,exhaustive,vocabtree,keyframes}
+colmap-panorama-reconstruct --matcher keyframes ...
+colmap-panorama-clusters ...
+tools-download-colmap-vocab-tree ...
 ```
 
-Add keyframe-specific options:
+## Implemented Pair Planning API
 
-```bash
---keyframe-selection {vocabtree,interval}
---keyframe-interval 10
---keyframe-overlap 3
---keyframe-cluster-min-size 2
---keyframe-cluster-max-size 30
---keyframe-vocabtree-neighbors 10
---keyframe-vocabtree-checks 64
-```
+`keyframe_matching.py` owns the pure planning logic.
 
-Defaults:
+Main data structures:
 
-- `--matcher sequential` remains the default to avoid changing current runs.
-- If `--matcher keyframes`, default to `--keyframe-selection vocabtree`.
-- `--overlap` continues to mean local sequential neighbor overlap.
-- `--vocab-tree-path` is required for `--matcher keyframes --keyframe-selection vocabtree`.
-- `--loop-detection` is ignored in keyframe mode because keyframe mode writes
-  its own imported pair list.
+- `KeyframeSelectionOptions`
+- `KeyframeCluster`
+- `KeyframePairPlan`
+
+Main helpers:
+
+- `normalize_image_pair`
+- `deduplicate_image_pairs`
+- `build_sequential_backbone_pairs`
+- `build_backbone_pairs_for_policy`
+- `build_interval_keyframes`
+- `build_interval_keyframe_pair_plan`
+- `build_sequential_vocabtree_clusters`
+- `build_sequential_vocabtree_pair_plan`
+- `select_cluster_keyframe`
+
+`KeyframePairPlan` preserves pair provenance:
+
+- `keyframe_pairs`
+- `vocabtree_pairs`
+- `sequential_backbone_pairs`
+- `all_pairs`
+- `pair_counts_by_source`
+- `keyframes`
+- `clusters`
+
+The final pair list is deterministic, unordered, deduplicated, and stored as
+image-name pairs.
+
+## Implemented Modes
+
+### Interval Keyframes
+
+This is the deterministic baseline.
+
+Behavior:
+
+1. Select every `--keyframe-interval` image.
+2. Always include the first and last image.
+3. Assign each image to its nearest keyframe.
+4. Add image-to-keyframe pairs.
+5. Add keyframe-to-next-keyframe pairs using `--keyframe-overlap`.
+6. Add sequential fallback pairs according to `--keyframe-backbone-policy`.
+
+This mode does not require a vocabulary tree.
 
 Example:
+
+```bash
+colmap-panorama-clusters \
+  --workspace /workspace/data/colmap-equirectangular \
+  --keyframe-selection interval \
+  --keyframe-interval 10
+```
+
+### Sequential Vocabtree Keyframes
+
+This is the preferred mode for ordered panorama captures.
+
+Behavior:
+
+1. Features are already extracted for all images.
+2. `pycolmap.VocabTreePairGenerator` produces visual-neighbor candidate pairs
+   from the COLMAP database.
+3. Images are scanned in capture order.
+4. The first image starts the current cluster as a temporary anchor.
+5. Each next image joins the current cluster if it is connected by vocabtree to
+   the temporary anchor or one of the recent images in the cluster.
+6. If it is not visually connected, the current cluster closes and a new cluster
+   starts.
+7. After a cluster closes, the final keyframe is selected from that cluster.
+
+The first image in a cluster is only a temporary anchor. The final keyframe is
+selected after the cluster is known.
+
+Implemented keyframe selection score:
+
+1. highest vocabtree degree inside the cluster;
+2. higher feature count from the `keypoints` table;
+3. image closest to the cluster middle;
+4. earlier image order for deterministic ties.
+
+Example:
+
+```bash
+colmap-panorama-clusters \
+  --workspace /workspace/data/colmap-equirectangular \
+  --vocab-tree-path /workspace/data/colmap-vocab-tree/vocab_tree_flickr100K_words256K.bin \
+  --keyframe-selection sequential-vocabtree
+```
+
+## Sequential Fallback Policy
+
+Implemented policy flag:
+
+```bash
+--keyframe-backbone-policy {none,gaps,all}
+--keyframe-backbone-overlap 1
+```
+
+Policies:
+
+- `none`: add no local sequential fallback pairs.
+- `all`: add local sequential pairs for every image to the next
+  `--keyframe-backbone-overlap` images.
+- `gaps`: add only local sequential pairs missing from the keyframe/vocabtree
+  pair graph.
+
+Default behavior for keyframe mode is `gaps` with overlap `1`.
+
+## Full Reconstruction Integration
+
+The full reconstruction path now supports:
 
 ```bash
 colmap-panorama-reconstruct \
   --input-image-path /path/to/panoramas \
   --workspace /workspace/data/colmap-equirectangular-keyframes \
   --matcher keyframes \
-  --keyframe-selection vocabtree \
-  --vocab-tree-path /path/to/vocab_tree.bin \
-  --overlap 5 \
-  --keyframe-vocabtree-neighbors 10 \
-  --keyframe-cluster-max-size 30 \
-  --keyframe-overlap 3 \
+  --keyframe-selection sequential-vocabtree \
+  --vocab-tree-path /workspace/data/colmap-vocab-tree/vocab_tree_flickr100K_words256K.bin \
+  --keyframe-backbone-policy gaps \
+  --keyframe-backbone-overlap 1 \
   --overwrite
 ```
 
-## Matching Strategy
+Pipeline flow:
 
-### Sequential Backbone
+1. Import panorama images.
+2. Extract features for every panorama.
+3. Read generated image names and ids from the COLMAP database.
+4. If `--matcher keyframes`, call `cluster_pipeline.build_keyframe_pair_plan`.
+5. Write `workspace/match_pairs.txt`.
+6. Call COLMAP matching with imported image pairs.
+7. Run incremental mapping as before.
+8. Write the normal panorama reconstruction report.
 
-Always add local continuity pairs in keyframe mode:
+Non-keyframe matchers still use their previous matching paths.
 
-- For each image `i`, match to the next `--overlap` images.
-- Deduplicate unordered pairs.
-- Never match an image to itself.
+## Standalone Cluster Pipeline
 
-This protects against vocabtree failures in visually repetitive or weakly
-textured areas.
+The standalone cluster-stage CLI was added because this stage needs to be
+inspectable without running full reconstruction:
 
-### Interval Keyframes
+```bash
+colmap-panorama-clusters \
+  --workspace /workspace/data/colmap-equirectangular-keyframes \
+  --vocab-tree-path /workspace/data/colmap-vocab-tree/vocab_tree_flickr100K_words256K.bin \
+  --keyframe-selection sequential-vocabtree
+```
 
-This is the fallback and test-friendly selector:
+This command assumes the workspace already contains:
 
-- Select every `--keyframe-interval` image.
-- Always include the first and last image.
-- Add image-to-nearest-keyframe pairs.
-- Add keyframe-to-keyframe pairs to the next `--keyframe-overlap` keyframes.
+- `panorama_equirectangular_config.json`
+- `database.db`
+- extracted features in the database
 
-### Vocabtree Cluster Keyframes
+It writes:
 
-This is the preferred selector:
+- `match_pairs.txt`
+- `panorama_keyframe_cluster_report.json`
 
-1. After feature extraction, open the COLMAP database with pycolmap.
-2. Use `pycolmap.VocabTreePairGenerator` with `VocabTreePairingOptions`.
-3. Generate candidate visual-neighbor pairs for the panorama image ids.
-4. Build an undirected graph:
-   - node = image id/name
-   - edge = vocabtree candidate visual neighbor
-5. Split graph components into clusters.
-6. If a cluster is larger than `--keyframe-cluster-max-size`, split it by image
-   order into smaller chunks.
-7. If a cluster is smaller than `--keyframe-cluster-min-size`, merge it into
-   the nearest ordered cluster when possible; otherwise keep it as a singleton.
-8. Pick one representative keyframe per cluster.
+The cluster report records:
 
-Representative selection for v1:
+- selected mode and effective mode;
+- selected keyframes;
+- keyframe clusters;
+- pair counts by source;
+- final matching pair count;
+- paths to metadata, database, pair list, and report.
 
-- Choose the node with the highest graph degree.
-- Tie-break by larger feature count from the `keypoints` table.
-- Final tie-break by earlier image order for determinism.
+## Vocab Tree File
 
-Pairs generated from clusters:
+Sequential-vocabtree mode requires a local COLMAP vocabulary tree file. A helper
+was added:
 
-- Every image matches its cluster keyframe.
-- Cluster keyframes match the next `--keyframe-overlap` keyframes in image
-  order.
-- Optional cross-cluster vocabtree edges are kept only when either endpoint is
-  a cluster keyframe.
+```bash
+tools-download-colmap-vocab-tree \
+  --variant 256k \
+  --destination-dir /workspace/data/colmap-vocab-tree
+```
 
-## Implementation Changes
+Supported variants:
 
-Main file: `src/colmap/panorama_reconstruct.py`.
+- `32k`
+- `256k`
+- `1m`
+- `all`
 
-Add small data structures:
+The downloader prints progress, skips existing files by default, and supports
+`--overwrite` and `--dry-run`.
 
-- `KeyframeSelectionOptions`
-- `KeyframeCluster`
-- `KeyframePairPlan`
+## Report Updates
 
-Add helper functions:
+The normal panorama report now records keyframe information when keyframe mode
+is used.
 
-- `build_local_sequential_pairs(image_names, overlap)`
-- `build_interval_keyframes(image_names, keyframe_interval)`
-- `build_interval_keyframe_pair_plan(image_names, options)`
-- `build_vocabtree_candidate_pairs(pycolmap_module, database_path, image_ids, options)`
-- `cluster_vocabtree_pairs(image_records, candidate_pairs, options)`
-- `select_cluster_keyframe(cluster, feature_counts_by_image_id, image_order)`
-- `build_vocabtree_keyframe_pair_plan(...)`
-- `deduplicate_image_pairs(pairs)`
+Added report fields include:
 
-Update the pipeline:
-
-1. Import images and extract features as today.
-2. Read generated image ids/names from the database.
-3. If `matcher != "keyframes"`, keep the current matching path.
-4. If `matcher == "keyframes"`:
-   - build a `KeyframePairPlan`
-   - write `workspace/match_pairs.txt`
-   - call `match_features(..., image_pairs_path=paths["match_pairs"])`
-5. Run incremental mapping exactly as today.
-
-Update report fields:
-
-- `options.matcher`
 - `options.effective_pairing`
 - `options.keyframe_selection`
 - `options.keyframe_interval`
 - `options.keyframe_overlap`
+- `options.keyframe_backbone_policy`
+- `options.keyframe_backbone_overlap`
 - `options.keyframe_cluster_min_size`
 - `options.keyframe_cluster_max_size`
+- `options.keyframe_cluster_recent_window`
 - `options.keyframe_vocabtree_neighbors`
 - `options.keyframe_vocabtree_checks`
+- `options.keyframe_pair_count`
+- `options.vocabtree_pair_count`
+- `options.sequential_backbone_pair_count`
 - `options.matching_pair_count`
 - `options.match_pairs_path`
 - `keyframes`
 - `keyframe_clusters`
 
-Report cluster records should include:
+## Important Edge Behavior
 
-- `cluster_id`
-- `image_count`
-- `image_names`
-- `keyframe_image_name`
-- `keyframe_image_id`
-- `source`
+- Missing `--vocab-tree-path` in sequential-vocabtree mode is a CLI error.
+- Interval mode does not require a vocabulary tree.
+- If vocabtree candidate generation returns no pairs, the implementation falls
+  back to interval keyframes and records `effective_selection` as
+  `interval_fallback`.
+- Pair counts are tracked separately for keyframe, vocabtree, and sequential
+  fallback pairs.
+- Final `all_pairs` are deduplicated across all sources.
 
-## Edge Cases
+## Implemented Tests
 
-- 0 images: existing import path already raises.
-- 1 image: no pairs; fail before matching with a clear error because COLMAP
-  cannot reconstruct from one panorama.
-- 2 images: local sequential pair only.
-- Missing vocab tree in vocabtree keyframe mode: CLI/parser error.
-- Vocabtree returns no candidate pairs: fall back to interval keyframes and
-  record `keyframe_selection_effective: interval_fallback`.
-- Very large connected component: split by image order using
-  `--keyframe-cluster-max-size`.
-- Repetitive environment: sequential backbone remains active even if vocabtree
-  clusters are noisy.
+Tests cover:
 
-## Test Plan
+- pair normalization and deduplication;
+- pair source accounting;
+- interval keyframe selection;
+- interval pair planning;
+- sequential-vocabtree ordered clustering;
+- keyframe selection tie-breaking;
+- fallback policies `none`, `gaps`, and `all`;
+- pycolmap vocabtree candidate-pair adapter with fake pycolmap;
+- full reconstruction keyframe integration with fake pycolmap;
+- standalone cluster CLI;
+- vocabulary-tree downloader without real network access;
+- report fields and pair-list writing.
 
-Unit tests:
-
-- local sequential pair generation is deterministic and deduplicated.
-- interval keyframes include first/last and respect interval.
-- vocabtree graph clustering handles isolated nodes, multiple components, and
-  oversized components.
-- representative selection uses degree, then feature count, then image order.
-- pair plan combines local, image-to-keyframe, and keyframe-to-keyframe pairs
-  without duplicates.
-
-CLI tests:
-
-- `--matcher keyframes` is accepted.
-- invalid keyframe intervals/overlaps/cluster sizes are rejected.
-- vocabtree keyframe mode requires `--vocab-tree-path`.
-- interval keyframe mode does not require `--vocab-tree-path`.
-
-Pipeline tests with fake pycolmap:
-
-- keyframe interval mode writes `match_pairs.txt` and calls imported pair
-  matching.
-- keyframe vocabtree mode uses fake vocabtree candidate pairs and writes the
-  expected pair list.
-- report includes keyframe settings, selected keyframes, clusters, pair count,
-  and pair-list path.
-- non-keyframe matchers keep existing behavior.
-
-Validation:
+Latest verified command:
 
 ```bash
 python -m pytest
-python -m colmap.panorama_reconstruct --help
 ```
 
-## Rollout Plan
+Last observed result:
 
-1. Implement interval keyframe mode first as a deterministic baseline.
-2. Add vocabtree candidate-pair generation and clustering.
-3. Add report details and README examples.
-4. Run smoke reconstruction with `--image-limit`.
-5. Compare pair count, registered images, sparse points, and runtime against:
-   - `--matcher sequential`
-   - `--matcher vocabtree`
-   - `--matcher keyframes --keyframe-selection interval`
-   - `--matcher keyframes --keyframe-selection vocabtree`
+```text
+194 passed
+```
 
 ## Open Follow-Ups
 
-- Consider using verified inlier counts as cluster edge weights after an
-  initial lightweight matching pass.
-- Consider geospatial or timestamp-aware clustering if capture metadata becomes
-  available.
-- Consider exporting the keyframe graph as GraphML/JSON for inspection.
-- Consider a visual debug report that draws clusters over capture order.
+- Run a real smoke reconstruction with `--image-limit`.
+- Compare pair count, runtime, registered images, sparse points, and reprojection
+  error against:
+  - `--matcher sequential`;
+  - `--matcher vocabtree`;
+  - `--matcher keyframes --keyframe-selection interval`;
+  - `--matcher keyframes --keyframe-selection sequential-vocabtree`.
+- Inspect whether `gaps`, `none`, or `all` is the best fallback policy on real
+  data.
+- Consider exporting the keyframe graph as JSON or GraphML for visual debugging.
