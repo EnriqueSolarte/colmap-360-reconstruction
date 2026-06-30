@@ -103,12 +103,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Sequential fallback overlap for keyframe matching.",
     )
     parser.add_argument(
-        "--keyframe-cluster-min-size",
-        type=int,
-        default=2,
-        help="Minimum keyframe cluster size target.",
-    )
-    parser.add_argument(
         "--keyframe-cluster-max-size",
         type=int,
         default=30,
@@ -224,16 +218,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=1,
         help=(
             "Number of worker threads for sharded feature extraction. Values "
-            "greater than 1 extract into shard databases and merge them."
-        ),
-    )
-    parser.add_argument(
-        "--feature-batch-size",
-        type=int,
-        default=None,
-        help=(
-            "Images per feature shard. If omitted, batches are split across "
-            "--feature-workers."
+            "greater than 1 split imported images into that many balanced "
+            "feature shards."
         ),
     )
     parser.add_argument(
@@ -250,8 +236,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--import-workers must be positive")
     if args.feature_workers <= 0:
         parser.error("--feature-workers must be positive")
-    if args.feature_batch_size is not None and args.feature_batch_size <= 0:
-        parser.error("--feature-batch-size must be positive")
     if args.max_num_features <= 0:
         parser.error("--max-num-features must be positive")
     if args.max_image_size < -1 or args.max_image_size == 0:
@@ -264,12 +248,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--keyframe-overlap must be non-negative")
     if args.keyframe_backbone_overlap < 0:
         parser.error("--keyframe-backbone-overlap must be non-negative")
-    if args.keyframe_cluster_min_size <= 0:
-        parser.error("--keyframe-cluster-min-size must be positive")
     if args.keyframe_cluster_max_size <= 0:
         parser.error("--keyframe-cluster-max-size must be positive")
-    if args.keyframe_cluster_min_size > args.keyframe_cluster_max_size:
-        parser.error("--keyframe-cluster-min-size cannot exceed max size")
     if args.keyframe_cluster_recent_window < 0:
         parser.error("--keyframe-cluster-recent-window must be non-negative")
     if args.keyframe_vocabtree_neighbors <= 0:
@@ -318,14 +298,12 @@ def main(argv: list[str] | None = None) -> int:
         image_limit=args.image_limit,
         import_workers=args.import_workers,
         feature_workers=args.feature_workers,
-        feature_batch_size=args.feature_batch_size,
         keyframe_options=KeyframeSelectionOptions(
             selection=args.keyframe_selection,
             interval=args.keyframe_interval,
             overlap=args.keyframe_overlap,
             backbone_policy=args.keyframe_backbone_policy,
             backbone_overlap=args.keyframe_backbone_overlap,
-            cluster_min_size=args.keyframe_cluster_min_size,
             cluster_max_size=args.keyframe_cluster_max_size,
             cluster_recent_window=args.keyframe_cluster_recent_window,
             vocabtree_neighbors=args.keyframe_vocabtree_neighbors,

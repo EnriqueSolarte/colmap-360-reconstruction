@@ -291,7 +291,6 @@ def build_panorama_report(
             "keyframe_overlap": keyframe_options.overlap,
             "keyframe_backbone_policy": keyframe_options.backbone_policy,
             "keyframe_backbone_overlap": keyframe_options.backbone_overlap,
-            "keyframe_cluster_min_size": keyframe_options.cluster_min_size,
             "keyframe_cluster_max_size": keyframe_options.cluster_max_size,
             "keyframe_cluster_recent_window": keyframe_options.cluster_recent_window,
             "keyframe_vocabtree_neighbors": keyframe_options.vocabtree_neighbors,

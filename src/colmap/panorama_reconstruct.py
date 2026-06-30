@@ -31,6 +31,7 @@ from colmap.panorama.database import (
 )
 from colmap.panorama.feature_pipeline import (
     FeatureShardExtractionResult,
+    compute_feature_batch_size,
     extract_panorama_features_to_database,
     extract_panorama_features_to_sharded_database,
     merge_feature_shard_databases,
@@ -140,6 +141,7 @@ __all__ = [
     "build_sequential_vocabtree_pair_plan",
     "build_vocabtree_candidate_pairs",
     "colmap_frame_id_for_image",
+    "compute_feature_batch_size",
     "configure_ssl_cert_file",
     "create_feature_extraction_options",
     "create_feature_matching_options",

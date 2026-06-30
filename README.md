@@ -187,12 +187,13 @@ feature extraction, use the standalone cluster command:
 
 ```bash
 tools-download-colmap-vocab-tree \
+  --format faiss \
   --variant 256k \
   --destination-dir /workspace/data/colmap-vocab-tree
 
 colmap-panorama-clusters \
   --workspace /workspace/data/colmap-equirectangular-keyframes \
-  --vocab-tree-path /workspace/data/colmap-vocab-tree/vocab_tree_flickr100K_words256K.bin \
+  --vocab-tree-path /workspace/data/colmap-vocab-tree/vocab_tree_faiss_flickr100K_words256K.bin \
   --keyframe-selection sequential-vocabtree
 ```
 

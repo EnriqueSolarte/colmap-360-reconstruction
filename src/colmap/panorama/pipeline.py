@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import shutil
 import time
 from pathlib import Path
@@ -16,6 +15,7 @@ from colmap.panorama.database import (
 )
 from colmap.panorama.feature_pipeline import (
     FeatureShardExtractionResult,
+    compute_feature_batch_size,
     extract_panorama_features_to_database,
     extract_panorama_features_to_sharded_database,
 )
@@ -71,17 +71,15 @@ def run_panorama_reconstruction(
     image_limit: int | None = None,
     import_workers: int = 1,
     feature_workers: int = 1,
-    feature_batch_size: int | None = None,
     keyframe_options: KeyframeSelectionOptions = KeyframeSelectionOptions(),
     overwrite: bool = False,
 ) -> dict[str, Any]:
     if feature_workers <= 0:
         raise ValueError("feature_workers must be positive")
-    if feature_batch_size is not None and feature_batch_size <= 0:
-        raise ValueError("feature_batch_size must be positive")
     started_at = time.perf_counter()
     elapsed_seconds_by_stage: dict[str, float] = {}
     feature_shard_result: FeatureShardExtractionResult | None = None
+    feature_batch_size: int | None = None
     keyframe_pair_plan: KeyframePairPlan | None = None
     stage_started_at = started_at
     pycolmap_module = require_pycolmap()
@@ -122,8 +120,9 @@ def run_panorama_reconstruction(
             execution=execution,
         )
     else:
-        effective_feature_batch_size = feature_batch_size or math.ceil(
-            len(generated_image_names) / feature_workers,
+        feature_batch_size = compute_feature_batch_size(
+            image_count=len(generated_image_names),
+            feature_workers=feature_workers,
         )
         feature_shard_result = extract_panorama_features_to_sharded_database(
             pycolmap_module,
@@ -134,7 +133,7 @@ def run_panorama_reconstruction(
             feature_options=feature_options,
             execution=execution,
             image_names=generated_image_names,
-            batch_size=effective_feature_batch_size,
+            batch_size=feature_batch_size,
             feature_workers=feature_workers,
         )
     record_elapsed_stage(

@@ -56,6 +56,18 @@ def split_image_names_into_batches(
     )
 
 
+def compute_feature_batch_size(
+    *,
+    image_count: int,
+    feature_workers: int,
+) -> int:
+    if image_count <= 0:
+        raise ValueError("image_count must be positive")
+    if feature_workers <= 0:
+        raise ValueError("feature_workers must be positive")
+    return math.ceil(image_count / feature_workers)
+
+
 def extract_panorama_features_to_database(
     pycolmap_module: Any,
     *,
@@ -293,7 +305,10 @@ def run_panorama_feature_extraction(
             execution=execution,
         )
     else:
-        feature_batch_size = math.ceil(len(generated_image_names) / feature_workers)
+        feature_batch_size = compute_feature_batch_size(
+            image_count=len(generated_image_names),
+            feature_workers=feature_workers,
+        )
         feature_shard_result = extract_panorama_features_to_sharded_database(
             pycolmap_module,
             database_path=paths["database"],

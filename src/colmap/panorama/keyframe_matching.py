@@ -15,7 +15,6 @@ class KeyframeSelectionOptions:
     overlap: int = 3
     backbone_policy: str = "gaps"
     backbone_overlap: int = 1
-    cluster_min_size: int = 2
     cluster_max_size: int = 30
     cluster_recent_window: int = 3
     vocabtree_neighbors: int = 10
@@ -97,14 +96,8 @@ def validate_keyframe_selection_options(options: KeyframeSelectionOptions) -> No
         raise ValueError("keyframe backbone policy must be 'none', 'gaps', or 'all'")
     if options.backbone_overlap < 0:
         raise ValueError("keyframe backbone overlap must be non-negative")
-    if options.cluster_min_size <= 0:
-        raise ValueError("keyframe cluster minimum size must be positive")
     if options.cluster_max_size <= 0:
         raise ValueError("keyframe cluster maximum size must be positive")
-    if options.cluster_min_size > options.cluster_max_size:
-        raise ValueError(
-            "keyframe cluster minimum size cannot exceed maximum size",
-        )
     if options.cluster_recent_window < 0:
         raise ValueError("keyframe cluster recent window must be non-negative")
     if options.vocabtree_neighbors <= 0:
@@ -322,7 +315,6 @@ def build_sequential_vocabtree_pair_plan(
         overlap=options.overlap,
         backbone_policy=options.backbone_policy,
         backbone_overlap=options.backbone_overlap,
-        cluster_min_size=options.cluster_min_size,
         cluster_max_size=options.cluster_max_size,
         cluster_recent_window=options.cluster_recent_window,
         vocabtree_neighbors=options.vocabtree_neighbors,
@@ -407,7 +399,6 @@ def build_interval_keyframe_pair_plan(
         overlap=options.overlap,
         backbone_policy=options.backbone_policy,
         backbone_overlap=options.backbone_overlap,
-        cluster_min_size=options.cluster_min_size,
         cluster_max_size=options.cluster_max_size,
         cluster_recent_window=options.cluster_recent_window,
         vocabtree_neighbors=options.vocabtree_neighbors,

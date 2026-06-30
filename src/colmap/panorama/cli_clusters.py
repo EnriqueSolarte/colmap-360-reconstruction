@@ -57,7 +57,6 @@ def keyframe_options_from_cluster_args(
         overlap=args.keyframe_overlap,
         backbone_policy=args.keyframe_backbone_policy,
         backbone_overlap=args.keyframe_backbone_overlap,
-        cluster_min_size=args.keyframe_cluster_min_size,
         cluster_max_size=args.keyframe_cluster_max_size,
         cluster_recent_window=args.keyframe_cluster_recent_window,
         vocabtree_neighbors=args.keyframe_vocabtree_neighbors,
@@ -92,7 +91,6 @@ def build_keyframe_cluster_report(
             "keyframe_overlap": keyframe_options.overlap,
             "keyframe_backbone_policy": keyframe_options.backbone_policy,
             "keyframe_backbone_overlap": keyframe_options.backbone_overlap,
-            "keyframe_cluster_min_size": keyframe_options.cluster_min_size,
             "keyframe_cluster_max_size": keyframe_options.cluster_max_size,
             "keyframe_cluster_recent_window": (
                 keyframe_options.cluster_recent_window
@@ -179,12 +177,6 @@ def parse_cluster_args(argv: list[str]) -> argparse.Namespace:
         help="Sequential fallback overlap for keyframe matching.",
     )
     parser.add_argument(
-        "--keyframe-cluster-min-size",
-        type=int,
-        default=2,
-        help="Minimum keyframe cluster size target.",
-    )
-    parser.add_argument(
         "--keyframe-cluster-max-size",
         type=int,
         default=30,
@@ -222,12 +214,8 @@ def parse_cluster_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--keyframe-overlap must be non-negative")
     if args.keyframe_backbone_overlap < 0:
         parser.error("--keyframe-backbone-overlap must be non-negative")
-    if args.keyframe_cluster_min_size <= 0:
-        parser.error("--keyframe-cluster-min-size must be positive")
     if args.keyframe_cluster_max_size <= 0:
         parser.error("--keyframe-cluster-max-size must be positive")
-    if args.keyframe_cluster_min_size > args.keyframe_cluster_max_size:
-        parser.error("--keyframe-cluster-min-size cannot exceed max size")
     if args.keyframe_cluster_recent_window < 0:
         parser.error("--keyframe-cluster-recent-window must be non-negative")
     if args.keyframe_vocabtree_neighbors <= 0:

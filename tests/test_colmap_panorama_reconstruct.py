@@ -33,6 +33,7 @@ from colmap.panorama_reconstruct import (
     build_sequential_vocabtree_clusters,
     build_sequential_vocabtree_pair_plan,
     build_vocabtree_candidate_pairs,
+    compute_feature_batch_size,
     configure_ssl_cert_file,
     create_feature_extraction_options,
     create_feature_matching_options,
@@ -1214,7 +1215,6 @@ def test_run_panorama_reconstruction_uses_sharded_feature_extraction_when_reques
         input_dir,
         workspace,
         feature_workers=2,
-        feature_batch_size=2,
     )
 
     assert len(sharded_calls) == 1
@@ -1284,6 +1284,17 @@ def test_split_image_names_into_batches_preserves_order() -> None:
 
     with pytest.raises(ValueError, match="batch_size"):
         split_image_names_into_batches(["a.png"], batch_size=0)
+
+
+def test_compute_feature_batch_size_balances_images_across_workers() -> None:
+    assert compute_feature_batch_size(image_count=3, feature_workers=2) == 2
+    assert compute_feature_batch_size(image_count=12, feature_workers=4) == 3
+    assert compute_feature_batch_size(image_count=3, feature_workers=8) == 1
+
+    with pytest.raises(ValueError, match="image_count"):
+        compute_feature_batch_size(image_count=0, feature_workers=2)
+    with pytest.raises(ValueError, match="feature_workers"):
+        compute_feature_batch_size(image_count=3, feature_workers=0)
 
 
 def test_merge_feature_shard_databases_merges_iteratively(tmp_path) -> None:
@@ -2429,7 +2440,6 @@ def test_parse_args_accepts_image_limit(tmp_path) -> None:
     assert args.num_threads == -1
     assert args.import_workers == 1
     assert args.feature_workers == 1
-    assert args.feature_batch_size is None
     assert args.device == "auto"
     assert args.gpu_index == "-1"
     assert args.gpu_bundle_adjustment is True
@@ -2581,13 +2591,10 @@ def test_parse_args_accepts_feature_workers(tmp_path) -> None:
             str(tmp_path),
             "--feature-workers",
             "3",
-            "--feature-batch-size",
-            "5",
         ]
     )
 
     assert args.feature_workers == 3
-    assert args.feature_batch_size == 5
 
 
 @pytest.mark.parametrize(
@@ -2619,8 +2626,6 @@ def test_parse_args_rejects_invalid_import_workers(tmp_path, value) -> None:
     [
         ("--feature-workers", "0"),
         ("--feature-workers", "-1"),
-        ("--feature-batch-size", "0"),
-        ("--feature-batch-size", "-1"),
     ],
 )
 def test_parse_args_rejects_invalid_feature_workers(tmp_path, option, value) -> None:
