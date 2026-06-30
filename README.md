@@ -206,6 +206,33 @@ The workspace includes `panorama_equirectangular_config.json` and
 `native_equirectangular`, and the report records feature health, matching
 settings, registered panorama images, and sparse model statistics.
 
+To measure the gain from vocabulary-tree matching or vocabtree-backed keyframes,
+run the same input twice into separate workspaces and compare the reports:
+
+```bash
+colmap-panorama-reconstruct \
+  --input-image-path /path/to/panoramas \
+  --workspace /workspace/data/colmap-equirectangular-sequential \
+  --matcher sequential \
+  --overwrite
+
+colmap-panorama-reconstruct \
+  --input-image-path /path/to/panoramas \
+  --workspace /workspace/data/colmap-equirectangular-vocabtree \
+  --matcher vocabtree \
+  --vocab-tree-path /path/to/vocab_tree.bin \
+  --overwrite
+
+colmap-panorama-compare \
+  --baseline /workspace/data/colmap-equirectangular-sequential/panorama_equirectangular_report.json \
+  --candidate /workspace/data/colmap-equirectangular-vocabtree/panorama_equirectangular_report.json
+```
+
+Use the same feature settings, image limit, device, thread count, and GPU index
+for both runs. Treat lower matching/runtime numbers as a speed gain only if the
+candidate preserves acceptable registered-image count, sparse point count, and
+reprojection error.
+
 ## Manually Select Pinhole Render Directions
 
 After an equirectangular panorama reconstruction exists, you can manually choose

@@ -29,6 +29,7 @@ visualize = [
 
 [project.scripts]
 colmap-panorama-clusters = "colmap.panorama.cli_clusters:main"
+colmap-panorama-compare = "colmap.panorama.cli_compare:main"
 colmap-panorama-features = "colmap.panorama.cli_features:main"
 colmap-panorama-import = "colmap.panorama.cli_import:main"
 colmap-panorama-reconstruct = "colmap.panorama_reconstruct:main"
