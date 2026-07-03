@@ -125,6 +125,26 @@ The report should record:
 - per-render output filenames;
 - any skipped or failed selections.
 
+Implemented command shape:
+
+```bash
+manual-pinhole-render-selected \
+  --selections /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/selections.json \
+  --output-dir /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/renders \
+  --width 1280 \
+  --height 1280 \
+  --fov-x-deg 70 \
+  --fov-y-deg 70
+```
+
+`--image-dir` is optional when `selections.json` contains `source.image_dir`.
+`--output-dir` defaults to a `renders/` directory beside `selections.json`.
+The command writes rendered images and `render_report.json` without loading
+COLMAP, `pycolmap`, `sparse_best`, scene poses, or rig metadata.
+Rendering shows a `tqdm` progress bar. Use `--workers N` to render source
+panorama groups with multiple threads; the default is `--workers 1` for
+predictable memory use.
+
 ### Stage 3: Attach Poses From Reconstruction
 
 Input:

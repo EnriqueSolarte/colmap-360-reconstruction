@@ -11,6 +11,7 @@ from render_pinhole.tools.render_pinhole_image import (
     DEFAULT_WIDTH,
     main as render_image_main,
 )
+from render_pinhole.defaults import DEFAULT_PINHOLE_FOV_X, DEFAULT_PINHOLE_FOV_Y
 from render_pinhole.selection_schema import (
     auto_grid_selection_store,
     build_selection_store,
@@ -59,6 +60,13 @@ from render_pinhole.tools.manual_pinhole_select_server import (
 from render_pinhole.tools.manual_pinhole_select import _parse_args as parse_select_args
 from render_pinhole.tools.random_pinhole_image import main as random_render_image_main
 from render_pinhole.tools.render_pinhole_directory import main as render_directory_main
+from render_pinhole.tools.render_selected_pinhole import (
+    DEFAULT_FOV_X_DEGREES,
+    DEFAULT_FOV_Y_DEGREES,
+    RENDER_REPORT_FILENAME,
+    _parse_args as parse_render_selected_args,
+    main as render_selected_main,
+)
 from render_pinhole.view_sampling import (
     VIEW_SAMPLING_DESCRIPTIONS,
     random_views,
@@ -347,6 +355,143 @@ def test_manual_select_ui_highlighted_marker_can_be_deleted() -> None:
     assert "function updateHighlightedSelection(point)" in INDEX_HTML
     assert 'event.key.toLowerCase() === "d"' in INDEX_HTML
     assert "deleteSelection(highlightedSelectionIndex)" in INDEX_HTML
+
+
+def test_render_selected_pinhole_cli_writes_images_and_report(tmp_path, capsys) -> None:
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(image_dir / "front.png")
+    Image.fromarray(make_equirectangular_image()).save(image_dir / "back.png")
+    selections_path = tmp_path / "selections.json"
+    selections_store = build_selection_store(
+        image_dir=image_dir,
+        selections=[
+            selection_record(
+                pano_image_name="front.png",
+                selection_index=0,
+                longitude=pi / 4,
+                latitude=0.0,
+                selected_by="manual-pinhole-select",
+            ),
+            selection_record(
+                pano_image_name="back.png",
+                selection_index=0,
+                longitude=-pi / 4,
+                latitude=0.1,
+                selected_by="manual-pinhole-select",
+            )
+        ],
+        selection_mode="manual",
+    )
+    selections_path.write_text(
+        json.dumps(selections_store),
+        encoding="utf-8",
+    )
+
+    exit_code = render_selected_main(
+        [
+            "-s",
+            str(selections_path),
+            "-h",
+            "8",
+            "-w",
+            "10",
+            "--fov-x-deg",
+            "90",
+            "--fov-y-deg",
+            "60",
+            "--interpolation",
+            "nearest",
+            "--workers",
+            "2",
+        ]
+    )
+
+    output_dir = tmp_path / "renders"
+    output_path = output_dir / "front__sel-000.png"
+    second_output_path = output_dir / "back__sel-000.png"
+    report = json.loads(
+        (output_dir / RENDER_REPORT_FILENAME).read_text(encoding="utf-8")
+    )
+
+    assert exit_code == 0
+    assert output_path.exists()
+    assert second_output_path.exists()
+    assert np.asarray(Image.open(output_path)).shape == (8, 10, 3)
+    assert report["source"]["image_dir"] == str(image_dir)
+    assert report["options"]["workers"] == 2
+    assert report["render_params"]["width"] == 10
+    assert report["render_params"]["height"] == 8
+    assert report["render_params"]["fov_x_degrees"] == pytest.approx(90.0)
+    assert report["render_params"]["fov_y_degrees"] == pytest.approx(60.0)
+    assert report["rendered_count"] == 2
+    assert report["skipped_count"] == 0
+    assert report["failed_count"] == 0
+    assert [record["output_file"] for record in report["renders"]] == [
+        str(output_path),
+        str(second_output_path),
+    ]
+    captured = capsys.readouterr()
+    assert "Rendered: 2" in captured.out
+    assert "Rendering selected pinholes" in captured.err
+
+
+def test_render_selected_pinhole_cli_reports_missing_sources(tmp_path) -> None:
+    image_dir = tmp_path / "images"
+    output_dir = tmp_path / "selected-renders"
+    image_dir.mkdir()
+    selections_path = tmp_path / "selections.json"
+    selections_store = build_selection_store(
+        image_dir=image_dir,
+        selections=[
+            selection_record(
+                pano_image_name="missing.png",
+                selection_index=0,
+                longitude=0.0,
+                latitude=0.0,
+                selected_by="manual-pinhole-select",
+            )
+        ],
+        selection_mode="manual",
+    )
+    selections_path.write_text(
+        json.dumps(selections_store),
+        encoding="utf-8",
+    )
+
+    exit_code = render_selected_main(
+        [
+            "--selections",
+            str(selections_path),
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    report = json.loads(
+        (output_dir / RENDER_REPORT_FILENAME).read_text(encoding="utf-8")
+    )
+    assert exit_code == 1
+    assert report["rendered_count"] == 0
+    assert report["skipped_count"] == 1
+    assert report["skipped"][0]["pano_image_name"] == "missing.png"
+
+
+def test_render_selected_pinhole_cli_uses_degree_fov_only(tmp_path) -> None:
+    selections_path = tmp_path / "selections.json"
+    selections_path.write_text("{}", encoding="utf-8")
+
+    args = parse_render_selected_args(["-s", str(selections_path)])
+
+    assert args.fov_x_deg == DEFAULT_FOV_X_DEGREES
+    assert args.fov_y_deg == DEFAULT_FOV_Y_DEGREES
+    assert args.fov_x == pytest.approx(DEFAULT_PINHOLE_FOV_X)
+    assert args.fov_y == pytest.approx(DEFAULT_PINHOLE_FOV_Y)
+    with pytest.raises(SystemExit):
+        parse_render_selected_args(
+            ["-s", str(selections_path), "--fov-x", str(pi / 2)]
+        )
 
 
 def test_render_directory_cli_writes_multiple_outputs_per_image(tmp_path, capsys) -> None:
