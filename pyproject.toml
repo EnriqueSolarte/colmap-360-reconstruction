@@ -38,6 +38,7 @@ manual-pinhole-render = "render_pinhole.tools.manual_pinhole_render:main"
 manual-pinhole-select = "render_pinhole.tools.manual_pinhole_select:main"
 tools-sampling = "tools.sampling_dir:main"
 tools-proc-video = "tools.proc_video:main"
+tools-shift-panorama = "tools.shift_panorama:main"
 tools-download-colmap-vocab-tree = "tools.download_colmap_vocab_tree:main"
 
 

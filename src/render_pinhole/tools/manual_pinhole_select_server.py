@@ -16,7 +16,20 @@ from urllib.parse import urlparse
 from PIL import Image
 
 from colmap.camera import camera_from_fov
+from render_pinhole.defaults import (
+    DEFAULT_PINHOLE_FOV_X,
+    DEFAULT_PINHOLE_FOV_Y,
+    DEFAULT_PINHOLE_HEIGHT,
+    DEFAULT_PINHOLE_INTERPOLATION,
+    DEFAULT_PINHOLE_WIDTH,
+)
 from render_pinhole.renderer import EquirectangularToPinhole
+from render_pinhole.selection_schema import (
+    auto_grid_selection_store,
+    build_selection_store,
+    selection_record as flat_selection_record,
+    selection_summary as flat_selection_summary,
+)
 from render_pinhole.tools.manual_pinhole_selection_store import (
     load_metadata_with_selections,
     migrate_metadata_to_sidecar,
@@ -26,6 +39,7 @@ from render_pinhole.tools.manual_pinhole_selection_store import (
     write_metadata_with_sidecar,
 )
 from render_pinhole.tools.manual_pinhole_render import (
+    IMAGE_EXTENSIONS,
     METADATA_FILENAME,
     SOURCE_STATUS_MISSING,
     validate_latitude,
@@ -39,6 +53,9 @@ DEFAULT_PREVIEW_MAX_HEIGHT = 384
 DEFAULT_PANORAMA_DISPLAY_MAX_WIDTH = 1600
 DEFAULT_PANORAMA_DISPLAY_MAX_HEIGHT = 800
 MAX_UNDO_DEPTH = 20
+FLAT_SELECTIONS_FILENAME = "selections.json"
+SELECTOR_MODE_LEGACY_METADATA = "legacy_metadata"
+SELECTOR_MODE_IMAGE_DIR = "image_dir"
 
 
 def serve_selector(
@@ -57,6 +74,38 @@ def serve_selector(
     url = f"http://{host}:{server.server_address[1]}"
     print(f"Manual pinhole selector: {url}")
     print(f"Metadata: {metadata_path}")
+    print("Press Ctrl+C to stop.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        server.server_close()
+
+
+def serve_image_dir_selector(
+    image_dir: Path,
+    output_dir: Path,
+    *,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    image_records = image_dir_panorama_records(image_dir)
+    if not image_records:
+        raise RuntimeError(f"No panorama images found in {image_dir}")
+    server = ManualPinholeSelectionServer(
+        (host, port),
+        ManualPinholeSelectionHandler,
+        output_dir=output_dir,
+        image_dir=image_dir,
+        selector_mode=SELECTOR_MODE_IMAGE_DIR,
+        image_records=image_records,
+    )
+    url = f"http://{host}:{server.server_address[1]}"
+    print(f"Manual pinhole selector: {url}")
+    print(f"Image directory: {image_dir}")
+    print(f"Selections: {output_dir / FLAT_SELECTIONS_FILENAME}")
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()
@@ -108,6 +157,30 @@ def restore_undo_state(
     return restore_collection_snapshot(output_dir, undo_stack.pop())
 
 
+def read_flat_selection_snapshot(output_dir: Path) -> str | None:
+    selections_path = output_dir / FLAT_SELECTIONS_FILENAME
+    if not selections_path.is_file():
+        return None
+    return selections_path.read_text(encoding="utf-8")
+
+
+def restore_flat_selection_snapshot(
+    output_dir: Path,
+    image_dir: Path,
+    image_records: list[dict[str, Any]],
+    undo_stack: list[Any],
+) -> dict[str, Any] | None:
+    if not undo_stack:
+        return None
+    snapshot = undo_stack.pop()
+    selections_path = output_dir / FLAT_SELECTIONS_FILENAME
+    if snapshot is None:
+        selections_path.unlink(missing_ok=True)
+    else:
+        selections_path.write_text(str(snapshot), encoding="utf-8")
+    return load_flat_selection_store(output_dir, image_dir, image_records)
+
+
 def append_selection(
     metadata: dict[str, Any],
     pano_index: int,
@@ -119,6 +192,32 @@ def append_selection(
     selection = selection_record(metadata, panorama, longitude, latitude, overrides)
     panorama.setdefault("selections", []).append(selection)
     metadata["selection_summary"] = selection_summary(metadata)
+    return selection
+
+
+def append_flat_selection(
+    store: dict[str, Any],
+    image_record: dict[str, Any],
+    longitude: float,
+    latitude: float,
+) -> dict[str, Any]:
+    pano_image_name = str(image_record["pano_image_name"])
+    longitude = wrap_longitude(float(longitude))
+    latitude = float(latitude)
+    validate_latitude(latitude)
+    selection = flat_selection_record(
+        pano_image_name=pano_image_name,
+        selection_index=next_flat_selection_index(
+            store.get("selections", []),
+            pano_image_name,
+        ),
+        longitude=longitude,
+        latitude=latitude,
+        selected_by="manual-pinhole-select",
+    )
+    store.setdefault("selections", []).append(selection)
+    store["selection_mode"] = "manual"
+    store["selection_summary"] = flat_selection_summary(store["selections"])
     return selection
 
 
@@ -141,6 +240,28 @@ def delete_selection(
     return deleted
 
 
+def delete_flat_selection(
+    store: dict[str, Any],
+    image_record: dict[str, Any],
+    selection_index: int,
+) -> bool:
+    pano_image_name = str(image_record["pano_image_name"])
+    selections = store.setdefault("selections", [])
+    original_count = len(selections)
+    store["selections"] = [
+        selection
+        for selection in selections
+        if not (
+            selection.get("pano_image_name") == pano_image_name
+            and int(selection.get("selection_index", -1)) == selection_index
+        )
+    ]
+    deleted = len(store["selections"]) != original_count
+    if deleted:
+        store["selection_summary"] = flat_selection_summary(store["selections"])
+    return deleted
+
+
 def reset_panorama_selections(metadata: dict[str, Any], pano_index: int) -> int:
     panorama = panorama_at_index(metadata, pano_index)
     removed_count = len(panorama.get("selections", []))
@@ -156,6 +277,46 @@ def reset_collection_selections(metadata: dict[str, Any]) -> int:
         panorama["selections"] = []
     metadata["selection_summary"] = selection_summary(metadata)
     return removed_count
+
+
+def reset_flat_panorama_selections(
+    store: dict[str, Any],
+    image_record: dict[str, Any],
+) -> int:
+    pano_image_name = str(image_record["pano_image_name"])
+    selections = store.setdefault("selections", [])
+    remaining = [
+        selection
+        for selection in selections
+        if selection.get("pano_image_name") != pano_image_name
+    ]
+    removed_count = len(selections) - len(remaining)
+    store["selections"] = remaining
+    store["selection_summary"] = flat_selection_summary(remaining)
+    return removed_count
+
+
+def reset_flat_collection_selections(store: dict[str, Any]) -> int:
+    removed_count = len(store.get("selections", []))
+    store["selections"] = []
+    store["selection_summary"] = flat_selection_summary([])
+    return removed_count
+
+
+def replace_flat_auto_grid_selections(
+    *,
+    image_dir: Path,
+    image_records: list[dict[str, Any]],
+    delta_degrees: float,
+) -> dict[str, Any]:
+    return auto_grid_selection_store(
+        image_dir=image_dir,
+        pano_image_names=[
+            str(image_record["pano_image_name"])
+            for image_record in image_records
+        ],
+        delta_degrees=delta_degrees,
+    )
 
 
 def append_roi_selections(
@@ -188,6 +349,30 @@ def append_roi_selections(
         panorama.setdefault("selections", []).append(selection)
         selections.append(selection)
     metadata["selection_summary"] = selection_summary(metadata)
+    return selections
+
+
+def append_flat_roi_selections(
+    store: dict[str, Any],
+    image_record: dict[str, Any],
+    *,
+    longitude_min: float,
+    longitude_max: float,
+    latitude_min: float,
+    latitude_max: float,
+    delta_degrees: float,
+) -> list[dict[str, Any]]:
+    selections = []
+    for longitude, latitude in roi_points_by_delta(
+        longitude_min=longitude_min,
+        longitude_max=longitude_max,
+        latitude_min=latitude_min,
+        latitude_max=latitude_max,
+        delta_degrees=delta_degrees,
+    ):
+        selections.append(
+            append_flat_selection(store, image_record, longitude, latitude)
+        )
     return selections
 
 
@@ -294,6 +479,33 @@ def render_preview_png(
     return buffer.getvalue()
 
 
+def render_flat_preview_png(
+    image_record: dict[str, Any],
+    longitude: float,
+    latitude: float,
+    overrides: dict[str, Any] | None = None,
+) -> bytes:
+    source_path = Path(str(image_record["source_path"]))
+    params = preview_render_params(render_params(flat_render_metadata(), overrides))
+    longitude = wrap_longitude(float(longitude))
+    latitude = float(latitude)
+    validate_latitude(latitude)
+
+    renderer = EquirectangularToPinhole.from_file(source_path)
+    pinhole = renderer.render(
+        height=params["height"],
+        width=params["width"],
+        longitude=longitude,
+        latitude=latitude,
+        fov_x=params["fov_x"],
+        fov_y=params["fov_y"],
+        interpolation=params["interpolation"],
+    )
+    buffer = io.BytesIO()
+    Image.fromarray(pinhole).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 def render_panorama_display_jpeg(
     metadata: dict[str, Any],
     pano_index: int,
@@ -305,6 +517,23 @@ def render_panorama_display_jpeg(
         raise ValueError("display panorama max dimensions must be positive")
     panorama = panorama_at_index(metadata, pano_index)
     source_path = source_panorama_path(panorama)
+    with Image.open(source_path) as image:
+        display = image.convert("RGB")
+        display.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+        buffer = io.BytesIO()
+        display.save(buffer, format="JPEG", quality=85, optimize=True)
+    return buffer.getvalue()
+
+
+def render_flat_panorama_display_jpeg(
+    image_record: dict[str, Any],
+    *,
+    max_width: int = DEFAULT_PANORAMA_DISPLAY_MAX_WIDTH,
+    max_height: int = DEFAULT_PANORAMA_DISPLAY_MAX_HEIGHT,
+) -> bytes:
+    if max_width <= 0 or max_height <= 0:
+        raise ValueError("display panorama max dimensions must be positive")
+    source_path = Path(str(image_record["source_path"]))
     with Image.open(source_path) as image:
         display = image.convert("RGB")
         display.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
@@ -342,6 +571,21 @@ def render_params(
     if not params["output_extension"].startswith("."):
         params["output_extension"] = f".{params['output_extension']}"
     return params
+
+
+def flat_render_metadata() -> dict[str, Any]:
+    return {
+        "render_defaults": {
+            "width": DEFAULT_PINHOLE_WIDTH,
+            "height": DEFAULT_PINHOLE_HEIGHT,
+            "fov_x": DEFAULT_PINHOLE_FOV_X,
+            "fov_y": DEFAULT_PINHOLE_FOV_Y,
+            "fov_x_degrees": degrees(DEFAULT_PINHOLE_FOV_X),
+            "fov_y_degrees": degrees(DEFAULT_PINHOLE_FOV_Y),
+            "interpolation": DEFAULT_PINHOLE_INTERPOLATION,
+            "output_extension": ".png",
+        }
+    }
 
 
 def preview_render_params(
@@ -394,8 +638,84 @@ def next_selection_index(selections: list[dict[str, Any]]) -> int:
     return max(int(selection.get("selection_index", -1)) for selection in selections) + 1
 
 
+def next_flat_selection_index(
+    selections: list[dict[str, Any]],
+    pano_image_name: str,
+) -> int:
+    pano_selections = [
+        selection
+        for selection in selections
+        if selection.get("pano_image_name") == pano_image_name
+    ]
+    if not pano_selections:
+        return 0
+    return max(
+        int(selection.get("selection_index", -1))
+        for selection in pano_selections
+    ) + 1
+
+
 def selection_summary(metadata: dict[str, Any]) -> dict[str, int]:
     return selection_summary_from_metadata(metadata)
+
+
+def image_dir_panorama_records(image_dir: Path) -> list[dict[str, Any]]:
+    paths = sorted(
+        (
+            path
+            for path in image_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ),
+        key=lambda path: path.relative_to(image_dir).as_posix(),
+    )
+    return [
+        {
+            "pano_index": index,
+            "pano_image_name": path.relative_to(image_dir).as_posix(),
+            "source_path": str(path),
+        }
+        for index, path in enumerate(paths)
+    ]
+
+
+def image_record_at_index(
+    image_records: list[dict[str, Any]],
+    pano_index: int,
+) -> dict[str, Any]:
+    for image_record in image_records:
+        if int(image_record["pano_index"]) == int(pano_index):
+            return image_record
+    raise KeyError(f"Panorama index not found: {pano_index}")
+
+
+def load_flat_selection_store(
+    output_dir: Path,
+    image_dir: Path,
+    image_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    selections_path = output_dir / FLAT_SELECTIONS_FILENAME
+    if selections_path.is_file():
+        store = json.loads(selections_path.read_text(encoding="utf-8"))
+        store.setdefault("schema_version", 1)
+        store.setdefault("source", {"image_dir": str(image_dir)})
+        store.setdefault("selection_mode", "manual")
+        store.setdefault("selections", [])
+        store["selection_summary"] = flat_selection_summary(store["selections"])
+        return store
+    return build_selection_store(
+        image_dir=image_dir,
+        selections=[],
+        selection_mode="manual",
+    )
+
+
+def write_flat_selection_store(output_dir: Path, store: dict[str, Any]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    store["selection_summary"] = flat_selection_summary(store.get("selections", []))
+    (output_dir / FLAT_SELECTIONS_FILENAME).write_text(
+        json.dumps(store, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def api_state(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -452,6 +772,53 @@ def api_state(metadata: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def flat_api_state(
+    *,
+    image_dir: Path,
+    output_dir: Path,
+    image_records: list[dict[str, Any]],
+    store: dict[str, Any],
+) -> dict[str, Any]:
+    selections_by_name: dict[str, list[dict[str, Any]]] = {}
+    for selection in store.get("selections", []):
+        selections_by_name.setdefault(str(selection.get("pano_image_name")), []).append(
+            selection
+        )
+    panoramas = []
+    for image_record in image_records:
+        pano_image_name = str(image_record["pano_image_name"])
+        selections = sorted(
+            selections_by_name.get(pano_image_name, []),
+            key=lambda selection: int(selection.get("selection_index", -1)),
+        )
+        panoramas.append(
+            {
+                "pano_index": image_record["pano_index"],
+                "pano_filename": pano_image_name,
+                "pano_image_name": pano_image_name,
+                "scene_pano_filename": None,
+                "source_pano_filename": pano_image_name,
+                "source_status": "matched",
+                "pose_status": "missing",
+                "selections": selections,
+                "quality": {},
+            }
+        )
+    return {
+        "schema_version": store.get("schema_version"),
+        "selector_mode": SELECTOR_MODE_IMAGE_DIR,
+        "pano_dir": str(image_dir),
+        "image_dir": str(image_dir),
+        "scene_workspace": None,
+        "output_dir": str(output_dir),
+        "selections_path": str(output_dir / FLAT_SELECTIONS_FILENAME),
+        "render_defaults": flat_render_metadata()["render_defaults"],
+        "selection_summary": flat_selection_summary(store.get("selections", [])),
+        "panorama_count": len(panoramas),
+        "panoramas": panoramas,
+    }
+
+
 class ManualPinholeSelectionServer(ThreadingHTTPServer):
     def __init__(
         self,
@@ -459,11 +826,22 @@ class ManualPinholeSelectionServer(ThreadingHTTPServer):
         handler_class: type[BaseHTTPRequestHandler],
         *,
         output_dir: Path,
+        image_dir: Path | None = None,
+        selector_mode: str = SELECTOR_MODE_LEGACY_METADATA,
+        image_records: list[dict[str, Any]] | None = None,
     ):
         super().__init__(server_address, handler_class)
         self.output_dir = output_dir
+        self.image_dir = image_dir
+        self.selector_mode = selector_mode
+        self.image_records = image_records or []
         self.metadata_lock = threading.Lock()
-        self.undo_stack: list[dict[str, str | None] | str] = []
+        self.undo_stack: list[Any] = []
+
+    def image_dir_path(self) -> Path:
+        if self.image_dir is None:
+            raise ValueError("image_dir is not configured for this selector")
+        return self.image_dir
 
 
 class ManualPinholeSelectionHandler(BaseHTTPRequestHandler):
@@ -477,14 +855,23 @@ class ManualPinholeSelectionHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/state":
                 with self.server.metadata_lock:
-                    metadata = load_metadata(self.server.output_dir)
-                self.send_json(api_state(metadata))
+                    if self.server.selector_mode == SELECTOR_MODE_IMAGE_DIR:
+                        store = self.load_flat_store()
+                        self.send_json(self.flat_state(store))
+                    else:
+                        metadata = load_metadata(self.server.output_dir)
+                        self.send_json(api_state(metadata))
                 return
             if path.startswith("/api/panorama-preview/"):
                 pano_index = int(path.rsplit("/", 1)[1])
                 with self.server.metadata_lock:
-                    metadata = load_metadata(self.server.output_dir)
-                display = render_panorama_display_jpeg(metadata, pano_index)
+                    if self.server.selector_mode == SELECTOR_MODE_IMAGE_DIR:
+                        display = render_flat_panorama_display_jpeg(
+                            self.image_record_at_index(pano_index)
+                        )
+                    else:
+                        metadata = load_metadata(self.server.output_dir)
+                        display = render_panorama_display_jpeg(metadata, pano_index)
                 self.send_bytes(
                     display,
                     "image/jpeg",
@@ -494,9 +881,14 @@ class ManualPinholeSelectionHandler(BaseHTTPRequestHandler):
             if path.startswith("/api/panorama/"):
                 pano_index = int(path.rsplit("/", 1)[1])
                 with self.server.metadata_lock:
-                    metadata = load_metadata(self.server.output_dir)
-                    panorama = panorama_at_index(metadata, pano_index)
-                    source_path = source_panorama_path(panorama)
+                    if self.server.selector_mode == SELECTOR_MODE_IMAGE_DIR:
+                        source_path = Path(
+                            str(self.image_record_at_index(pano_index)["source_path"])
+                        )
+                    else:
+                        metadata = load_metadata(self.server.output_dir)
+                        panorama = panorama_at_index(metadata, pano_index)
+                        source_path = source_panorama_path(panorama)
                 content_type = mimetypes.guess_type(source_path.name)[0] or "image/png"
                 self.send_bytes(source_path.read_bytes(), content_type)
                 return
@@ -510,120 +902,270 @@ class ManualPinholeSelectionHandler(BaseHTTPRequestHandler):
             payload = self.read_json_body()
             if path == "/api/preview":
                 with self.server.metadata_lock:
-                    metadata = load_metadata(self.server.output_dir)
-                preview = render_preview_png(
-                    metadata,
-                    int(payload["pano_index"]),
-                    float(payload["longitude"]),
-                    float(payload["latitude"]),
-                    payload.get("render"),
-                )
+                    if self.server.selector_mode == SELECTOR_MODE_IMAGE_DIR:
+                        preview = render_flat_preview_png(
+                            self.image_record_at_index(int(payload["pano_index"])),
+                            float(payload["longitude"]),
+                            float(payload["latitude"]),
+                            payload.get("render"),
+                        )
+                    else:
+                        metadata = load_metadata(self.server.output_dir)
+                        preview = render_preview_png(
+                            metadata,
+                            int(payload["pano_index"]),
+                            float(payload["longitude"]),
+                            float(payload["latitude"]),
+                            payload.get("render"),
+                        )
                 self.send_bytes(preview, "image/png")
                 return
             if path == "/api/selections":
                 with self.server.metadata_lock:
-                    previous_snapshot = read_collection_snapshot(self.server.output_dir)
-                    metadata = load_metadata(self.server.output_dir)
-                    selection = append_selection(
-                        metadata,
-                        int(payload["pano_index"]),
-                        float(payload["longitude"]),
-                        float(payload["latitude"]),
-                        payload.get("render"),
-                    )
-                    remember_undo_state(self.server.undo_stack, previous_snapshot)
-                    write_metadata(self.server.output_dir, metadata)
-                self.send_json({"selection": selection, "state": api_state(metadata)})
+                    if self.server.selector_mode == SELECTOR_MODE_IMAGE_DIR:
+                        previous_snapshot = read_flat_selection_snapshot(
+                            self.server.output_dir
+                        )
+                        store = self.load_flat_store()
+                        selection = append_flat_selection(
+                            store,
+                            self.image_record_at_index(int(payload["pano_index"])),
+                            float(payload["longitude"]),
+                            float(payload["latitude"]),
+                        )
+                        remember_undo_state(self.server.undo_stack, previous_snapshot)
+                        write_flat_selection_store(self.server.output_dir, store)
+                        state = self.flat_state(store)
+                    else:
+                        previous_snapshot = read_collection_snapshot(self.server.output_dir)
+                        metadata = load_metadata(self.server.output_dir)
+                        selection = append_selection(
+                            metadata,
+                            int(payload["pano_index"]),
+                            float(payload["longitude"]),
+                            float(payload["latitude"]),
+                            payload.get("render"),
+                        )
+                        remember_undo_state(self.server.undo_stack, previous_snapshot)
+                        write_metadata(self.server.output_dir, metadata)
+                        state = api_state(metadata)
+                self.send_json({"selection": selection, "state": state})
                 return
             if path == "/api/sample-roi-selections":
                 with self.server.metadata_lock:
-                    previous_snapshot = read_collection_snapshot(self.server.output_dir)
-                    metadata = load_metadata(self.server.output_dir)
-                    selections = append_roi_selections(
-                        metadata,
-                        int(payload["pano_index"]),
-                        longitude_min=float(payload["longitude_min"]),
-                        longitude_max=float(payload["longitude_max"]),
-                        latitude_min=float(payload["latitude_min"]),
-                        latitude_max=float(payload["latitude_max"]),
-                        delta_degrees=float(payload["delta_degrees"]),
-                        overrides=payload.get("render"),
-                    )
-                    remember_undo_state(self.server.undo_stack, previous_snapshot)
-                    write_metadata(self.server.output_dir, metadata)
+                    if self.server.selector_mode == SELECTOR_MODE_IMAGE_DIR:
+                        previous_snapshot = read_flat_selection_snapshot(
+                            self.server.output_dir
+                        )
+                        store = self.load_flat_store()
+                        selections = append_flat_roi_selections(
+                            store,
+                            self.image_record_at_index(int(payload["pano_index"])),
+                            longitude_min=float(payload["longitude_min"]),
+                            longitude_max=float(payload["longitude_max"]),
+                            latitude_min=float(payload["latitude_min"]),
+                            latitude_max=float(payload["latitude_max"]),
+                            delta_degrees=float(payload["delta_degrees"]),
+                        )
+                        remember_undo_state(self.server.undo_stack, previous_snapshot)
+                        write_flat_selection_store(self.server.output_dir, store)
+                        state = self.flat_state(store)
+                    else:
+                        previous_snapshot = read_collection_snapshot(self.server.output_dir)
+                        metadata = load_metadata(self.server.output_dir)
+                        selections = append_roi_selections(
+                            metadata,
+                            int(payload["pano_index"]),
+                            longitude_min=float(payload["longitude_min"]),
+                            longitude_max=float(payload["longitude_max"]),
+                            latitude_min=float(payload["latitude_min"]),
+                            latitude_max=float(payload["latitude_max"]),
+                            delta_degrees=float(payload["delta_degrees"]),
+                            overrides=payload.get("render"),
+                        )
+                        remember_undo_state(self.server.undo_stack, previous_snapshot)
+                        write_metadata(self.server.output_dir, metadata)
+                        state = api_state(metadata)
                 self.send_json(
                     {
                         "created_count": len(selections),
                         "selections": selections,
-                        "state": api_state(metadata),
+                        "state": state,
+                    }
+                )
+                return
+            if path == "/api/auto-grid-selections":
+                with self.server.metadata_lock:
+                    if self.server.selector_mode != SELECTOR_MODE_IMAGE_DIR:
+                        raise ValueError(
+                            "auto-grid selections are only available in image-dir mode"
+                        )
+                    previous_snapshot = read_flat_selection_snapshot(
+                        self.server.output_dir
+                    )
+                    store = replace_flat_auto_grid_selections(
+                        image_dir=self.server.image_dir_path(),
+                        image_records=self.server.image_records,
+                        delta_degrees=float(payload["delta_degrees"]),
+                    )
+                    remember_undo_state(self.server.undo_stack, previous_snapshot)
+                    write_flat_selection_store(self.server.output_dir, store)
+                    state = self.flat_state(store)
+                self.send_json(
+                    {
+                        "created_count": len(store.get("selections", [])),
+                        "state": state,
                     }
                 )
                 return
             if path == "/api/delete-selection":
                 with self.server.metadata_lock:
-                    previous_snapshot = read_collection_snapshot(self.server.output_dir)
-                    metadata = load_metadata(self.server.output_dir)
-                    deleted = delete_selection(
-                        metadata,
-                        int(payload["pano_index"]),
-                        int(payload["selection_index"]),
-                    )
-                    if deleted:
-                        remember_undo_state(
-                            self.server.undo_stack,
-                            previous_snapshot,
+                    if self.server.selector_mode == SELECTOR_MODE_IMAGE_DIR:
+                        previous_snapshot = read_flat_selection_snapshot(
+                            self.server.output_dir
                         )
-                        write_metadata(self.server.output_dir, metadata)
+                        store = self.load_flat_store()
+                        deleted = delete_flat_selection(
+                            store,
+                            self.image_record_at_index(int(payload["pano_index"])),
+                            int(payload["selection_index"]),
+                        )
+                        if deleted:
+                            remember_undo_state(
+                                self.server.undo_stack,
+                                previous_snapshot,
+                            )
+                            write_flat_selection_store(self.server.output_dir, store)
+                        state = self.flat_state(store)
+                    else:
+                        previous_snapshot = read_collection_snapshot(self.server.output_dir)
+                        metadata = load_metadata(self.server.output_dir)
+                        deleted = delete_selection(
+                            metadata,
+                            int(payload["pano_index"]),
+                            int(payload["selection_index"]),
+                        )
+                        if deleted:
+                            remember_undo_state(
+                                self.server.undo_stack,
+                                previous_snapshot,
+                            )
+                            write_metadata(self.server.output_dir, metadata)
+                        state = api_state(metadata)
                 status = HTTPStatus.OK if deleted else HTTPStatus.NOT_FOUND
-                self.send_json({"deleted": deleted, "state": api_state(metadata)}, status)
+                self.send_json({"deleted": deleted, "state": state}, status)
                 return
             if path == "/api/reset-panorama-selections":
                 with self.server.metadata_lock:
-                    previous_snapshot = read_collection_snapshot(self.server.output_dir)
-                    metadata = load_metadata(self.server.output_dir)
-                    removed_count = reset_panorama_selections(
-                        metadata,
-                        int(payload["pano_index"]),
-                    )
-                    if removed_count:
-                        remember_undo_state(
-                            self.server.undo_stack,
-                            previous_snapshot,
+                    if self.server.selector_mode == SELECTOR_MODE_IMAGE_DIR:
+                        previous_snapshot = read_flat_selection_snapshot(
+                            self.server.output_dir
                         )
-                        write_metadata(self.server.output_dir, metadata)
+                        store = self.load_flat_store()
+                        removed_count = reset_flat_panorama_selections(
+                            store,
+                            self.image_record_at_index(int(payload["pano_index"])),
+                        )
+                        if removed_count:
+                            remember_undo_state(
+                                self.server.undo_stack,
+                                previous_snapshot,
+                            )
+                            write_flat_selection_store(self.server.output_dir, store)
+                        state = self.flat_state(store)
+                    else:
+                        previous_snapshot = read_collection_snapshot(self.server.output_dir)
+                        metadata = load_metadata(self.server.output_dir)
+                        removed_count = reset_panorama_selections(
+                            metadata,
+                            int(payload["pano_index"]),
+                        )
+                        if removed_count:
+                            remember_undo_state(
+                                self.server.undo_stack,
+                                previous_snapshot,
+                            )
+                            write_metadata(self.server.output_dir, metadata)
+                        state = api_state(metadata)
                 self.send_json(
-                    {"removed_count": removed_count, "state": api_state(metadata)}
+                    {"removed_count": removed_count, "state": state}
                 )
                 return
             if path == "/api/reset-collection-selections":
                 with self.server.metadata_lock:
-                    previous_snapshot = read_collection_snapshot(self.server.output_dir)
-                    metadata = load_metadata(self.server.output_dir)
-                    removed_count = reset_collection_selections(metadata)
-                    if removed_count:
-                        remember_undo_state(
-                            self.server.undo_stack,
-                            previous_snapshot,
+                    if self.server.selector_mode == SELECTOR_MODE_IMAGE_DIR:
+                        previous_snapshot = read_flat_selection_snapshot(
+                            self.server.output_dir
                         )
-                        write_metadata(self.server.output_dir, metadata)
+                        store = self.load_flat_store()
+                        removed_count = reset_flat_collection_selections(store)
+                        if removed_count:
+                            remember_undo_state(
+                                self.server.undo_stack,
+                                previous_snapshot,
+                            )
+                            write_flat_selection_store(self.server.output_dir, store)
+                        state = self.flat_state(store)
+                    else:
+                        previous_snapshot = read_collection_snapshot(self.server.output_dir)
+                        metadata = load_metadata(self.server.output_dir)
+                        removed_count = reset_collection_selections(metadata)
+                        if removed_count:
+                            remember_undo_state(
+                                self.server.undo_stack,
+                                previous_snapshot,
+                            )
+                            write_metadata(self.server.output_dir, metadata)
+                        state = api_state(metadata)
                 self.send_json(
-                    {"removed_count": removed_count, "state": api_state(metadata)}
+                    {"removed_count": removed_count, "state": state}
                 )
                 return
             if path == "/api/undo":
                 with self.server.metadata_lock:
-                    metadata = restore_undo_state(
-                        self.server.output_dir,
-                        self.server.undo_stack,
-                    )
-                    undone = metadata is not None
-                    if metadata is None:
-                        metadata = load_metadata(self.server.output_dir)
-                self.send_json({"undone": undone, "state": api_state(metadata)})
+                    if self.server.selector_mode == SELECTOR_MODE_IMAGE_DIR:
+                        store = restore_flat_selection_snapshot(
+                            self.server.output_dir,
+                            self.server.image_dir_path(),
+                            self.server.image_records,
+                            self.server.undo_stack,
+                        )
+                        undone = store is not None
+                        if store is None:
+                            store = self.load_flat_store()
+                        state = self.flat_state(store)
+                    else:
+                        metadata = restore_undo_state(
+                            self.server.output_dir,
+                            self.server.undo_stack,
+                        )
+                        undone = metadata is not None
+                        if metadata is None:
+                            metadata = load_metadata(self.server.output_dir)
+                        state = api_state(metadata)
+                self.send_json({"undone": undone, "state": state})
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
             self.send_error(HTTPStatus.BAD_REQUEST, str(error))
+
+    def load_flat_store(self) -> dict[str, Any]:
+        return load_flat_selection_store(
+            self.server.output_dir,
+            self.server.image_dir_path(),
+            self.server.image_records,
+        )
+
+    def flat_state(self, store: dict[str, Any]) -> dict[str, Any]:
+        return flat_api_state(
+            image_dir=self.server.image_dir_path(),
+            output_dir=self.server.output_dir,
+            image_records=self.server.image_records,
+            store=store,
+        )
+
+    def image_record_at_index(self, pano_index: int) -> dict[str, Any]:
+        return image_record_at_index(self.server.image_records, pano_index)
 
     def read_json_body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -821,6 +1363,11 @@ INDEX_HTML = r"""<!doctype html>
       box-shadow: 0 0 0 2px rgba(255, 59, 48, 0.32);
       transform: translate(-50%, -50%);
     }
+    .selection-marker.highlighted {
+      background: #32d74b;
+      box-shadow: 0 0 0 2px rgba(50, 215, 75, 0.36);
+      transform: translate(-50%, -50%) scale(1.1);
+    }
     .roi-box {
       position: absolute;
       display: none;
@@ -861,6 +1408,7 @@ INDEX_HTML = r"""<!doctype html>
       line-height: 1.35;
     }
     .meta strong { color: var(--text); font-weight: 600; }
+    .meta span { overflow-wrap: anywhere; }
     #preview {
       width: 100%;
       aspect-ratio: 4 / 3;
@@ -968,9 +1516,9 @@ INDEX_HTML = r"""<!doctype html>
     </section>
     <aside>
       <section class="panel meta">
-        <div><strong>Source</strong> <span id="source"></span></div>
-        <div><strong>Scene</strong> <span id="scene"></span></div>
-        <div><strong>Quality</strong> <span id="quality"></span></div>
+        <div><strong id="sourceLabel">Source</strong> <span id="source"></span></div>
+        <div><strong id="sceneLabel">Scene</strong> <span id="scene"></span></div>
+        <div><strong id="qualityLabel">Quality</strong> <span id="quality"></span></div>
         <div><strong>Selected</strong> <span id="selectedCount"></span></div>
       </section>
       <section class="panel">
@@ -994,10 +1542,6 @@ INDEX_HTML = r"""<!doctype html>
           <button id="previewBtn">Preview</button>
           <button id="saveBtn" class="primary">Save</button>
         </div>
-        <label class="checkbox-row">
-          <input id="cmdSaveOnly" type="checkbox">
-          Cmd-click save only
-        </label>
         <div class="roi-controls">
           <label class="checkbox-row">
             <input id="roiMode" type="checkbox">
@@ -1009,6 +1553,7 @@ INDEX_HTML = r"""<!doctype html>
       </section>
       <section class="reset-actions">
         <button id="undoBtn">Undo</button>
+        <button id="autoGridBtn">Auto Grid</button>
         <button id="resetPanoBtn" class="danger">Reset Pano</button>
         <button id="resetCollectionBtn" class="danger">Reset Collection</button>
       </section>
@@ -1027,8 +1572,11 @@ INDEX_HTML = r"""<!doctype html>
       next: document.getElementById("next"),
       counter: document.getElementById("counter"),
       filename: document.getElementById("filename"),
+      sourceLabel: document.getElementById("sourceLabel"),
       source: document.getElementById("source"),
+      sceneLabel: document.getElementById("sceneLabel"),
       scene: document.getElementById("scene"),
+      qualityLabel: document.getElementById("qualityLabel"),
       quality: document.getElementById("quality"),
       selectedCount: document.getElementById("selectedCount"),
       lonDeg: document.getElementById("lonDeg"),
@@ -1041,10 +1589,10 @@ INDEX_HTML = r"""<!doctype html>
       preview: document.getElementById("preview"),
       previewBtn: document.getElementById("previewBtn"),
       saveBtn: document.getElementById("saveBtn"),
-      cmdSaveOnly: document.getElementById("cmdSaveOnly"),
       roiMode: document.getElementById("roiMode"),
       roiDeltaDeg: document.getElementById("roiDeltaDeg"),
       undoBtn: document.getElementById("undoBtn"),
+      autoGridBtn: document.getElementById("autoGridBtn"),
       resetPanoBtn: document.getElementById("resetPanoBtn"),
       resetCollectionBtn: document.getElementById("resetCollectionBtn"),
       status: document.getElementById("status"),
@@ -1055,6 +1603,8 @@ INDEX_HTML = r"""<!doctype html>
     let roiStart = null;
     let isDrawingRoi = false;
     let suppressNextClick = false;
+    let highlightedSelectionIndex = null;
+    const HIGHLIGHT_DISTANCE_PX = 14;
 
     function radians(value) { return Number(value) * Math.PI / 180; }
     function degrees(value) { return Number(value) * 180 / Math.PI; }
@@ -1069,6 +1619,14 @@ INDEX_HTML = r"""<!doctype html>
       };
     }
     function setStatus(message) { els.status.textContent = message || ""; }
+
+    function navigatePanorama(delta) {
+      if (!state || !state.panorama_count) return;
+      const nextIndex = clamp(index + delta, 0, state.panorama_count - 1);
+      if (nextIndex === index) return;
+      index = nextIndex;
+      draw();
+    }
 
     async function refresh() {
       const response = await fetch("/api/state");
@@ -1085,20 +1643,35 @@ INDEX_HTML = r"""<!doctype html>
 
     function draw() {
       if (!state || !state.panorama_count) return;
+      highlightedSelectionIndex = null;
       const current = pano();
       const quality = current.quality || {};
+      const imageDirMode = state.selector_mode === "image_dir";
       els.counter.textContent = `${index + 1} / ${state.panorama_count}`;
       els.filename.textContent = current.pano_filename || "";
-      els.source.textContent = current.source_pano_filename || current.source_status || "";
-      els.scene.textContent = current.scene_pano_filename || "none";
-      els.quality.textContent = [
-        `obs ${quality.triangulated_observation_count ?? "n/a"}`,
-        `pts ${quality.unique_point3D_count ?? "n/a"}`,
-        `err ${formatNumber(quality.mean_reprojection_error_px)}`
-      ].join("  ");
+      if (imageDirMode) {
+        els.sourceLabel.textContent = "Image";
+        els.sceneLabel.textContent = "Image Dir";
+        els.qualityLabel.textContent = "Selections Path";
+        els.source.textContent = current.pano_image_name || current.pano_filename || "";
+        els.scene.textContent = state.image_dir || state.pano_dir || "";
+        els.quality.textContent = state.selections_path || "";
+      } else {
+        els.sourceLabel.textContent = "Source";
+        els.sceneLabel.textContent = "Scene";
+        els.qualityLabel.textContent = "Quality";
+        els.source.textContent = current.source_pano_filename || current.source_status || "";
+        els.scene.textContent = current.scene_pano_filename || "none";
+        els.quality.textContent = [
+          `obs ${quality.triangulated_observation_count ?? "n/a"}`,
+          `pts ${quality.unique_point3D_count ?? "n/a"}`,
+          `err ${formatNumber(quality.mean_reprojection_error_px)}`
+        ].join("  ");
+      }
       els.selectedCount.textContent = `${current.selections.length}`;
       els.prev.disabled = index === 0;
       els.next.disabled = index >= state.panorama_count - 1;
+      els.autoGridBtn.disabled = !imageDirMode;
       clearMarkers();
       els.panorama.onload = () => drawMarkers(pano());
       els.panorama.src = `/api/panorama-preview/${current.pano_index}`;
@@ -1113,24 +1686,65 @@ INDEX_HTML = r"""<!doctype html>
       els.markerLayer.innerHTML = "";
     }
 
+    function selectionDisplayPoint(selection, rect) {
+      const longitude = Number(selection.longitude);
+      const latitude = Number(selection.latitude);
+      if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) return null;
+      return {
+        x: clamp(((longitude + Math.PI) / (2 * Math.PI)) * rect.width, 0, rect.width),
+        y: clamp(((Math.PI / 2 - latitude) / Math.PI) * rect.height, 0, rect.height)
+      };
+    }
+
     function drawMarkers(current) {
       clearMarkers();
       if (!current || !current.selections.length) return;
       const rect = els.panorama.getBoundingClientRect();
       if (!rect.width || !rect.height) return;
       for (const selection of current.selections) {
-        const longitude = Number(selection.longitude);
-        const latitude = Number(selection.latitude);
-        if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) continue;
-        const x = clamp(((longitude + Math.PI) / (2 * Math.PI)) * rect.width, 0, rect.width);
-        const y = clamp(((Math.PI / 2 - latitude) / Math.PI) * rect.height, 0, rect.height);
+        const point = selectionDisplayPoint(selection, rect);
+        if (!point) continue;
+        const selectionIndex = Number(selection.selection_index);
         const marker = document.createElement("div");
         marker.className = "selection-marker";
-        marker.style.left = `${x}px`;
-        marker.style.top = `${y}px`;
+        if (selectionIndex === highlightedSelectionIndex) {
+          marker.classList.add("highlighted");
+        }
+        marker.style.left = `${point.x}px`;
+        marker.style.top = `${point.y}px`;
         marker.title = `sel-${String(selection.selection_index).padStart(3, "0")}`;
         els.markerLayer.appendChild(marker);
       }
+    }
+
+    function nearestSelectionIndex(point) {
+      const current = pano();
+      if (!current || !current.selections.length) return null;
+      let nearest = null;
+      let nearestDistance = HIGHLIGHT_DISTANCE_PX;
+      for (const selection of current.selections) {
+        const selectionPoint = selectionDisplayPoint(selection, point.rect);
+        if (!selectionPoint) continue;
+        const distance = Math.hypot(point.x - selectionPoint.x, point.y - selectionPoint.y);
+        if (distance <= nearestDistance) {
+          nearest = Number(selection.selection_index);
+          nearestDistance = distance;
+        }
+      }
+      return nearest;
+    }
+
+    function updateHighlightedSelection(point) {
+      const nextHighlightedSelectionIndex = nearestSelectionIndex(point);
+      if (nextHighlightedSelectionIndex === highlightedSelectionIndex) return;
+      highlightedSelectionIndex = nextHighlightedSelectionIndex;
+      drawMarkers(pano());
+    }
+
+    function clearHighlightedSelection() {
+      if (highlightedSelectionIndex === null) return;
+      highlightedSelectionIndex = null;
+      drawMarkers(pano());
     }
 
     function drawSelections(current) {
@@ -1307,6 +1921,26 @@ INDEX_HTML = r"""<!doctype html>
       setStatus(`Sampled ${payload.created_count} ROI view(s).`);
     }
 
+    async function autoGridSelections() {
+      if (state.selector_mode !== "image_dir") {
+        setStatus("Auto Grid is only available in image-directory mode.");
+        return;
+      }
+      const deltaDegrees = Math.max(0.1, Number(els.roiDeltaDeg.value) || 45);
+      if (!confirm(`Replace all saved selections with a ${formatNumber(deltaDegrees)} degree auto grid for every panorama?`)) return;
+      setStatus(`Creating ${formatNumber(deltaDegrees)} deg auto grid...`);
+      const response = await fetch("/api/auto-grid-selections", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({delta_degrees: deltaDegrees})
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      state = payload.state;
+      draw();
+      setStatus(`Auto Grid created ${payload.created_count} view(s).`);
+    }
+
     function cursorPoint(event) {
       const rect = els.panorama.getBoundingClientRect();
       const x = Math.min(Math.max(event.clientX - rect.left, 0), rect.width);
@@ -1336,6 +1970,7 @@ INDEX_HTML = r"""<!doctype html>
     function hideCursorLines() {
       els.cursorVertical.classList.remove("visible");
       els.cursorHorizontal.classList.remove("visible");
+      clearHighlightedSelection();
     }
 
     function showRoiBox(start, end) {
@@ -1366,6 +2001,7 @@ INDEX_HTML = r"""<!doctype html>
     function updatePanoramaPointer(event) {
       const point = cursorPoint(event);
       updateCursorLinesFromPoint(point);
+      updateHighlightedSelection(point);
       if (isDrawingRoi && roiStart) {
         showRoiBox(roiStart, point);
       }
@@ -1410,13 +2046,9 @@ INDEX_HTML = r"""<!doctype html>
       els.latDeg.value = degrees(angles.latitude).toFixed(2);
       const saveModifier = event.metaKey || event.ctrlKey;
       if (saveModifier) {
-        if (els.cmdSaveOnly.checked) {
-          saveSelectionAndAdvance(event.shiftKey).catch(error => setStatus(error.message));
-        } else {
-          preview()
-            .then(() => saveSelection())
-            .catch(error => setStatus(error.message));
-        }
+        preview()
+          .then(() => saveSelectionAndAdvance(event.shiftKey))
+          .catch(error => setStatus(error.message));
       } else {
         preview().catch(error => setStatus(error.message));
       }
@@ -1430,8 +2062,8 @@ INDEX_HTML = r"""<!doctype html>
       return Math.min(Math.max(value, min), max);
     }
 
-    els.prev.onclick = () => { index = Math.max(index - 1, 0); draw(); };
-    els.next.onclick = () => { index = Math.min(index + 1, state.panorama_count - 1); draw(); };
+    els.prev.onclick = () => navigatePanorama(-1);
+    els.next.onclick = () => navigatePanorama(1);
     els.panorama.onclick = pickFromClick;
     els.panorama.onmousedown = startRoi;
     els.panorama.onmouseup = finishRoi;
@@ -1440,11 +2072,22 @@ INDEX_HTML = r"""<!doctype html>
     els.previewBtn.onclick = () => preview().catch(error => setStatus(error.message));
     els.saveBtn.onclick = () => saveSelection().catch(error => setStatus(error.message));
     els.undoBtn.onclick = () => undoLastAction().catch(error => setStatus(error.message));
+    els.autoGridBtn.onclick = () => autoGridSelections().catch(error => setStatus(error.message));
     els.resetPanoBtn.onclick = () => resetPanoSelections().catch(error => setStatus(error.message));
     els.resetCollectionBtn.onclick = () => resetCollectionSelections().catch(error => setStatus(error.message));
     window.addEventListener("keydown", event => {
-      if (event.key === "ArrowLeft") els.prev.click();
-      if (event.key === "ArrowRight") els.next.click();
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        navigatePanorama(-1);
+      }
+      if (event.key === "ArrowRight") {
+        event.preventDefault();
+        navigatePanorama(1);
+      }
+      if (event.key.toLowerCase() === "d" && highlightedSelectionIndex !== null) {
+        event.preventDefault();
+        deleteSelection(highlightedSelectionIndex).catch(error => setStatus(error.message));
+      }
       if (event.key.toLowerCase() === "s") els.saveBtn.click();
     });
     window.addEventListener("resize", () => {

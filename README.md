@@ -496,6 +496,16 @@ Extract video frames through the bundled shell wrapper:
 tools-proc-video /path/to/video.mp4 5
 ```
 
+Shift extracted equirectangular panoramas horizontally:
+
+```bash
+tools-shift-panorama \
+  --input /path/to/video-frame-directory \
+  --output /path/to/shifted-video-frame-directory \
+  --theta 180 \
+  --workers 8
+```
+
 ## Important Limits
 
 - COLMAP output is raw monocular geometry in arbitrary scale and frame.

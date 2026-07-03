@@ -11,6 +11,11 @@ from render_pinhole.tools.render_pinhole_image import (
     DEFAULT_WIDTH,
     main as render_image_main,
 )
+from render_pinhole.selection_schema import (
+    auto_grid_selection_store,
+    build_selection_store,
+    selection_record,
+)
 from render_pinhole.tools.manual_pinhole_render import (
     ColmapPointRecord,
     PanoramaRigViewMetadata,
@@ -31,18 +36,27 @@ from render_pinhole.tools.manual_pinhole_selection_store import (
     write_metadata_with_sidecar,
 )
 from render_pinhole.tools.manual_pinhole_select_server import (
+    INDEX_HTML,
     append_roi_selections,
     append_selection,
+    append_flat_selection,
     delete_selection,
+    flat_api_state,
+    image_dir_panorama_records,
+    load_flat_selection_store,
     pixel_to_longitude_latitude,
+    replace_flat_auto_grid_selections,
+    render_flat_preview_png,
     render_panorama_display_jpeg,
     render_preview_png,
     remember_undo_state,
+    reset_flat_collection_selections,
     restore_undo_state,
     roi_points_by_delta,
     reset_collection_selections,
     reset_panorama_selections,
 )
+from render_pinhole.tools.manual_pinhole_select import _parse_args as parse_select_args
 from render_pinhole.tools.random_pinhole_image import main as random_render_image_main
 from render_pinhole.tools.render_pinhole_directory import main as render_directory_main
 from render_pinhole.view_sampling import (
@@ -301,6 +315,38 @@ def test_random_render_image_cli_writes_output(tmp_path, capsys) -> None:
     assert "Random longitude:" in output
     assert "Random latitude:" in output
     assert "Output pinhole resolution: 10x8" in output
+
+
+def test_manual_select_image_dir_defaults_output_dir_to_image_parent(tmp_path) -> None:
+    image_dir = tmp_path / "workspace" / "images"
+    explicit_output_dir = tmp_path / "manual-selections"
+    image_dir.mkdir(parents=True)
+
+    default_args = parse_select_args(["--image-dir", str(image_dir)])
+    explicit_args = parse_select_args(
+        ["--image-dir", str(image_dir), "--output-dir", str(explicit_output_dir)]
+    )
+
+    assert default_args.output_dir == image_dir.parent
+    assert explicit_args.output_dir == explicit_output_dir
+
+
+def test_manual_select_ui_cmd_click_and_arrow_navigation_defaults() -> None:
+    assert "cmdSaveOnly" not in INDEX_HTML
+    assert "Cmd-click save only" not in INDEX_HTML
+    assert "saveSelectionAndAdvance(event.shiftKey)" in INDEX_HTML
+    assert "function navigatePanorama(delta)" in INDEX_HTML
+    assert 'event.key === "ArrowLeft"' in INDEX_HTML
+    assert 'event.key === "ArrowRight"' in INDEX_HTML
+
+
+def test_manual_select_ui_highlighted_marker_can_be_deleted() -> None:
+    assert ".selection-marker.highlighted" in INDEX_HTML
+    assert "const HIGHLIGHT_DISTANCE_PX" in INDEX_HTML
+    assert "function nearestSelectionIndex(point)" in INDEX_HTML
+    assert "function updateHighlightedSelection(point)" in INDEX_HTML
+    assert 'event.key.toLowerCase() === "d"' in INDEX_HTML
+    assert "deleteSelection(highlightedSelectionIndex)" in INDEX_HTML
 
 
 def test_render_directory_cli_writes_multiple_outputs_per_image(tmp_path, capsys) -> None:
@@ -673,6 +719,91 @@ def test_manual_render_auto_select_grid_uses_45_degree_cells() -> None:
     assert points[0] == pytest.approx((-7 * pi / 8, 3 * pi / 8))
     assert points[7] == pytest.approx((7 * pi / 8, 3 * pi / 8))
     assert points[-1] == pytest.approx((7 * pi / 8, -3 * pi / 8))
+
+
+def test_flat_selection_store_supports_multiple_selections_per_panorama(tmp_path) -> None:
+    selections = [
+        selection_record(
+            pano_image_name="1782890858308.png",
+            selection_index=0,
+            longitude=0.52,
+            latitude=-0.12,
+            selected_by="manual-pinhole-select",
+        ),
+        selection_record(
+            pano_image_name="1782890858308.png",
+            selection_index=1,
+            longitude=1.2,
+            latitude=0.05,
+            selected_by="manual-pinhole-select",
+        ),
+        selection_record(
+            pano_image_name="nested/1782890859000.png",
+            selection_index=0,
+            longitude=-0.25,
+            latitude=0.1,
+            selected_by="manual-pinhole-select",
+        ),
+    ]
+
+    store = build_selection_store(
+        image_dir=tmp_path / "images",
+        selections=selections,
+        selection_mode="manual",
+    )
+
+    assert store["schema_version"] == 1
+    assert store["source"] == {"image_dir": str(tmp_path / "images")}
+    assert store["selection_mode"] == "manual"
+    assert store["selection_summary"] == {
+        "selected_panorama_count": 2,
+        "selection_count": 3,
+    }
+    assert [selection["selection_id"] for selection in store["selections"]] == [
+        "1782890858308__sel-000",
+        "1782890858308__sel-001",
+        "nested__1782890859000__sel-000",
+    ]
+    assert store["selections"][0]["longitude_degrees"] == pytest.approx(
+        degrees(0.52)
+    )
+    assert store["selections"][0]["latitude_degrees"] == pytest.approx(
+        degrees(-0.12)
+    )
+
+
+def test_flat_auto_grid_selection_store_uses_same_selection_shape(tmp_path) -> None:
+    store = auto_grid_selection_store(
+        image_dir=tmp_path / "images",
+        pano_image_names=["a.png", "b.png"],
+    )
+
+    assert store["selection_mode"] == "auto_grid"
+    assert store["selection_summary"] == {
+        "selected_panorama_count": 2,
+        "selection_count": 64,
+    }
+    assert store["auto_selection"] == {
+        "strategy": "longitude_latitude_grid",
+        "delta_degrees": 45.0,
+        "longitude_sample_count": 8,
+        "latitude_sample_count": 4,
+        "views_per_panorama": 32,
+        "selection_count": 64,
+    }
+    first_selection = store["selections"][0]
+    assert first_selection == {
+        "selection_id": "a__sel-000",
+        "pano_image_name": "a.png",
+        "selection_index": 0,
+        "longitude": pytest.approx(-7 * pi / 8),
+        "latitude": pytest.approx(3 * pi / 8),
+        "longitude_degrees": pytest.approx(-157.5),
+        "latitude_degrees": pytest.approx(67.5),
+        "selected_by": "auto_grid",
+    }
+    assert store["selections"][32]["selection_id"] == "b__sel-000"
+    assert set(store["selections"][0]) == set(store["selections"][32])
 
 
 def test_manual_render_cli_auto_selects_every_panorama(tmp_path, capsys) -> None:
@@ -1240,6 +1371,106 @@ def test_manual_select_preview_renders_png_bytes(tmp_path) -> None:
     assert preview.startswith(b"\x89PNG")
     image = Image.open(io.BytesIO(preview))
     assert np.asarray(image).shape == (8, 10, 3)
+
+
+def test_image_dir_selector_state_uses_flat_selections(tmp_path) -> None:
+    image_dir = tmp_path / "images"
+    output_dir = tmp_path / "selection"
+    nested_dir = image_dir / "nested"
+    nested_dir.mkdir(parents=True)
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(image_dir / "b.png")
+    Image.fromarray(make_equirectangular_image()).save(nested_dir / "a.png")
+
+    image_records = image_dir_panorama_records(image_dir)
+    store = load_flat_selection_store(output_dir, image_dir, image_records)
+    first_selection = append_flat_selection(store, image_records[0], pi / 4, 0.0)
+    second_selection = append_flat_selection(store, image_records[0], -pi / 4, 0.1)
+    state = flat_api_state(
+        image_dir=image_dir,
+        output_dir=output_dir,
+        image_records=image_records,
+        store=store,
+    )
+
+    assert [record["pano_image_name"] for record in image_records] == [
+        "b.png",
+        "nested/a.png",
+    ]
+    assert first_selection["selection_id"] == "b__sel-000"
+    assert second_selection["selection_id"] == "b__sel-001"
+    assert state["selector_mode"] == "image_dir"
+    assert state["selection_summary"] == {
+        "selected_panorama_count": 1,
+        "selection_count": 2,
+    }
+    assert state["panoramas"][0]["selections"] == [first_selection, second_selection]
+    assert state["panoramas"][1]["selections"] == []
+
+
+def test_image_dir_selector_preview_and_reset_are_colmap_free(tmp_path) -> None:
+    image_dir = tmp_path / "images"
+    output_dir = tmp_path / "selection"
+    image_dir.mkdir()
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(image_dir / "pano.png")
+    image_records = image_dir_panorama_records(image_dir)
+    store = load_flat_selection_store(output_dir, image_dir, image_records)
+
+    append_flat_selection(store, image_records[0], pi / 4, 0.0)
+    preview = render_flat_preview_png(
+        image_records[0],
+        pi / 4,
+        0.0,
+        {
+            "width": 10,
+            "height": 8,
+            "fov_x": pi / 2,
+            "fov_y": pi / 3,
+            "interpolation": "nearest",
+        },
+    )
+    removed_count = reset_flat_collection_selections(store)
+
+    assert preview.startswith(b"\x89PNG")
+    assert np.asarray(Image.open(io.BytesIO(preview))).shape == (8, 10, 3)
+    assert removed_count == 1
+    assert store["selection_summary"] == {
+        "selected_panorama_count": 0,
+        "selection_count": 0,
+    }
+
+
+def test_image_dir_selector_auto_grid_replaces_with_flat_store(tmp_path) -> None:
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(image_dir / "a.png")
+    Image.fromarray(make_equirectangular_image()).save(image_dir / "b.png")
+    image_records = image_dir_panorama_records(image_dir)
+
+    store = replace_flat_auto_grid_selections(
+        image_dir=image_dir,
+        image_records=image_records,
+        delta_degrees=90.0,
+    )
+
+    assert store["selection_mode"] == "auto_grid"
+    assert store["selection_summary"] == {
+        "selected_panorama_count": 2,
+        "selection_count": 16,
+    }
+    assert store["auto_selection"] == {
+        "strategy": "longitude_latitude_grid",
+        "delta_degrees": 90.0,
+        "longitude_sample_count": 4,
+        "latitude_sample_count": 2,
+        "views_per_panorama": 8,
+        "selection_count": 16,
+    }
+    assert store["selections"][0]["selected_by"] == "auto_grid"
+    assert store["selections"][0]["selection_id"] == "a__sel-000"
+    assert store["selections"][8]["selection_id"] == "b__sel-000"
 
 
 def test_manual_select_preview_caps_resolution_without_changing_saved_selection(
