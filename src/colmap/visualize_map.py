@@ -32,7 +32,8 @@ except ImportError:  # pragma: no cover - environment dependent
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WORKSPACE = PROJECT_ROOT / "data" / "colmap-equirectangular"
 DEFAULT_MODEL = DEFAULT_WORKSPACE / "sparse_best"
-CAMERA_STYLES = ("auto", "frustum", "sphere")
+CAMERA_STYLES = ("auto", "frustum", "pinhole", "sphere")
+DEFAULT_MIN_TRACK_LENGTH = 3
 PANORAMA_REFERENCE_FRAME_SCALE = 0.75
 PANORAMA_SPHERE_RADIUS_RATIO = 0.25
 
@@ -209,9 +210,46 @@ def panorama_prefixes_from_views(
 
 def resolve_camera_style(model_path: Path, requested_style: str) -> tuple[str, Path | None]:
     metadata_path = panorama_metadata_path(model_path)
+    if requested_style == "pinhole":
+        return "frustum", metadata_path
     if requested_style == "auto":
         return ("sphere" if metadata_path is not None else "frustum"), metadata_path
     return requested_style, metadata_path
+
+
+def derived_pinhole_pose_report_path(model_path: Path) -> Path | None:
+    candidates = (
+        model_path / "pose_report.json",
+        model_path.parent / "pose_report.json",
+        model_path.parent.parent / "pose_report.json",
+    )
+    for candidate in candidates:
+        if is_derived_pinhole_pose_report(candidate):
+            return candidate
+    return None
+
+
+def is_derived_pinhole_pose_report(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(report.get("views"), list)
+        and "pose_attached_view_count" in report
+        and "rendered_view_count" in report
+    )
+
+
+def effective_min_track_length(model_path: Path, requested_min_track_length: int) -> int:
+    if (
+        requested_min_track_length == DEFAULT_MIN_TRACK_LENGTH
+        and derived_pinhole_pose_report_path(model_path) is not None
+    ):
+        return 0
+    return requested_min_track_length
 
 
 def panorama_frame_groups(
@@ -654,9 +692,10 @@ def visualize(
     open3d_module = require_open3d()
     resolved_camera_style, metadata_path = resolve_camera_style(model_path, camera_style)
     panorama_views = panorama_views_from_metadata(metadata_path)
+    effective_min_track = effective_min_track_length(model_path, min_track_length)
     point_cloud = point_cloud_from_reconstruction(
         reconstruction,
-        min_track_length=min_track_length,
+        min_track_length=effective_min_track,
         max_reprojection_error=max_reprojection_error,
         remove_outliers=remove_outliers,
     )
@@ -805,17 +844,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="auto",
         help=(
             "Camera glyph style: auto uses panorama spheres when "
-            "panorama_equirectangular_config.json is found, frustum draws pinhole cameras, "
-            "sphere draws one surface sphere per panorama frame (default: auto)"
+            "panorama_equirectangular_config.json is found, frustum/pinhole "
+            "draws pinhole camera frustums, sphere draws one surface sphere "
+            "per panorama frame (default: auto)"
         ),
     )
     parser.add_argument(
         "--min-track-length",
         type=int,
-        default=3,
+        default=DEFAULT_MIN_TRACK_LENGTH,
         help=(
             "Minimum COLMAP track length for displayed 3D points; use 0 to "
-            "show untracked/synthetic points (default: 3)"
+            "show untracked/synthetic points. Derived pinhole exports with a "
+            "nearby pose_report.json default to 0 because their points3D "
+            "tracks are intentionally omitted (default: 3)"
         ),
     )
     parser.add_argument(

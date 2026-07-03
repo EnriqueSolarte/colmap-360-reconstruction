@@ -67,6 +67,13 @@ from render_pinhole.tools.render_selected_pinhole import (
     _parse_args as parse_render_selected_args,
     main as render_selected_main,
 )
+from render_pinhole.tools.attach_pinhole_poses import (
+    attach_pinhole_poses,
+    write_colmap_text_export,
+    lookup_panorama_pose,
+    native_panorama_pose_record,
+    panorama_match_keys,
+)
 from render_pinhole.view_sampling import (
     VIEW_SAMPLING_DESCRIPTIONS,
     random_views,
@@ -492,6 +499,141 @@ def test_render_selected_pinhole_cli_uses_degree_fov_only(tmp_path) -> None:
         parse_render_selected_args(
             ["-s", str(selections_path), "--fov-x", str(pi / 2)]
         )
+
+
+def test_attach_pinhole_poses_reports_matched_and_missing_native_poses(tmp_path) -> None:
+    selections_path = tmp_path / "selections.json"
+    render_report_path = tmp_path / "renders" / "render_report.json"
+    output_dir = tmp_path / "posed-renders"
+    selections_store = build_selection_store(
+        image_dir=tmp_path / "images",
+        selections=[
+            selection_record(
+                pano_image_name="front.png",
+                selection_index=0,
+                longitude=pi / 4,
+                latitude=0.0,
+                selected_by="manual-pinhole-select",
+            ),
+            selection_record(
+                pano_image_name="missing.png",
+                selection_index=0,
+                longitude=0.0,
+                latitude=0.0,
+                selected_by="manual-pinhole-select",
+            ),
+        ],
+        selection_mode="manual",
+    )
+    render_report = {
+        "renders": [
+            {
+                "selection_id": "front__sel-000",
+                "pano_image_name": "front.png",
+                "output_file": str(tmp_path / "renders" / "front__sel-000.png"),
+                "output_name": "front__sel-000.png",
+                "width": 10,
+                "height": 8,
+                "fov_x": pi / 2,
+                "fov_y": pi / 3,
+            },
+            {
+                "selection_id": "missing__sel-000",
+                "pano_image_name": "missing.png",
+                "output_file": str(tmp_path / "renders" / "missing__sel-000.png"),
+                "output_name": "missing__sel-000.png",
+                "width": 10,
+                "height": 8,
+                "fov_x": pi / 2,
+                "fov_y": pi / 3,
+            },
+        ],
+    }
+    reconstruction = FakeColmapReconstruction(
+        {
+            7: FakePoint3D(
+                error=0.25,
+                image_ids=[],
+                xyz=(1.0, 2.0, 3.0),
+                color=(10, 20, 30),
+            ),
+        },
+        num_reg_images=1,
+        images=(
+            FakeColmapImage(
+                image_id=7,
+                name="nested/front.png",
+                point3d_ids=[],
+            ),
+        ),
+    )
+
+    pose_report = attach_pinhole_poses(
+        selections_store=selections_store,
+        render_report=render_report,
+        selections_path=selections_path,
+        render_report_path=render_report_path,
+        sparse_best_path=tmp_path / "sparse_best",
+        output_dir=output_dir,
+        reconstruction=reconstruction,
+    )
+
+    assert pose_report["selected_view_count"] == 2
+    assert pose_report["rendered_view_count"] == 2
+    assert pose_report["registered_panorama_count"] == 1
+    assert pose_report["pose_attached_view_count"] == 1
+    assert pose_report["missing_pose_view_count"] == 1
+    matched = pose_report["views"][0]
+    missing = pose_report["views"][1]
+    assert matched["pose_status"] == "matched"
+    assert matched["source_colmap_image_name"] == "nested/front.png"
+    assert matched["pinhole_camera_pose"]["coordinate_frame"] == "colmap_world_unscaled"
+    assert matched["pinhole_camera_pose"]["center_world"] == [1.0, 2.0, 3.0]
+    assert missing == {
+        "selection_id": "missing__sel-000",
+        "pano_image_name": "missing.png",
+        "output_file": str(tmp_path / "renders" / "missing__sel-000.png"),
+        "pose_status": "missing",
+        "missing_reason": "panorama pose not registered in COLMAP model",
+    }
+    manifest = write_colmap_text_export(
+        pose_report=pose_report,
+        render_report=render_report,
+        reconstruction=reconstruction,
+        output_dir=output_dir,
+    )
+    sparse_dir = output_dir / "sparse" / "0"
+    assert manifest == {
+        "status": "exported",
+        "format": "colmap_text",
+        "coordinate_frame": "colmap_world_unscaled",
+        "sparse_dir": str(sparse_dir),
+        "camera_count": 1,
+        "image_count": 1,
+        "point3D_count": 1,
+        "points3D_tracks": "omitted_for_derived_pinhole_views",
+    }
+    cameras_text = (sparse_dir / "cameras.txt").read_text(encoding="utf-8")
+    images_text = (sparse_dir / "images.txt").read_text(encoding="utf-8")
+    points_text = (sparse_dir / "points3D.txt").read_text(encoding="utf-8")
+    assert "1 PINHOLE 10 8 5 6.92820323028 5 4" in cameras_text
+    assert "1 0.923879532511 0 -0.382683432365 0 1.41421356237 -2 -2.82842712475 1 front__sel-000.png" in images_text
+    assert "7 1 2 3 10 20 30 0.25" in points_text
+
+
+def test_native_panorama_pose_matching_uses_basename() -> None:
+    image = FakeColmapImage(
+        image_id=1,
+        name="images/front.png",
+        point3d_ids=[],
+    )
+    pose = native_panorama_pose_record(image)
+
+    assert panorama_match_keys("images/front.png") == (
+        "images/front.png",
+        "front.png",
+    )
+    assert lookup_panorama_pose({"front.png": pose}, "nested/front.png") is pose
 
 
 def test_render_directory_cli_writes_multiple_outputs_per_image(tmp_path, capsys) -> None:
@@ -2065,8 +2207,16 @@ class FakePoint2D:
 
 
 class FakePoint3D:
-    def __init__(self, error: float, image_ids: list[int]):
+    def __init__(
+        self,
+        error: float,
+        image_ids: list[int],
+        xyz: tuple[float, float, float] = (1.0, 2.0, 3.0),
+        color: tuple[int, int, int] = (255, 255, 255),
+    ):
         self.error = error
+        self.xyz = np.asarray(xyz, dtype=np.float64)
+        self.color = np.asarray(color, dtype=np.uint8)
         self.track = FakeTrack(image_ids)
 
 
@@ -2084,15 +2234,28 @@ class FakeTrackElement:
 
 
 class FakeColmapReconstruction:
-    def __init__(self, points: dict[int, FakePoint3D], num_reg_images: int):
+    def __init__(
+        self,
+        points: dict[int, FakePoint3D],
+        num_reg_images: int,
+        images: tuple[FakeColmapImage, ...] = (),
+    ):
         self._points = points
+        self.points3D = points
         self._num_reg_images = num_reg_images
+        self._images = {int(image.image_id): image for image in images}
 
     def point3D(self, point_id: int) -> FakePoint3D:
         return self._points[point_id]
 
     def num_reg_images(self) -> int:
         return self._num_reg_images
+
+    def reg_image_ids(self) -> list[int]:
+        return sorted(self._images)
+
+    def image(self, image_id: int) -> FakeColmapImage:
+        return self._images[int(image_id)]
 
 
 class FakePose:

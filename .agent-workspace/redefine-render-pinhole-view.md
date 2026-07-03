@@ -184,6 +184,26 @@ registered panorama count
 For pose-aware exports, unresolved selections should either be skipped
 explicitly or fail unless an option such as `--allow-missing-poses` is provided.
 
+First implemented command shape:
+
+```bash
+manual-pinhole-attach-poses \
+  --selections /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/selections.json \
+  --render-report /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/renders/render_report.json \
+  --sparse-best /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/sparse_best \
+  --output-dir /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/posed-renders
+```
+
+This stage writes `pose_report.json` by matching flat rendered selections to
+registered native equirectangular COLMAP image names. It also writes a COLMAP
+text model under `sparse/0` for pose-attached views:
+
+```text
+sparse/0/cameras.txt
+sparse/0/images.txt
+sparse/0/points3D.txt
+```
+
 ## Implementation Plan
 
 1. Define the flat `selections.json` schema and add a pure selection artifact

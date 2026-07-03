@@ -160,6 +160,12 @@ def test_camera_style_accepts_sphere():
     assert args.camera_style == "sphere"
 
 
+def test_camera_style_accepts_pinhole_alias():
+    args = visualize_map.parse_args(["--camera-style", "pinhole"])
+
+    assert args.camera_style == "pinhole"
+
+
 def test_auto_camera_style_uses_nearby_panorama_metadata(tmp_path):
     model_path = tmp_path / "sparse_best"
     model_path.mkdir()
@@ -172,6 +178,29 @@ def test_auto_camera_style_uses_nearby_panorama_metadata(tmp_path):
 
     assert style == "sphere"
     assert metadata_path == tmp_path / "panorama_equirectangular_config.json"
+
+
+def test_pinhole_camera_style_resolves_to_frustum(tmp_path):
+    model_path = tmp_path / "sparse" / "0"
+
+    style, metadata_path = visualize_map.resolve_camera_style(model_path, "pinhole")
+
+    assert style == "frustum"
+    assert metadata_path is None
+
+
+def test_derived_pinhole_pose_report_sets_default_min_track_length_zero(tmp_path):
+    model_path = tmp_path / "pose-renders" / "sparse" / "0"
+    model_path.mkdir(parents=True)
+    pose_report_path = tmp_path / "pose-renders" / "pose_report.json"
+    pose_report_path.write_text(
+        '{"rendered_view_count": 2, "pose_attached_view_count": 2, "views": []}\n',
+        encoding="utf-8",
+    )
+
+    assert visualize_map.derived_pinhole_pose_report_path(model_path) == pose_report_path
+    assert visualize_map.effective_min_track_length(model_path, 3) == 0
+    assert visualize_map.effective_min_track_length(model_path, 2) == 2
 
 
 def test_panorama_frame_groups_collapse_virtual_camera_images():
