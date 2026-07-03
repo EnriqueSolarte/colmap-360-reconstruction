@@ -233,49 +233,37 @@ for both runs. Treat lower matching/runtime numbers as a speed gain only if the
 candidate preserves acceptable registered-image count, sparse point count, and
 reprojection error.
 
-## Manually Select Pinhole Render Directions
+## Select And Render Pinhole Views
 
-After an equirectangular panorama reconstruction exists, you can manually choose
-longitude/latitude directions from the registered panoramas and render those
-directions as pinhole images. This is useful when you want a curated set of
-perspective views for Gaussian Splatting or other pose-aware training
-pipelines.
+The current pinhole workflow is split into three stages:
 
-First initialize a manual render workspace. The `--scene-workspace` decides
-which panoramas are shown: only panorama frames registered in that COLMAP scene
-are included. The `--pano-dir` is used to resolve those scene frame names back
-to the original equirectangular image files.
+1. Select longitude/latitude directions from the panorama images.
+2. Render pinhole images from those selected directions.
+3. Attach poses from an existing native equirectangular COLMAP reconstruction
+   when a pose-aware output is needed.
 
-```bash
-manual-pinhole-render \
-  --pano-dir /path/to/source-panoramas \
-  --scene-workspace /path/to/equirectangular-workspace \
-  --output-dir /path/to/equirectangular-workspace/pinhole-renders
-```
+Selection and rendering are pure image operations. They do not require COLMAP,
+`pycolmap`, `sparse_best`, optimized poses, or rig metadata. Pose attachment is
+the only stage that reads the reconstructed COLMAP model.
 
-To skip manual point-by-point selection and initialize a regular grid over
-every registered panorama, add `--auto-select`. This samples a 45-degree
-longitude/latitude grid inside the full equirectangular image, producing 32
-pending pinhole views per panorama.
+### Stage 1: Select Directions
 
-```bash
-manual-pinhole-render \
-  --pano-dir /path/to/source-panoramas \
-  --scene-workspace /path/to/equirectangular-workspace \
-  --output-dir /path/to/equirectangular-workspace/pinhole-renders \
-  --auto-select
-```
-
-Then open the local browser selector:
+Launch the selector directly from a directory of equirectangular panorama
+images:
 
 ```bash
 manual-pinhole-select \
-  --output-dir /path/to/equirectangular-workspace/pinhole-renders \
+  --image-dir /path/to/workspace/images \
   --host 127.0.0.1 \
-  --port 8766
+  --port 8765
 ```
 
-Open the printed URL, for example `http://127.0.0.1:8766`.
+Open the printed URL, for example `http://127.0.0.1:8765`. If `--output-dir`
+is not passed, the selector writes beside the image directory:
+
+```text
+/path/to/workspace/selections.json
+```
 
 The panorama image is an equirectangular view:
 
@@ -288,20 +276,14 @@ The panorama image is an equirectangular view:
 
 Basic selection behavior:
 
-- Move the cursor over the panorama to inspect the full-width/full-height
-  crosshair location.
-- Click once to render only a low-resolution preview of that longitude/latitude
-  direction.
-- Press `Cmd` or `Ctrl` while clicking to save the direction as a selected
-  pinhole view. If `Cmd-click save only` is disabled, the preview is rendered
-  too.
-- When `Cmd-click save only` is enabled, press `Shift` with `Cmd` or `Ctrl`
-  while clicking to save and immediately advance to the next panorama.
-- Use `Preview` to re-render the current numeric longitude/latitude fields.
-- Use `Save` to save the current numeric longitude/latitude fields.
-- Use `Check` beside a saved view to reload that saved direction and preview it.
-- Use `Delete`, `Undo`, `Reset Pano`, and `Reset Collection` to manage saved
-  selections.
+- Click once to render only a preview of that longitude/latitude direction.
+- Press `Cmd` or `Ctrl` while clicking to save the direction and render its
+  preview.
+- Press the left and right arrow keys to move to the previous or next panorama.
+- Move near an existing saved point to highlight it. Press `d` while a point is
+  highlighted to delete it.
+- Use `Preview`, `Save`, `Check`, `Delete`, `Undo`, `Reset Pano`, and
+  `Reset Collection` to manage saved selections.
 
 For faster batch selection, enable `ROI sampling`, draw a box from the upper
 left to the lower right of the region you want, and set `Delta deg`. The tool
@@ -316,125 +298,94 @@ Good manual selections usually follow these rules:
   heavy motion blur.
 - Avoid latitudes very close to `+90` or `-90` degrees unless you explicitly
   need pole-facing views.
-- Keep the FOV and resolution consistent unless you have a specific downstream
-  reason to vary intrinsics.
-- Use the per-panorama COLMAP quality fields as hints: panoramas with many
-  triangulated observations and low reprojection error are usually safer
-  pose anchors.
+- Keep the FOV and resolution consistent for a downstream training set unless
+  you have a specific reason to vary intrinsics.
 
-Saved selections are stored in:
+### Stage 2: Render Selected Pinhole Images
 
-```text
-pinhole-renders/metadata.json
-pinhole-renders/selections.json
-```
-
-When you are done selecting, render the final pinhole images:
+Render one pinhole image per saved selection:
 
 ```bash
-manual-pinhole-render \
-  --output-dir /path/to/equirectangular-workspace/pinhole-renders \
-  --render-selections
+manual-pinhole-render-selected \
+  -s /path/to/workspace/selections.json \
+  --image-dir /path/to/workspace/images \
+  -o /path/to/workspace/renders \
+  -w 1280 \
+  -h 1280 \
+  --fov-x-deg 70 \
+  --fov-y-deg 70
 ```
 
-To also export a COLMAP text model for Gaussian Splatting training:
+`--image-dir` is optional when `selections.json` contains `source.image_dir`.
+If `-o/--output-dir` is not passed, the renderer writes to `renders/` beside
+the selections file.
+
+The render stage writes:
+
+```text
+/path/to/workspace/renders/
+/path/to/workspace/renders/render_report.json
+```
+
+Use `--workers N` to render panorama groups with multiple worker threads. The
+default is `--workers 1`, which is slower but has predictable memory use.
+
+### Stage 3: Attach COLMAP Poses
+
+After a native equirectangular COLMAP reconstruction exists, attach panorama
+poses to the rendered pinhole views:
 
 ```bash
-manual-pinhole-render \
-  --output-dir /path/to/equirectangular-workspace/pinhole-renders \
-  --render-selections \
-  --export-gaussian-splatting-colmap
+manual-pinhole-attach-poses \
+  -s /path/to/workspace/selections.json \
+  --render-report /path/to/workspace/renders/render_report.json \
+  --sparse-best /path/to/workspace/sparse_best \
+  -o /path/to/workspace/pose-renders
 ```
 
-The export writes:
+If `-o/--output-dir` is not passed, the command writes to `posed-renders/`
+beside the render report. The command fails when a selected panorama is missing
+from the registered COLMAP model unless `--allow-missing-poses` is passed.
+
+The pose attachment stage writes:
 
 ```text
-pinhole-renders/images/
-pinhole-renders/sparse/0/cameras.txt
-pinhole-renders/sparse/0/images.txt
-pinhole-renders/sparse/0/points3D.txt
-pinhole-renders/gaussian_splatting_export.json
+/path/to/workspace/pose-renders/pose_report.json
+/path/to/workspace/pose-renders/sparse/0/cameras.txt
+/path/to/workspace/pose-renders/sparse/0/images.txt
+/path/to/workspace/pose-renders/sparse/0/points3D.txt
 ```
 
-### Example With An Existing Optimized Scene
+This COLMAP text model can be used by downstream tools that expect pinhole
+camera images and COLMAP-style camera poses.
 
-Use this workflow when you already have:
+### Example Workspace
 
-- an optimized equirectangular panorama COLMAP model, for example:
-
-```text
-/data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/colmap/1781765016983-1781764929431-1781765089651-1781765215596-1781765283163-1781765391913-1781765475779-1781765557512/sparse_best
-```
-
-- the original panorama images, for example:
-
-```text
-/data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/pano-raw-views/all-merged
-```
-
-The COLMAP scene is the authority for which panorama frames are usable. The
-raw panorama directory may contain extra images; those are only used to resolve
-source files for the registered scene panoramas.
-
-Choose an output directory for the selected pinhole workflow:
-
-```text
-/data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/renders-pinhole
-```
-
-Initialize the selection workspace:
-
-```bash
-manual-pinhole-render \
-  --pano-dir /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/pano-raw-views/all-merged \
-  --scene-workspace /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/colmap/1781765016983-1781764929431-1781765089651-1781765215596-1781765283163-1781765391913-1781765475779-1781765557512/sparse_best \
-  --output-dir /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/renders-pinhole
-```
-
-Open the selector:
+For the tested workspace:
 
 ```bash
 manual-pinhole-select \
-  --output-dir /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/renders-pinhole \
-  --host 127.0.0.1 \
-  --port 8766
+  --image-dir /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/images
 ```
-
-Select views in the browser, then stop the selector server before rendering the
-final set. Avoid editing selections in the browser while the render/export
-command is running.
-
-Render the selected pinhole images and export a COLMAP text model for Gaussian
-Splatting:
 
 ```bash
-manual-pinhole-render \
-  --output-dir /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/renders-pinhole \
-  --render-selections \
-  --scene-workspace /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/colmap/1781765016983-1781764929431-1781765089651-1781765215596-1781765283163-1781765391913-1781765475779-1781765557512/sparse_best \
-  --export-gaussian-splatting-colmap
+manual-pinhole-render-selected \
+  -s /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/selections.json \
+  --image-dir /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/images \
+  -o /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/renders \
+  -w 1280 \
+  -h 1280 \
+  --fov-x-deg 70 \
+  --fov-y-deg 70
 ```
-
-Passing `--scene-workspace` again during render/export is intentional and safe.
-It ensures the exporter has the optimized panorama poses and the source COLMAP
-`points3D`, even if the selection metadata was originally initialized without
-scene pose information.
-
-For a fully automatic baseline selection instead of browser selection, add
-`--auto-select` during initialization:
 
 ```bash
-manual-pinhole-render \
-  --pano-dir /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/pano-raw-views/all-merged \
-  --scene-workspace /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/colmap/1781765016983-1781764929431-1781765089651-1781765215596-1781765283163-1781765391913-1781765475779-1781765557512/sparse_best \
-  --output-dir /data/itri-3d-reconstruction/scene-reconstruction/q200-lab-2026-06-18/renders-pinhole \
-  --auto-select
+manual-pinhole-attach-poses \
+  -s /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/selections.json \
+  --render-report /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/renders/render_report.json \
+  --sparse-best /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/sparse_best \
+  -o /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/pose-renders
 ```
-
-`--auto-select` creates 32 pending views per registered panorama using a
-45-degree longitude/latitude grid. It is useful for a baseline dataset, but a
-manual or ROI-curated set is usually better when you want to avoid blank walls,
-blurred views, ceiling/floor-heavy crops, or weakly textured areas.
 
 ## Visualize Or Summarize COLMAP Output
 
@@ -465,6 +416,20 @@ colmap-visualize \
   --model /workspace/data/colmap-equirectangular/sparse_best \
   --camera-style sphere
 ```
+
+For pose-attached pinhole render exports, draw pinhole camera frustums and the
+exported point cloud:
+
+```bash
+colmap-visualize \
+  --model /path/to/workspace/pose-renders/sparse/0 \
+  --camera-style pinhole
+```
+
+When the visualizer detects a nearby `pose_report.json` from
+`manual-pinhole-attach-poses`, it shows untracked/synthetic `points3D` by
+default because the derived pinhole export intentionally omits COLMAP feature
+tracks. Use `--min-track-length N` to override that filtering behavior.
 
 To save a preview image:
 
