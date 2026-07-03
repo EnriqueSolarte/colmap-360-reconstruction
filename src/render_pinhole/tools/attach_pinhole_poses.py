@@ -12,10 +12,8 @@ import numpy as np
 from tqdm import tqdm
 
 from colmap.camera import camera_from_fov
-from render_pinhole.tools.manual_pinhole_render import (
-    is_colmap_model_dir,
-    pinhole_camera_pose_report,
-)
+from colmap.model_io import is_colmap_model_dir
+from render_pinhole.geometry import pinhole_camera_pose_report
 
 try:  # Keep import usable in test/dev environments without pycolmap.
     import pycolmap

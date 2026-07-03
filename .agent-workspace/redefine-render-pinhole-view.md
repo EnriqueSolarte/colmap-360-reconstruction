@@ -1,6 +1,6 @@
-Date: 2026-07-02
+Date: 2026-07-03
 Project version: v0.1.0
-Description: Redefines pinhole view rendering as selection, rendering, and pose attachment stages
+Description: Completed staged pinhole rendering workflow and legacy cleanup
 
 # Redefine Pinhole View Rendering
 
@@ -25,6 +25,40 @@ Decoupling the stages makes the workflow faster to iterate on, easier to test,
 and better aligned with the maintained native equirectangular reconstruction
 pipeline.
 
+## Final Status
+
+Implemented and verified.
+
+The maintained pinhole workflow is now:
+
+```text
+images/ -> selections.json -> renders/render_report.json -> pose-renders/sparse/0
+```
+
+Public commands:
+
+```text
+manual-pinhole-select
+manual-pinhole-render-selected
+manual-pinhole-attach-poses
+colmap-visualize
+```
+
+Removed legacy workflow:
+
+- `manual-pinhole-render` console script was removed.
+- `src/render_pinhole/tools/manual_pinhole_render.py` was deleted.
+- `src/render_pinhole/tools/manual_pinhole_selection_store.py` was deleted.
+- selector `metadata.json` legacy mode was removed.
+- selector now requires `--image-dir` and writes flat `selections.json`.
+
+Verification:
+
+```text
+pytest -q
+197 passed
+```
+
 ## Target Pipeline
 
 ### Stage 1: Select Panorama Directions
@@ -41,8 +75,8 @@ Behavior:
   images.
 - Support manual selection of one or more longitude/latitude directions per
   panorama.
-- Support automatic grid selection, similar to the current `--auto-select`
-  behavior.
+- Support automatic grid selection from the browser, using the same flat
+  selection schema as manual selections.
 - Do not require COLMAP, `pycolmap`, `sparse_best`, or optimized poses.
 
 Output:
@@ -184,14 +218,14 @@ registered panorama count
 For pose-aware exports, unresolved selections should either be skipped
 explicitly or fail unless an option such as `--allow-missing-poses` is provided.
 
-First implemented command shape:
+Implemented command shape:
 
 ```bash
 manual-pinhole-attach-poses \
   --selections /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/selections.json \
   --render-report /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/renders/render_report.json \
   --sparse-best /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/sparse_best \
-  --output-dir /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/posed-renders
+  --output-dir /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/pose-renders
 ```
 
 This stage writes `pose_report.json` by matching flat rendered selections to
@@ -204,35 +238,40 @@ sparse/0/images.txt
 sparse/0/points3D.txt
 ```
 
-## Implementation Plan
+## Completed Implementation
 
-1. Define the flat `selections.json` schema and add a pure selection artifact
+1. Defined the flat `selections.json` schema and added a pure selection artifact
    builder for manual and auto-selected views.
-2. Add a render stage that consumes `selections.json` and writes rendered
+2. Added a render stage that consumes `selections.json` and writes rendered
    images plus `render_report.json` without loading COLMAP.
-3. Adapt or replace the browser selector so it can operate directly from an
-   image directory and write the flat selection schema.
-4. Add native equirectangular pose attachment from `sparse_best`, using
+3. Reworked the browser selector so it operates directly from an
+   image directory and writes the flat selection schema.
+4. Added native equirectangular pose attachment from `sparse_best`, using
    registered COLMAP image names instead of legacy `panorama_rig_config.json`.
-5. Update README examples after the behavior is implemented and verified.
+5. Updated README examples after the behavior was implemented and verified.
+6. Updated `colmap-visualize` so pose-attached pinhole exports can be viewed as
+   pinhole camera frustums with the exported point cloud.
+7. Removed stale legacy pinhole render command, metadata selector mode, and
+   virtual-rig/metadata-sidecar code.
 
-## Selector Server Plan
+## Final Selector Behavior
 
-The selector server should support a new image-directory mode while preserving
-the existing metadata-based workflow until the new flow fully replaces it.
+The selector server supports only image-directory mode.
 
-New CLI shape:
+CLI shape:
 
 ```bash
 manual-pinhole-select \
-  --image-dir /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/images \
-  --output-dir /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/pinhole-selection
+  --image-dir /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/images
 ```
+
+`--output-dir` is optional and defaults to the parent directory of
+`--image-dir`.
 
 Behavior:
 
 - scan `--image-dir` for equirectangular panorama images;
-- launch the existing browser selector from those images;
+- launch the browser selector from those images;
 - write flat `--output-dir/selections.json`;
 - keep preview rendering available in the browser;
 - store only direction selection fields in `selections.json`;
@@ -250,23 +289,19 @@ on disk must remain the flat schema:
 selections[]
 ```
 
-### Selector Server Slices
+Implemented selector behavior:
 
-1. Add image-directory server mode and flat `selections.json` read/write while
-   preserving legacy metadata mode.
-2. Make the existing `/api/state`, `/api/preview`, `/api/selections`,
-   delete/reset/undo, and ROI endpoints dispatch to flat storage in image mode.
-3. Simplify browser labels for image mode by hiding COLMAP scene/quality fields
-   or replacing them with image-directory selection status.
-4. Add automatic grid selection from the same flat schema, either as a CLI
-   option or a browser command.
+- plain click previews without saving;
+- `Cmd`/`Ctrl` click previews and saves;
+- left/right arrow keys navigate panoramas;
+- cursor-near-marker highlighting;
+- `d` deletes the highlighted marker;
+- ROI sampling writes the flat schema;
+- auto-grid selection writes the flat schema.
 
-## First Slice
+## Remaining Follow-Up
 
-Implement the data-model slice first:
-
-- create or extract focused helpers for the flat `selections.json` schema;
-- support auto-grid generation into that schema;
-- add tests that prove multiple selections per panorama and auto-selection use
-  the same flat output shape;
-- avoid changing the existing browser workflow until the schema is verified.
+`src/render_pinhole/tools/manual_pinhole_select_server.py` is still large. It is
+no longer carrying legacy metadata branches, but a later refactor could split
+server state/storage, HTTP handlers, and browser assets into smaller modules.
+That refactor is intentionally separate from this completed pipeline change.
