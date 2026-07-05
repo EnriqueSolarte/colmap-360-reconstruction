@@ -1,6 +1,6 @@
-Date: 2026-07-03
+Date: 2026-07-05
 Project version: v0.1.0
-Description: Completed staged pinhole rendering workflow and legacy cleanup
+Description: Completed pinhole rendering workflow and planned pinhole COLMAP reconstruction
 
 # Redefine Pinhole View Rendering
 
@@ -305,3 +305,280 @@ Implemented selector behavior:
 no longer carrying legacy metadata branches, but a later refactor could split
 server state/storage, HTTP handlers, and browser assets into smaller modules.
 That refactor is intentionally separate from this completed pipeline change.
+
+# Planned Pinhole COLMAP Reconstruction
+
+## Purpose
+
+Add a sibling COLMAP reconstruction pipeline under `src/colmap/pinhole/` that
+uses rendered pinhole images as the reconstruction input.
+
+This pipeline should be separate from the maintained native panorama pipeline
+under `src/colmap/panorama/`. The panorama pipeline remains the direct
+`EQUIRECTANGULAR` reconstruction path. The new pinhole pipeline should consume
+the outputs of the completed pinhole rendering workflow:
+
+```text
+selections.json -> renders/render_report.json -> optional pose-renders/pose_report.json
+```
+
+The first implementation should target reconstruction from the rendered images
+and intrinsics recorded in `render_report.json`.
+
+## Agreed Baseline Behavior
+
+Input:
+
+```text
+renders/render_report.json
+```
+
+Behavior:
+
+- read rendered pinhole image records from `render_report.json`;
+- link or copy those rendered images into a new COLMAP workspace;
+- derive COLMAP `PINHOLE` camera intrinsics from each render record's width,
+  height, `fov_x`, and `fov_y`;
+- for the first implementation, require one shared camera setup across all
+  rendered images;
+- extract features with the same pycolmap feature options used by the panorama
+  pipeline;
+- match images using a normal overlap-based matcher, with sequential overlap as
+  the default first target;
+- run COLMAP incremental mapping without requiring panorama poses;
+- write `sparse/`, `sparse_best/`, `cloud_colmap_raw.ply`, and a structured
+  `pinhole_reconstruction_report.json`.
+
+Initial command shape:
+
+```bash
+colmap-pinhole-reconstruct \
+  --render-report /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/renders/render_report.json \
+  --workspace /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/pinhole-reconstruction \
+  --matcher sequential \
+  --overlap 10 \
+  --overwrite
+```
+
+The baseline result is a normal unscaled COLMAP sparse model reconstructed from
+the rendered pinhole images. It is independent from the native panorama
+reconstruction unless optional priors are explicitly enabled.
+
+## Optional Panorama-Derived Position Priors
+
+Optional input:
+
+```text
+pose-renders/pose_report.json
+```
+
+When a pose report is passed, the first pose-aware implementation should use the
+panorama-derived pinhole camera centers as COLMAP position priors.
+
+This means:
+
+```text
+pose_report.views[].pinhole_camera_pose.center_world
+```
+
+is used as a prior camera center for the matching rendered pinhole image.
+
+This does not mean the first implementation should force COLMAP to start from
+or keep the full panorama-derived 6DoF pose. In particular, the first
+pose-aware mode should not rely on:
+
+```text
+pose_report.views[].pinhole_camera_pose.rotation_world_from_pinhole
+```
+
+except for reporting and future experiments.
+
+Initial command shape:
+
+```bash
+colmap-pinhole-reconstruct \
+  --render-report /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/renders/render_report.json \
+  --pose-report /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/pose-renders/pose_report.json \
+  --use-position-priors \
+  --workspace /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/pinhole-reconstruction-priors \
+  --matcher sequential \
+  --overlap 10 \
+  --overwrite
+```
+
+Reports should make the prior behavior explicit:
+
+```text
+pose_prior_source: panorama_pose_report
+pose_prior_type: camera_center
+pose_prior_coordinate_frame: colmap_world_unscaled
+pose_prior_count
+missing_pose_prior_count
+use_prior_position
+```
+
+Important limitation:
+
+The panorama-derived centers are not external ground truth. They come from the
+native equirectangular COLMAP reconstruction and therefore inherit that model's
+unscaled coordinate frame, drift, and any pose errors. They are useful for
+anchoring or regularizing the pinhole reconstruction, but they should not be
+reported as metric or absolute camera locations.
+
+## Deferred Full-Pose Initialization
+
+Full-pose initialization is a later experiment, not part of the first
+implementation.
+
+Possible future approaches:
+
+- write a COLMAP model from `pose_report.json` and pass it as pycolmap
+  `incremental_mapping(..., input_path=...)`;
+- use lower-level pycolmap mapper APIs to seed registered images from
+  panorama-derived pinhole poses, triangulate from rendered-image matches, and
+  bundle-adjust the result.
+
+This is deferred because a useful COLMAP continuation model needs more than a
+list of camera poses. It also needs database image identity, cameras, features,
+matches, observations, points, and tracks to line up correctly. The current
+pose-attached export is appropriate for pose-aware handoff, but it is not yet
+proven to be a robust incremental-mapping seed.
+
+## Implementation Stages
+
+### Stage 1: Render-Report Import And Intrinsics
+
+Goal:
+
+Build the pure input layer for `src/colmap/pinhole/`.
+
+Tasks:
+
+- create `src/colmap/pinhole/` with focused modules such as `paths.py`,
+  `image_import.py`, `reports.py`, `pipeline.py`, and `cli.py`;
+- parse `render_report.json`;
+- validate rendered records and output files;
+- require uniform width, height, `fov_x`, and `fov_y` for the first slice;
+- derive a shared `PINHOLE` camera using `camera_from_fov`;
+- link rendered images into `workspace/images/`;
+- write a pinhole config/import report.
+
+Verification:
+
+- unit tests for render-report parsing;
+- unit tests for camera derivation from FOV;
+- unit tests for rejecting missing files and mixed intrinsics.
+
+### Stage 2: Baseline Pinhole Reconstruction
+
+Goal:
+
+Run COLMAP reconstruction from rendered pinhole images without using panorama
+poses.
+
+Tasks:
+
+- reuse shared feature and execution option dataclasses where practical;
+- extract features into `database.db`;
+- support sequential matching with configurable `--overlap`;
+- run incremental mapping;
+- select and write the best sparse model;
+- export `cloud_colmap_raw.ply`;
+- write `pinhole_reconstruction_report.json`.
+
+Verification:
+
+- tests for CLI argument validation and report construction;
+- targeted tests around the pipeline boundaries using fakes where pycolmap is
+  too heavy;
+- one small real smoke run when data and pycolmap are available.
+
+### Stage 3: Optional Position-Prior Parsing
+
+Goal:
+
+Read `pose_report.json` and match panorama-derived pinhole camera centers to
+rendered image records, without changing reconstruction behavior yet.
+
+Tasks:
+
+- add `--pose-report`;
+- match pose-report views to render records by `selection_id` and/or
+  `output_name`;
+- report matched, missing, and unusable priors;
+- record prior coordinate frame and source;
+- keep reconstruction identical unless `--use-position-priors` is enabled.
+
+Verification:
+
+- tests for pose-report matching;
+- tests for missing priors and mismatched render records;
+- report tests proving the mode is visible and auditable.
+
+### Stage 4: Enable COLMAP Position Priors
+
+Goal:
+
+Use panorama-derived camera centers as optional COLMAP position priors.
+
+Tasks:
+
+- add `--use-position-priors`;
+- write position priors into the COLMAP database or otherwise feed them through
+  the supported pycolmap path;
+- set mapper options such as `use_prior_position`;
+- expose robust-loss and prior-loss-scale options only if needed after the
+  first working implementation;
+- report all prior-related mapper options.
+
+Verification:
+
+- unit tests for database prior writing if that path is used;
+- a comparison run against the Stage 2 baseline:
+  - registered image count;
+  - sparse point count;
+  - model count;
+  - mean reprojection error;
+  - elapsed time;
+  - visual consistency with the panorama coordinate frame.
+
+### Stage 5: Pair Planning Improvements
+
+Goal:
+
+Make matching more aware of pinhole render provenance after the baseline is
+working.
+
+Possible improvements:
+
+- avoid or separately report same-source-panorama pairs, because multiple
+  pinhole crops from one panorama share the same physical camera center and do
+  not provide stereo baseline;
+- add source-panorama-aware sequential pair planning;
+- add optional vocabtree or keyframe-style pairing if baseline overlap matching
+  is insufficient.
+
+Verification:
+
+- report pair counts by source;
+- compare reconstruction quality and runtime against simple sequential overlap.
+
+### Stage 6: Experimental Full-Pose Initialization
+
+Goal:
+
+Evaluate whether full panorama-derived pinhole poses can be used as an
+initialization strategy.
+
+Possible implementations:
+
+- generate a COLMAP input model from pose report data and pass it through
+  `input_path`;
+- use lower-level pycolmap reconstruction or mapper APIs to seed registered
+  images, triangulate, and bundle-adjust.
+
+Exit criteria:
+
+- only keep this mode if it demonstrably improves registration, stability, or
+  alignment compared with Stage 2 and Stage 4;
+- label the mode experimental until it is verified on representative datasets.
