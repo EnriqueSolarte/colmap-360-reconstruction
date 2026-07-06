@@ -329,6 +329,11 @@ The render stage writes:
 
 Use `--workers N` to render panorama groups with multiple worker threads. The
 default is `--workers 1`, which is slower but has predictable memory use.
+Existing expected output images are reused by default, so rerunning the command
+only renders missing selections. Pass `--overwrite` to regenerate existing
+outputs. When a previous `render_report.json` exists, images listed in that old
+report are deleted if they are no longer present in the current selections; pass
+`--keep-stale` to keep them.
 
 ### Stage 3: Attach COLMAP Poses
 

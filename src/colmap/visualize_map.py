@@ -36,6 +36,8 @@ CAMERA_STYLES = ("auto", "frustum", "pinhole", "sphere")
 DEFAULT_MIN_TRACK_LENGTH = 3
 PANORAMA_REFERENCE_FRAME_SCALE = 0.75
 PANORAMA_SPHERE_RADIUS_RATIO = 0.25
+DARK_BACKGROUND_COLOR = np.asarray([0.02, 0.02, 0.025])
+WHITE_BACKGROUND_COLOR = np.asarray([1.0, 1.0, 1.0])
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,10 @@ def require_open3d():
             "`visualize` extra or add `open3d` to the environment."
         )
     return o3d
+
+
+def visualization_background_color(*, white_bg: bool) -> np.ndarray:
+    return WHITE_BACKGROUND_COLOR if white_bg else DARK_BACKGROUND_COLOR
 
 
 def point_cloud_from_reconstruction(
@@ -590,6 +596,7 @@ def save_map_image(
     view_points: np.ndarray,
     *,
     point_size: float,
+    white_bg: bool,
     width: int = 1600,
     height: int = 1100,
 ) -> None:
@@ -623,7 +630,9 @@ def save_map_image(
             visualizer.add_geometry(geometry)
         render_options = visualizer.get_render_option()
         render_options.point_size = point_size
-        render_options.background_color = np.asarray([0.02, 0.02, 0.025])
+        render_options.background_color = visualization_background_color(
+            white_bg=white_bg,
+        )
         configure_map_view(visualizer, view_points)
         for _ in range(3):
             visualizer.poll_events()
@@ -661,6 +670,7 @@ def visualize(
     min_track_length: int,
     max_reprojection_error: float,
     point_size: float,
+    white_bg: bool,
     remove_outliers: bool,
     summary_only: bool,
 ) -> None:
@@ -736,6 +746,7 @@ def visualize(
             geometries,
             view_points,
             point_size=point_size,
+            white_bg=white_bg,
         )
         print(f"saved map image: {save_image}")
     if summary_only:
@@ -755,7 +766,9 @@ def visualize(
 
         render_options = visualizer.get_render_option()
         render_options.point_size = point_size
-        render_options.background_color = np.asarray([0.02, 0.02, 0.025])
+        render_options.background_color = visualization_background_color(
+            white_bg=white_bg,
+        )
 
         visualizer.run()
     finally:
@@ -881,6 +894,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Open3D point render size (default: 2.0)",
     )
     parser.add_argument(
+        "--white-bg",
+        action="store_true",
+        help="Use a white visualization background instead of the default dark one.",
+    )
+    parser.add_argument(
         "--keep-outliers",
         action="store_true",
         help="Disable Open3D statistical outlier removal on displayed points.",
@@ -918,6 +936,7 @@ def main(argv: list[str] | None = None) -> int:
         min_track_length=args.min_track_length,
         max_reprojection_error=args.max_reprojection_error,
         point_size=args.point_size,
+        white_bg=args.white_bg,
         remove_outliers=not args.keep_outliers,
         summary_only=args.summary_only,
     )

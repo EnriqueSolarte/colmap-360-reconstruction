@@ -166,6 +166,26 @@ def test_camera_style_accepts_pinhole_alias():
     assert args.camera_style == "pinhole"
 
 
+def test_white_bg_flag_selects_white_background():
+    args = visualize_map.parse_args(["--white-bg"])
+
+    assert args.white_bg is True
+    assert np.allclose(
+        visualize_map.visualization_background_color(white_bg=args.white_bg),
+        [1.0, 1.0, 1.0],
+    )
+
+
+def test_default_background_stays_dark():
+    args = visualize_map.parse_args([])
+
+    assert args.white_bg is False
+    assert np.allclose(
+        visualize_map.visualization_background_color(white_bg=args.white_bg),
+        [0.02, 0.02, 0.025],
+    )
+
+
 def test_auto_camera_style_uses_nearby_panorama_metadata(tmp_path):
     model_path = tmp_path / "sparse_best"
     model_path.mkdir()
@@ -312,6 +332,7 @@ def test_visualize_summary_only_does_not_require_open3d(tmp_path, monkeypatch, c
         min_track_length=3,
         max_reprojection_error=0.0,
         point_size=2.0,
+        white_bg=False,
         remove_outliers=True,
         summary_only=True,
     )
@@ -340,6 +361,7 @@ def test_visualize_requires_open3d_for_geometry(tmp_path, monkeypatch):
             min_track_length=3,
             max_reprojection_error=0.0,
             point_size=2.0,
+            white_bg=False,
             remove_outliers=True,
             summary_only=False,
         )

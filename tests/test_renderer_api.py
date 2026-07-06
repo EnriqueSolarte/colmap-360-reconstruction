@@ -417,6 +417,101 @@ def test_render_selected_pinhole_cli_writes_images_and_report(tmp_path, capsys) 
     assert "Rendering selected pinholes" in captured.err
 
 
+def test_render_selected_pinhole_cli_reuses_existing_and_deletes_stale(
+    tmp_path,
+    capsys,
+) -> None:
+    image_dir = tmp_path / "images"
+    output_dir = tmp_path / "renders"
+    image_dir.mkdir()
+    output_dir.mkdir()
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(image_dir / "front.png")
+    Image.fromarray(make_equirectangular_image()).save(image_dir / "back.png")
+
+    existing_output = output_dir / "front__sel-000.png"
+    stale_output = output_dir / "old__sel-000.png"
+    existing_pixels = np.full((8, 10, 3), 255, dtype=np.uint8)
+    Image.fromarray(existing_pixels).save(existing_output)
+    Image.fromarray(np.zeros((8, 10, 3), dtype=np.uint8)).save(stale_output)
+    (output_dir / RENDER_REPORT_FILENAME).write_text(
+        json.dumps(
+            {
+                "renders": [
+                    {
+                        "selection_id": "front__sel-000",
+                        "output_file": str(existing_output),
+                        "output_name": existing_output.name,
+                    },
+                    {
+                        "selection_id": "old__sel-000",
+                        "output_file": str(stale_output),
+                        "output_name": stale_output.name,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    selections_path = tmp_path / "selections.json"
+    selections_store = build_selection_store(
+        image_dir=image_dir,
+        selections=[
+            selection_record(
+                pano_image_name="front.png",
+                selection_index=0,
+                longitude=pi / 4,
+                latitude=0.0,
+                selected_by="manual-pinhole-select",
+            ),
+            selection_record(
+                pano_image_name="back.png",
+                selection_index=0,
+                longitude=-pi / 4,
+                latitude=0.1,
+                selected_by="manual-pinhole-select",
+            ),
+        ],
+        selection_mode="manual",
+    )
+    selections_path.write_text(json.dumps(selections_store), encoding="utf-8")
+
+    exit_code = render_selected_main(
+        [
+            "-s",
+            str(selections_path),
+            "-o",
+            str(output_dir),
+            "-h",
+            "8",
+            "-w",
+            "10",
+        ]
+    )
+
+    report = json.loads(
+        (output_dir / RENDER_REPORT_FILENAME).read_text(encoding="utf-8")
+    )
+    assert exit_code == 0
+    assert np.array_equal(np.asarray(Image.open(existing_output)), existing_pixels)
+    assert (output_dir / "back__sel-000.png").is_file()
+    assert not stale_output.exists()
+    assert report["rendered_count"] == 2
+    assert report["newly_rendered_count"] == 1
+    assert report["reused_count"] == 1
+    assert report["deleted_count"] == 1
+    assert [record["render_status"] for record in report["renders"]] == [
+        "reused_existing",
+        "rendered",
+    ]
+    assert report["deleted"][0]["output_name"] == "old__sel-000.png"
+    captured = capsys.readouterr()
+    assert "Rendered: 1" in captured.out
+    assert "Reused existing: 1" in captured.out
+    assert "Deleted stale: 1" in captured.out
+
+
 def test_render_selected_pinhole_cli_reports_missing_sources(tmp_path) -> None:
     image_dir = tmp_path / "images"
     output_dir = tmp_path / "selected-renders"

@@ -54,11 +54,18 @@ def main(argv: list[str] | None = None) -> int:
         interpolation=args.interpolation,
         output_extension=args.output_extension,
         workers=args.workers,
+        overwrite=args.overwrite,
+        prune_stale=not args.keep_stale,
     )
     report_path = output_dir / RENDER_REPORT_FILENAME
     _write_json(report_path, report)
 
-    print(f"Rendered: {report['rendered_count']}")
+    print(f"Rendered: {report['newly_rendered_count']}")
+    if report["reused_count"]:
+        print(f"Reused existing: {report['reused_count']}")
+    if report["deleted_count"]:
+        print(f"Deleted stale: {report['deleted_count']}")
+    print(f"Available renders: {report['rendered_count']}")
     if report["skipped_count"]:
         print(f"Skipped: {report['skipped_count']}")
     if report["failed_count"]:
@@ -81,6 +88,8 @@ def render_selected_pinhole_images(
     output_extension: str,
     workers: int = 1,
     show_progress: bool = True,
+    overwrite: bool = False,
+    prune_stale: bool = True,
 ) -> dict[str, Any]:
     if workers <= 0:
         raise ValueError("workers must be positive")
@@ -112,9 +121,13 @@ def render_selected_pinhole_images(
         "selection_summary": selections_store.get("selection_summary", {}),
         "selected_count": len(selections),
         "rendered_count": 0,
+        "newly_rendered_count": 0,
+        "reused_count": 0,
+        "deleted_count": 0,
         "skipped_count": 0,
         "failed_count": 0,
         "renders": [],
+        "deleted": [],
         "skipped": [],
         "failed": [],
     }
@@ -125,6 +138,14 @@ def render_selected_pinhole_images(
         output_dir=output_dir,
         output_extension=output_extension,
     )
+    if prune_stale:
+        deleted = _delete_stale_render_outputs(
+            output_dir=output_dir,
+            expected_output_names={job["output_path"].name for job in jobs},
+        )
+        report["deleted"] = deleted
+        report["deleted_count"] = len(deleted)
+
     outcomes = _render_jobs_with_progress(
         jobs,
         width=width,
@@ -134,6 +155,7 @@ def render_selected_pinhole_images(
         interpolation=interpolation,
         workers=workers,
         show_progress=show_progress,
+        overwrite=overwrite,
     )
     for outcome in sorted(outcomes, key=lambda record: int(record["order"])):
         kind = outcome.pop("kind")
@@ -141,6 +163,11 @@ def render_selected_pinhole_images(
         if kind == "rendered":
             report["renders"].append(outcome)
             report["rendered_count"] += 1
+            report["newly_rendered_count"] += 1
+        elif kind == "reused":
+            report["renders"].append(outcome)
+            report["rendered_count"] += 1
+            report["reused_count"] += 1
         elif kind == "skipped":
             report["skipped"].append(outcome)
             report["skipped_count"] += 1
@@ -181,6 +208,7 @@ def _render_jobs_with_progress(
     interpolation: str,
     workers: int,
     show_progress: bool,
+    overwrite: bool,
 ) -> list[dict[str, Any]]:
     job_groups = _jobs_by_source_path(jobs)
     progress_options = {
@@ -195,6 +223,7 @@ def _render_jobs_with_progress(
         "fov_x": fov_x,
         "fov_y": fov_y,
         "interpolation": interpolation,
+        "overwrite": overwrite,
     }
 
     outcomes: list[dict[str, Any]] = []
@@ -233,12 +262,46 @@ def _render_source_group(
     fov_x: float,
     fov_y: float,
     interpolation: str,
+    overwrite: bool,
 ) -> list[dict[str, Any]]:
     if not jobs:
         return []
     source_path = jobs[0]["source_path"]
+    outcomes: list[dict[str, Any]] = []
+    jobs_to_render = []
+    source_size: tuple[int | None, int | None] | None = None
+    for job in jobs:
+        output_path = job["output_path"]
+        if not overwrite and output_path.is_file():
+            output_size = _image_file_resolution(output_path)
+            if output_size is not None:
+                if source_size is None:
+                    source_size = _image_file_resolution(source_path)
+                outcomes.append(
+                    {
+                        "kind": "reused",
+                        "order": job["order"],
+                        **_render_record(
+                            selection=job["selection"],
+                            source_path=source_path,
+                            source_size=source_size,
+                            output_path=output_path,
+                            output_size=output_size,
+                            fov_x=fov_x,
+                            fov_y=fov_y,
+                            interpolation=interpolation,
+                            render_status="reused_existing",
+                        ),
+                    }
+                )
+                continue
+        jobs_to_render.append(job)
+
+    if not jobs_to_render:
+        return outcomes
+
     if not source_path.is_file():
-        return [
+        outcomes.extend(
             {
                 "kind": "skipped",
                 "order": job["order"],
@@ -247,24 +310,25 @@ def _render_source_group(
                     reason=f"source panorama not found: {source_path}",
                 ),
             }
-            for job in jobs
-        ]
+            for job in jobs_to_render
+        )
+        return outcomes
 
     try:
         renderer = EquirectangularToPinhole.from_file(source_path)
     except Exception as error:  # pragma: no cover - defensive report path
-        return [
+        outcomes.extend(
             {
                 "kind": "failed",
                 "order": job["order"],
                 **_selection_issue_record(job["selection"], reason=str(error)),
             }
-            for job in jobs
-        ]
+            for job in jobs_to_render
+        )
+        return outcomes
 
     source_width, source_height = _resolution(renderer.image)
-    outcomes = []
-    for job in jobs:
+    for job in jobs_to_render:
         selection = job["selection"]
         output_path = job["output_path"]
         try:
@@ -293,23 +357,17 @@ def _render_source_group(
             {
                 "kind": "rendered",
                 "order": job["order"],
-                "selection_id": selection.get("selection_id"),
-                "pano_image_name": selection.get("pano_image_name"),
-                "selection_index": selection.get("selection_index"),
-                "source_file": str(source_path),
-                "source_width": source_width,
-                "source_height": source_height,
-                "output_file": str(output_path),
-                "output_name": output_path.name,
-                "width": output_width,
-                "height": output_height,
-                "longitude": selection.get("longitude"),
-                "latitude": selection.get("latitude"),
-                "longitude_degrees": selection.get("longitude_degrees"),
-                "latitude_degrees": selection.get("latitude_degrees"),
-                "fov_x": fov_x,
-                "fov_y": fov_y,
-                "interpolation": interpolation,
+                **_render_record(
+                    selection=selection,
+                    source_path=source_path,
+                    source_size=(source_width, source_height),
+                    output_path=output_path,
+                    output_size=(output_width, output_height),
+                    fov_x=fov_x,
+                    fov_y=fov_y,
+                    interpolation=interpolation,
+                    render_status="rendered",
+                ),
             }
         )
     return outcomes
@@ -394,6 +452,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "group at a time."
         ),
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Re-render outputs even when the expected output image already exists.",
+    )
+    parser.add_argument(
+        "--keep-stale",
+        action="store_true",
+        help=(
+            "Keep outputs from the previous render report even when they are no "
+            "longer present in the current selections."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if not args.selections.is_file():
@@ -447,8 +518,115 @@ def _selection_issue_record(
     }
 
 
+def _render_record(
+    *,
+    selection: dict[str, Any],
+    source_path: Path,
+    source_size: tuple[int | None, int | None],
+    output_path: Path,
+    output_size: tuple[int, int],
+    fov_x: float,
+    fov_y: float,
+    interpolation: str,
+    render_status: str,
+) -> dict[str, Any]:
+    source_width, source_height = source_size
+    output_width, output_height = output_size
+    return {
+        "selection_id": selection.get("selection_id"),
+        "pano_image_name": selection.get("pano_image_name"),
+        "selection_index": selection.get("selection_index"),
+        "source_file": str(source_path),
+        "source_width": source_width,
+        "source_height": source_height,
+        "output_file": str(output_path),
+        "output_name": output_path.name,
+        "width": output_width,
+        "height": output_height,
+        "longitude": selection.get("longitude"),
+        "latitude": selection.get("latitude"),
+        "longitude_degrees": selection.get("longitude_degrees"),
+        "latitude_degrees": selection.get("latitude_degrees"),
+        "fov_x": fov_x,
+        "fov_y": fov_y,
+        "interpolation": interpolation,
+        "render_status": render_status,
+    }
+
+
+def _delete_stale_render_outputs(
+    *,
+    output_dir: Path,
+    expected_output_names: set[str],
+) -> list[dict[str, Any]]:
+    previous_report_path = output_dir / RENDER_REPORT_FILENAME
+    if not previous_report_path.is_file():
+        return []
+
+    try:
+        previous_report = _load_selection_store(previous_report_path)
+    except json.JSONDecodeError:
+        return []
+
+    deleted = []
+    for record in previous_report.get("renders", []):
+        if not isinstance(record, dict):
+            continue
+        output_name = str(record.get("output_name") or "")
+        output_path = _previous_render_output_path(
+            record=record,
+            output_dir=output_dir,
+        )
+        if not output_name and output_path is not None:
+            output_name = output_path.name
+        if not output_name or output_name in expected_output_names:
+            continue
+        if output_path is None or not output_path.is_file():
+            continue
+        output_path.unlink()
+        deleted.append(
+            {
+                "output_name": output_name,
+                "output_file": str(output_path),
+                "reason": "not present in current selections",
+            }
+        )
+    return deleted
+
+
+def _previous_render_output_path(
+    *,
+    record: dict[str, Any],
+    output_dir: Path,
+) -> Path | None:
+    output_file = record.get("output_file")
+    output_name = record.get("output_name")
+    candidate = Path(str(output_file)) if output_file else None
+    if candidate is None and output_name:
+        candidate = output_dir / str(output_name)
+    if candidate is None:
+        return None
+    if not candidate.is_absolute():
+        candidate = output_dir / candidate
+    try:
+        candidate.resolve().relative_to(output_dir.resolve())
+    except ValueError:
+        return None
+    return candidate
+
+
 def _normalize_extension(extension: str) -> str:
     return extension if extension.startswith(".") else f".{extension}"
+
+
+def _image_file_resolution(path: Path) -> tuple[int, int] | None:
+    if not path.is_file():
+        return None
+    try:
+        with Image.open(path) as image:
+            return image.size
+    except Exception:
+        return None
 
 
 def _write_image(path: Path, image: np.ndarray) -> None:
