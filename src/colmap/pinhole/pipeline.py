@@ -29,7 +29,12 @@ from colmap.panorama.reports import (
 )
 from colmap.panorama.types import FeaturePipelineOptions, PipelineExecutionOptions
 from colmap.pinhole.image_import import import_pinhole_images_from_render_report
+from colmap.pinhole.initial_poses import write_initial_pose_model_from_pose_report
 from colmap.pinhole.paths import pinhole_workspace_paths
+from colmap.pinhole.pose_priors import (
+    build_position_prior_summary,
+    write_position_priors_to_database,
+)
 from colmap.pinhole.reports import (
     build_pinhole_reconstruction_report,
     pinhole_feature_health_summary,
@@ -53,6 +58,9 @@ def run_pinhole_reconstruction(
     workspace: Path,
     *,
     image_dir: Path | None = None,
+    pose_report_path: Path | None = None,
+    use_position_priors: bool = False,
+    initial_poses_from_pose_report: bool = False,
     overlap: int = 10,
     loop_detection: bool = True,
     ssl_cert_file: Path | None = None,
@@ -63,6 +71,12 @@ def run_pinhole_reconstruction(
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
     elapsed_seconds_by_stage: dict[str, float] = {}
+    written_position_prior_count: int | None = None
+    initial_pose_summary = None
+    if use_position_priors and pose_report_path is None:
+        raise ValueError("--use-position-priors requires --pose-report")
+    if initial_poses_from_pose_report and pose_report_path is None:
+        raise ValueError("--initial-poses-from-pose-report requires --pose-report")
     stage_started_at = started_at
     pycolmap_module = require_pycolmap()
     pycolmap_module.set_random_seed(0)
@@ -90,6 +104,22 @@ def run_pinhole_reconstruction(
     record_elapsed_stage(elapsed_seconds_by_stage, "import_pinhole_images", stage_started_at)
 
     stage_started_at = time.perf_counter()
+    pose_prior_summary = (
+        None
+        if pose_report_path is None
+        else build_position_prior_summary(
+            pose_report_path=pose_report_path,
+            imported_images=import_result.imported_images,
+        )
+    )
+    if pose_prior_summary is not None:
+        record_elapsed_stage(
+            elapsed_seconds_by_stage,
+            "pose_prior_parsing",
+            stage_started_at,
+        )
+
+    stage_started_at = time.perf_counter()
     extract_panorama_features_to_database(
         pycolmap_module,
         database_path=paths["database"],
@@ -112,6 +142,36 @@ def run_pinhole_reconstruction(
     )
     record_elapsed_stage(elapsed_seconds_by_stage, "feature_stats", stage_started_at)
 
+    if use_position_priors:
+        if pose_prior_summary is None:
+            raise ValueError("--use-position-priors requires --pose-report")
+        stage_started_at = time.perf_counter()
+        written_position_prior_count = write_position_priors_to_database(
+            pycolmap_module,
+            database_path=paths["database"],
+            prior_summary=pose_prior_summary,
+        )
+        record_elapsed_stage(
+            elapsed_seconds_by_stage,
+            "pose_prior_database_write",
+            stage_started_at,
+        )
+
+    if initial_poses_from_pose_report:
+        stage_started_at = time.perf_counter()
+        initial_pose_summary = write_initial_pose_model_from_pose_report(
+            pose_report_path=pose_report_path,  # type: ignore[arg-type]
+            model_path=paths["initial_model"],
+            imported_images=import_result.imported_images,
+            generated_image_batch=generated_image_batch,
+            camera=import_result.camera,
+        )
+        record_elapsed_stage(
+            elapsed_seconds_by_stage,
+            "initial_pose_model_write",
+            stage_started_at,
+        )
+
     stage_started_at = time.perf_counter()
     matching_options = create_feature_matching_options(
         pycolmap_module,
@@ -133,11 +193,18 @@ def run_pinhole_reconstruction(
 
     stage_started_at = time.perf_counter()
     mapper_options = create_mapper_options(pycolmap_module, execution)
+    if use_position_priors:
+        mapper_options.use_prior_position = True
     reconstructions = run_incremental_mapping(
         pycolmap_module,
         paths,
         image_dir=paths["image_dir"],
         mapper_options=mapper_options,
+        input_path=(
+            initial_pose_summary.model_path
+            if initial_pose_summary is not None
+            else None
+        ),
     )
     record_elapsed_stage(elapsed_seconds_by_stage, "incremental_mapping", stage_started_at)
     if not reconstructions:
@@ -169,6 +236,10 @@ def run_pinhole_reconstruction(
         best_model_id=best_model_id,
         best_reconstruction=best_reconstruction,
         import_workers=import_workers,
+        pose_prior_summary=pose_prior_summary,
+        use_position_priors=use_position_priors,
+        written_position_prior_count=written_position_prior_count,
+        initial_pose_summary=initial_pose_summary,
     )
     elapsed_seconds_by_stage["report_writing"] = 0.0
     elapsed_seconds = time.perf_counter() - started_at

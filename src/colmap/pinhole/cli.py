@@ -46,6 +46,32 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--pose-report",
+        type=Path,
+        default=None,
+        help=(
+            "Optional pose_report.json from manual-pinhole-attach-poses. "
+            "By default this only reports camera-center prior coverage; combine "
+            "with --use-position-priors to enable COLMAP position priors."
+        ),
+    )
+    parser.add_argument(
+        "--use-position-priors",
+        action="store_true",
+        help=(
+            "Write camera-center priors from --pose-report into the COLMAP "
+            "database and enable mapper position-prior loss."
+        ),
+    )
+    parser.add_argument(
+        "--initial-poses-from-pose-report",
+        action="store_true",
+        help=(
+            "Initialize rendered pinhole image poses from the full 6DoF poses "
+            "in --pose-report, then let COLMAP refine them."
+        ),
+    )
+    parser.add_argument(
         "-w",
         "--workspace",
         type=Path,
@@ -154,6 +180,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--render-report must be an existing file: {args.render_report}")
     if args.image_dir is not None and not args.image_dir.is_dir():
         parser.error(f"--image-dir must be an existing directory: {args.image_dir}")
+    if args.pose_report is not None and not args.pose_report.is_file():
+        parser.error(f"--pose-report must be an existing file: {args.pose_report}")
+    if args.use_position_priors and args.pose_report is None:
+        parser.error("--use-position-priors requires --pose-report")
+    if args.initial_poses_from_pose_report and args.pose_report is None:
+        parser.error("--initial-poses-from-pose-report requires --pose-report")
     if args.overlap <= 0:
         parser.error("--overlap must be positive")
     if args.import_workers <= 0:
@@ -175,6 +207,9 @@ def main(argv: list[str] | None = None) -> int:
         render_report_path=args.render_report,
         workspace=args.workspace,
         image_dir=args.image_dir,
+        pose_report_path=args.pose_report,
+        use_position_priors=args.use_position_priors,
+        initial_poses_from_pose_report=args.initial_poses_from_pose_report,
         overlap=args.overlap,
         loop_detection=args.loop_detection,
         ssl_cert_file=args.ssl_cert_file,
@@ -210,6 +245,21 @@ def main(argv: list[str] | None = None) -> int:
         f"({report['best_model']['num_registered_images']} registered images, "
         f"{report['best_model']['num_points3D']} points)"
     )
+    if report["pose_priors"] is not None:
+        print(
+            "pose prior candidates: "
+            f"{report['pose_priors']['matched_count']} matched, "
+            f"{report['pose_priors']['missing_count']} missing, "
+            f"{report['pose_priors']['unusable_count']} unusable, "
+            f"{report['pose_priors']['written_prior_count']} written"
+        )
+    if report["initial_poses"] is not None:
+        print(
+            "initial poses: "
+            f"{report['initial_poses']['initialized_count']} initialized, "
+            f"{report['initial_poses']['missing_count']} missing, "
+            f"{report['initial_poses']['unusable_count']} unusable"
+        )
     print(f"elapsed: {report['elapsed_time']}")
     print(f"report: {report['report_path']}")
     return 0

@@ -273,10 +273,15 @@ def run_incremental_mapping(
     *,
     image_dir: Path,
     mapper_options: Any,
+    input_path: Path | None = None,
 ) -> dict[int, Any]:
+    kwargs: dict[str, Any] = {}
+    if input_path is not None:
+        kwargs["input_path"] = input_path
     return pycolmap_module.incremental_mapping(
         paths["database"],
         image_dir,
         paths["sparse"],
         options=mapper_options,
+        **kwargs,
     )

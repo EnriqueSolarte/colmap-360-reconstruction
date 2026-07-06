@@ -123,6 +123,10 @@ def build_pinhole_reconstruction_report(
     best_model_id: int,
     best_reconstruction: Any,
     import_workers: int,
+    pose_prior_summary: Any | None = None,
+    use_position_priors: bool = False,
+    written_position_prior_count: int | None = None,
+    initial_pose_summary: Any | None = None,
 ) -> dict[str, Any]:
     database_report = read_database_stats(paths["database"])
     model_stats = {
@@ -188,6 +192,9 @@ def build_pinhole_reconstruction_report(
             "skip_image_pairs_in_same_frame": False,
             "image_resolution_source": "actual_imported_files",
             "fov_source": "render_report",
+            "use_position_priors": use_position_priors,
+            "position_prior_count": written_position_prior_count,
+            "initial_poses_from_pose_report": initial_pose_summary is not None,
         },
         "rendered_image_count": len(import_result.imported_images),
         "generated_image_count": len(import_result.image_names),
@@ -207,5 +214,15 @@ def build_pinhole_reconstruction_report(
         "pinhole_images": [
             image.report() for image in import_result.imported_images
         ],
-        "pose_priors": None,
+        "pose_priors": (
+            None
+            if pose_prior_summary is None
+            else pose_prior_summary.report(
+                use_position_priors=use_position_priors,
+                written_prior_count=written_position_prior_count,
+            )
+        ),
+        "initial_poses": (
+            None if initial_pose_summary is None else initial_pose_summary.report()
+        ),
     }

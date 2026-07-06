@@ -13,10 +13,10 @@ def pinhole_workspace_paths(workspace: Path) -> dict[str, Path]:
         "feature_shards": workspace / "feature_shards",
         "sparse": workspace / "sparse",
         "best_sparse": workspace / "sparse_best",
+        "initial_model": workspace / "initial_model",
         "raw_ply": workspace / "cloud_colmap_raw.ply",
         "report": workspace / "pinhole_reconstruction_report.json",
         "import_report": workspace / "pinhole_import_report.json",
         "metadata": workspace / "pinhole_config.json",
         "match_pairs": workspace / "match_pairs.txt",
     }
-

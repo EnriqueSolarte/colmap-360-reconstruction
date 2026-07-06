@@ -364,7 +364,7 @@ The baseline result is a normal unscaled COLMAP sparse model reconstructed from
 the rendered pinhole images. It is independent from the native panorama
 reconstruction unless optional priors are explicitly enabled.
 
-## Optional Panorama-Derived Position Priors
+## Optional Panorama-Derived Pose Reuse
 
 Optional input:
 
@@ -372,8 +372,10 @@ Optional input:
 pose-renders/pose_report.json
 ```
 
-When a pose report is passed, the first pose-aware implementation should use the
-panorama-derived pinhole camera centers as COLMAP position priors.
+When a pose report is passed, the pinhole reconstruction can reuse
+panorama-derived pinhole poses in two separate ways.
+
+### Position Priors
 
 This means:
 
@@ -383,16 +385,6 @@ pose_report.views[].pinhole_camera_pose.center_world
 
 is used as a prior camera center for the matching rendered pinhole image.
 
-This does not mean the first implementation should force COLMAP to start from
-or keep the full panorama-derived 6DoF pose. In particular, the first
-pose-aware mode should not rely on:
-
-```text
-pose_report.views[].pinhole_camera_pose.rotation_world_from_pinhole
-```
-
-except for reporting and future experiments.
-
 Initial command shape:
 
 ```bash
@@ -401,7 +393,6 @@ colmap-pinhole-reconstruct \
   --pose-report /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/pose-renders/pose_report.json \
   --use-position-priors \
   --workspace /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/pinhole-reconstruction-priors \
-  --matcher sequential \
   --overlap 10 \
   --overwrite
 ```
@@ -425,24 +416,38 @@ unscaled coordinate frame, drift, and any pose errors. They are useful for
 anchoring or regularizing the pinhole reconstruction, but they should not be
 reported as metric or absolute camera locations.
 
-## Deferred Full-Pose Initialization
+### Full 6DoF Initial Poses
 
-Full-pose initialization is a later experiment, not part of the first
-implementation.
+Full-pose initialization means:
 
-Possible future approaches:
+```text
+pose_report.views[].pinhole_camera_pose.center_world
+pose_report.views[].pinhole_camera_pose.rotation_world_from_pinhole
+```
 
-- write a COLMAP model from `pose_report.json` and pass it as pycolmap
-  `incremental_mapping(..., input_path=...)`;
-- use lower-level pycolmap mapper APIs to seed registered images from
-  panorama-derived pinhole poses, triangulate from rendered-image matches, and
-  bundle-adjust the result.
+are converted into COLMAP image poses and written as an initial text model under
+the pinhole workspace. The mapper receives that model via pycolmap
+`incremental_mapping(..., input_path=...)`.
 
-This is deferred because a useful COLMAP continuation model needs more than a
-list of camera poses. It also needs database image identity, cameras, features,
-matches, observations, points, and tracks to line up correctly. The current
-pose-attached export is appropriate for pose-aware handoff, but it is not yet
-proven to be a robust incremental-mapping seed.
+This initializes the rendered pinhole images from the panorama-derived 6DoF
+poses, but it does not fix them. COLMAP still extracts features, matches
+rendered images, triangulates, and bundle-adjusts the reconstruction.
+
+Initial command shape:
+
+```bash
+colmap-pinhole-reconstruct \
+  --render-report /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/renders/render_report.json \
+  --pose-report /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/pose-renders/pose_report.json \
+  --initial-poses-from-pose-report \
+  --workspace /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/pinhole-reconstruction-initial-poses \
+  --overlap 10 \
+  --overwrite
+```
+
+The mode remains experimental until representative runs show that it improves
+registration, stability, or alignment compared with the baseline and
+camera-center prior modes.
 
 ## Implementation Stages
 
@@ -568,14 +573,19 @@ Verification:
 Goal:
 
 Evaluate whether full panorama-derived pinhole poses can be used as an
-initialization strategy.
+initialization strategy without fixing camera poses.
 
-Possible implementations:
+Implemented first slice:
 
 - generate a COLMAP input model from pose report data and pass it through
   `input_path`;
-- use lower-level pycolmap reconstruction or mapper APIs to seed registered
-  images, triangulate, and bundle-adjust.
+- keep mapper pose refinement enabled by leaving existing frames unfixed;
+- report initialized, missing, and unusable pose counts.
+
+Possible future implementation:
+
+- use lower-level pycolmap reconstruction or mapper APIs if the text-model
+  `input_path` seed proves insufficient.
 
 Exit criteria:
 
