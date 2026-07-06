@@ -28,6 +28,7 @@ from colmap.panorama.reports import (
     format_elapsed_seconds_by_stage,
 )
 from colmap.panorama.types import FeaturePipelineOptions, PipelineExecutionOptions
+from colmap.pinhole.colorize import colorize_reconstruction_points
 from colmap.pinhole.image_import import import_pinhole_images_from_render_report
 from colmap.pinhole.initial_poses import write_initial_pose_model_from_pose_report
 from colmap.pinhole.paths import pinhole_workspace_paths
@@ -73,6 +74,7 @@ def run_pinhole_reconstruction(
     elapsed_seconds_by_stage: dict[str, float] = {}
     written_position_prior_count: int | None = None
     initial_pose_summary = None
+    point_colorization_summary = None
     if use_position_priors and pose_report_path is None:
         raise ValueError("--use-position-priors requires --pose-report")
     if initial_poses_from_pose_report and pose_report_path is None:
@@ -215,6 +217,33 @@ def run_pinhole_reconstruction(
         reconstructions.items(),
         key=lambda item: (item[1].num_reg_images(), item[1].num_points3D()),
     )
+    record_elapsed_stage(
+        elapsed_seconds_by_stage,
+        "best_model_selection",
+        stage_started_at,
+    )
+
+    stage_started_at = time.perf_counter()
+    point_colorization_summary = colorize_reconstruction_points(
+        best_reconstruction,
+        image_dir=paths["image_dir"],
+        workers=4,
+    )
+    if (
+        point_colorization_summary.point_count > 0
+        and point_colorization_summary.colored_point_count == 0
+    ):
+        raise RuntimeError(
+            "COLMAP produced sparse points, but none could be colorized from "
+            "the rendered pinhole images.",
+        )
+    record_elapsed_stage(
+        elapsed_seconds_by_stage,
+        "point_colorization",
+        stage_started_at,
+    )
+
+    stage_started_at = time.perf_counter()
     write_best_model(best_reconstruction, paths)
     record_elapsed_stage(elapsed_seconds_by_stage, "best_model_write", stage_started_at)
 
@@ -240,6 +269,7 @@ def run_pinhole_reconstruction(
         use_position_priors=use_position_priors,
         written_position_prior_count=written_position_prior_count,
         initial_pose_summary=initial_pose_summary,
+        point_colorization_summary=point_colorization_summary,
     )
     elapsed_seconds_by_stage["report_writing"] = 0.0
     elapsed_seconds = time.perf_counter() - started_at

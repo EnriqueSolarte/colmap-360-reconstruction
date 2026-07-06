@@ -8,7 +8,12 @@ from PIL import Image
 
 from colmap.panorama.types import GeneratedImageBatch
 from colmap.pinhole import pipeline as pinhole_pipeline
+from colmap.pinhole.cli_colorize import parse_args as parse_colorize_args
 from colmap.pinhole.cli import parse_args as parse_reconstruct_args
+from colmap.pinhole.colorize import (
+    PointColorizationSummary,
+    colorize_reconstruction_points,
+)
 from colmap.pinhole.initial_poses import (
     initial_pose_from_view,
     write_initial_pose_model_from_pose_report,
@@ -250,6 +255,50 @@ def test_pinhole_import_cli_accepts_image_dir_override(tmp_path: Path) -> None:
     assert args.image_dir == image_dir
 
 
+def test_pinhole_colorize_cli_defaults_to_sibling_output_model(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "workspace" / "sparse_best"
+    model_path.mkdir(parents=True)
+    image_dir = tmp_path / "workspace" / "images"
+    image_dir.mkdir()
+
+    args = parse_colorize_args(["--model", str(model_path)])
+
+    assert args.model == model_path
+    assert args.image_dir == image_dir
+    assert args.output_model == tmp_path / "workspace" / "sparse_best_colorized"
+    assert args.in_place is False
+    assert args.workers == 4
+    assert args.no_progress is False
+
+
+def test_pinhole_colorize_cli_in_place_overwrites_model(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "workspace" / "sparse_best"
+    model_path.mkdir(parents=True)
+    image_dir = tmp_path / "workspace" / "images"
+    image_dir.mkdir()
+
+    args = parse_colorize_args(["--model", str(model_path), "--in-place"])
+
+    assert args.output_model == model_path
+    assert args.overwrite is True
+
+
+def test_pinhole_colorize_cli_rejects_nonpositive_workers(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "workspace" / "sparse_best"
+    model_path.mkdir(parents=True)
+    image_dir = tmp_path / "workspace" / "images"
+    image_dir.mkdir()
+
+    with pytest.raises(SystemExit):
+        parse_colorize_args(["--model", str(model_path), "--workers", "0"])
+
+
 def test_pinhole_reconstruct_cli_accepts_baseline_options(tmp_path: Path) -> None:
     image_dir = tmp_path / "renders"
     image_dir.mkdir()
@@ -474,6 +523,82 @@ def test_write_initial_pose_model_from_pose_report_writes_colmap_text_model(
     assert (model_path / "points3D.txt").read_text(encoding="utf-8").count("\n") == 3
 
 
+class FakeColorTrackElement:
+    def __init__(self, image_id: int, point2d_idx: int) -> None:
+        self.image_id = image_id
+        self.point2D_idx = point2d_idx
+
+
+class FakeColorTrack:
+    def __init__(self, elements: list[FakeColorTrackElement]) -> None:
+        self.elements = elements
+
+
+class FakeColorPoint3D:
+    def __init__(self, elements: list[FakeColorTrackElement]) -> None:
+        self.track = FakeColorTrack(elements)
+        self.color = [0, 0, 0]
+
+
+class FakeColorPoint2D:
+    def __init__(self, xy: tuple[float, float]) -> None:
+        self.xy = xy
+
+
+class FakeColorImage:
+    def __init__(self, name: str, points2d: dict[int, tuple[float, float]]) -> None:
+        self.name = name
+        self.points2d = points2d
+
+    def point2D(self, point2d_idx: int) -> FakeColorPoint2D:
+        return FakeColorPoint2D(self.points2d[point2d_idx])
+
+
+class FakeColorReconstruction:
+    def __init__(self) -> None:
+        self.images = {
+            1: FakeColorImage("a.png", {0: (0.0, 0.0)}),
+            2: FakeColorImage("b.png", {0: (1.0, 0.0)}),
+        }
+        self.points3D = {
+            10: FakeColorPoint3D(
+                [
+                    FakeColorTrackElement(1, 0),
+                    FakeColorTrackElement(2, 0),
+                ],
+            ),
+        }
+
+
+def test_colorize_reconstruction_points_uses_mean_observation_rgb(
+    tmp_path: Path,
+) -> None:
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    Image.new("RGB", (2, 1), color=(0, 0, 0)).save(image_dir / "unused.png")
+    image_a = Image.new("RGB", (2, 1), color=(0, 0, 0))
+    image_a.putpixel((0, 0), (10, 20, 30))
+    image_a.save(image_dir / "a.png")
+    image_b = Image.new("RGB", (2, 1), color=(0, 0, 0))
+    image_b.putpixel((1, 0), (30, 40, 50))
+    image_b.save(image_dir / "b.png")
+    reconstruction = FakeColorReconstruction()
+
+    summary = colorize_reconstruction_points(
+        reconstruction,
+        image_dir=image_dir,
+        show_progress=False,
+        workers=2,
+    )
+
+    assert reconstruction.points3D[10].color.tolist() == [20, 30, 40]
+    assert summary.report()["colored_point_count"] == 1
+    assert summary.report()["sampled_observation_count"] == 2
+    assert summary.report()["black_point_count_before"] == 1
+    assert summary.report()["black_point_count_after"] == 0
+    assert summary.report()["workers"] == 2
+
+
 class FakeDevice:
     cpu = "cpu"
     cuda = "cuda"
@@ -617,6 +742,26 @@ def test_pinhole_reconstruction_pipeline_runs_baseline_with_fakes(
         "write_position_priors_to_database",
         lambda *args, **kwargs: 2,
     )
+    monkeypatch.setattr(
+        pinhole_pipeline,
+        "colorize_reconstruction_points",
+        lambda _reconstruction, *, image_dir, workers: PointColorizationSummary(
+            image_dir=image_dir,
+            point_count=7,
+            track_observation_count=14,
+            sampled_observation_count=14,
+            colored_point_count=7,
+            black_point_count_before=7,
+            black_point_count_after=0,
+            requested_image_count=2,
+            loaded_image_count=2,
+            missing_image_count=0,
+            missing_image_observation_count=0,
+            missing_point2d_count=0,
+            out_of_bounds_observation_count=0,
+            workers=4,
+        ),
+    )
 
     def fake_match_features(*args, **kwargs) -> None:
         calls.append(("matcher", kwargs["matcher"]))
@@ -654,6 +799,10 @@ def test_pinhole_reconstruction_pipeline_runs_baseline_with_fakes(
     assert report["initial_poses"]["initialized_count"] == 2
     assert report["initial_poses"]["fixed_poses"] is False
     assert report["options"]["initial_poses_from_pose_report"] is True
+    assert report["options"]["point_colorization"] is True
+    assert report["point_colorization"]["colored_point_count"] == 7
+    assert report["point_colorization"]["black_point_count_after"] == 0
+    assert report["point_colorization"]["workers"] == 4
     assert mapper_options.use_prior_position is True
     assert ("matcher", "sequential") in calls
     assert ("overlap", 4) in calls

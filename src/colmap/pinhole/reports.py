@@ -127,6 +127,7 @@ def build_pinhole_reconstruction_report(
     use_position_priors: bool = False,
     written_position_prior_count: int | None = None,
     initial_pose_summary: Any | None = None,
+    point_colorization_summary: Any | None = None,
 ) -> dict[str, Any]:
     database_report = read_database_stats(paths["database"])
     model_stats = {
@@ -195,6 +196,7 @@ def build_pinhole_reconstruction_report(
             "use_position_priors": use_position_priors,
             "position_prior_count": written_position_prior_count,
             "initial_poses_from_pose_report": initial_pose_summary is not None,
+            "point_colorization": point_colorization_summary is not None,
         },
         "rendered_image_count": len(import_result.imported_images),
         "generated_image_count": len(import_result.image_names),
@@ -224,5 +226,10 @@ def build_pinhole_reconstruction_report(
         ),
         "initial_poses": (
             None if initial_pose_summary is None else initial_pose_summary.report()
+        ),
+        "point_colorization": (
+            None
+            if point_colorization_summary is None
+            else point_colorization_summary.report()
         ),
     }
