@@ -39,6 +39,7 @@ DEFAULT_PREVIEW_MAX_WIDTH = 512
 DEFAULT_PREVIEW_MAX_HEIGHT = 384
 DEFAULT_PANORAMA_DISPLAY_MAX_WIDTH = 1600
 DEFAULT_PANORAMA_DISPLAY_MAX_HEIGHT = 800
+PANORAMA_PREVIEW_CACHE_CONTROL = "no-store"
 MAX_UNDO_DEPTH = 20
 FLAT_SELECTIONS_FILENAME = "selections.json"
 SELECTOR_MODE_IMAGE_DIR = "image_dir"
@@ -557,7 +558,7 @@ class ManualPinholeSelectionHandler(BaseHTTPRequestHandler):
                 self.send_bytes(
                     display,
                     "image/jpeg",
-                    headers={"Cache-Control": "public, max-age=3600"},
+                    headers={"Cache-Control": PANORAMA_PREVIEW_CACHE_CONTROL},
                 )
                 return
             if path.startswith("/api/panorama/"):
@@ -1238,7 +1239,9 @@ INDEX_HTML = r"""<!doctype html>
       els.autoGridBtn.disabled = false;
       clearMarkers();
       els.panorama.onload = () => drawMarkers(pano());
-      els.panorama.src = `/api/panorama-preview/${current.pano_index}`;
+      const previewName = current.pano_image_name || current.pano_filename || current.pano_index;
+      const previewCacheKey = encodeURIComponent(`${previewName}:${Date.now()}`);
+      els.panorama.src = `/api/panorama-preview/${current.pano_index}?v=${previewCacheKey}`;
       drawSelections(current);
       if (els.panorama.complete) {
         requestAnimationFrame(() => drawMarkers(current));

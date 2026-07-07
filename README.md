@@ -364,6 +364,50 @@ The pose attachment stage writes:
 This COLMAP text model can be used by downstream tools that expect pinhole
 camera images and COLMAP-style camera poses.
 
+### Reconstruct With Higher-Resolution Pinhole Images
+
+`colmap-pinhole-reconstruct` can use one render report as the metadata/FOV
+manifest while reading the actual images from a different directory. This is
+useful when you render the same selected views again at a higher resolution.
+
+Use the original `render_report.json` for:
+
+- selected view identity;
+- output image names;
+- FOV;
+- provenance for pose-report matching.
+
+Use `--image-dir` for the actual image files that should be imported into the
+COLMAP workspace. Files are matched by `renders[].output_name`, and the pipeline
+reads the actual image resolution from those files before deriving the shared
+`PINHOLE` intrinsics. This means an x2 image directory with the same FOV but
+twice the width/height gets x2-resolution intrinsics automatically.
+
+Example using x1 metadata and x2 rendered images:
+
+```bash
+colmap-pinhole-reconstruct \
+  --render-report /data/itri-3d-reconstruction/scene-reconstruction/parking-lot-001/car-01-001/pinhole-renders-x1/render_report.json \
+  --image-dir /data/itri-3d-reconstruction/scene-reconstruction/parking-lot-001/car-01-001/pinhole-renders-x2 \
+  --pose-report /data/itri-3d-reconstruction/scene-reconstruction/parking-lot-001/car-01-001/pinhole-x1_panorama_pose_base/pose_report.json \
+  --use-position-priors \
+  --initial-poses-from-pose-report \
+  -w /data/itri-3d-reconstruction/scene-reconstruction/parking-lot-001/car-01-001/pinhole-colmap-x2-6dof-pose-priors \
+  --num-threads 4 \
+  --import-workers 100 \
+  --max-num-features 16384 \
+  --overwrite
+```
+
+Before running, make sure every `output_name` listed in the x1
+`render_report.json` exists in the x2 image directory. If any x2 image is still
+rendering or missing, import fails fast with the missing filename.
+
+For higher-resolution images, consider increasing `--max-num-features` from the
+default `8192`; `16384` is a practical first x2 setting. The default
+`--max-image-size -1` keeps COLMAP feature extraction at the full imported image
+resolution.
+
 ### Example Workspace
 
 For the tested workspace:

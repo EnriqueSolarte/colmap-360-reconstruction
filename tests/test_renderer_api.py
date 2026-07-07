@@ -19,6 +19,7 @@ from render_pinhole.selection_schema import (
 )
 from render_pinhole.tools.manual_pinhole_select_server import (
     INDEX_HTML,
+    PANORAMA_PREVIEW_CACHE_CONTROL,
     append_flat_selection,
     flat_api_state,
     image_dir_panorama_records,
@@ -1204,6 +1205,15 @@ def test_manual_select_panorama_display_uses_resized_jpeg(tmp_path) -> None:
     result = Image.open(io.BytesIO(display))
     assert result.format == "JPEG"
     assert result.size == (16, 8)
+
+
+def test_manual_select_panorama_preview_avoids_stale_index_cache() -> None:
+    assert PANORAMA_PREVIEW_CACHE_CONTROL == "no-store"
+    assert "Date.now()" in INDEX_HTML
+    assert (
+        "/api/panorama-preview/${current.pano_index}?v=${previewCacheKey}"
+        in INDEX_HTML
+    )
 
 
 
