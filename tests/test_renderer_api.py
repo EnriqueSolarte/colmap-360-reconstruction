@@ -1,6 +1,6 @@
 import io
 import json
-from math import degrees, pi
+from math import asin, cos, degrees, pi, sin
 
 import numpy as np
 import pytest
@@ -332,7 +332,19 @@ def test_manual_select_image_dir_defaults_output_dir_to_image_parent(tmp_path) -
 def test_manual_select_ui_cmd_click_and_arrow_navigation_defaults() -> None:
     assert "cmdSaveOnly" not in INDEX_HTML
     assert "Cmd-click save only" not in INDEX_HTML
-    assert "saveSelectionAndAdvance(event.shiftKey)" in INDEX_HTML
+    assert "let saveInFlight = false;" in INDEX_HTML
+    assert "function isSaveModifier(event) { return event.metaKey || event.ctrlKey; }" in INDEX_HTML
+    assert 'function setRoiModeFromShift(event)' in INDEX_HTML
+    assert 'if (event.key !== "Shift") return;' in INDEX_HTML
+    assert 'els.roiMode.checked = event.type === "keydown";' in INDEX_HTML
+    assert 'window.addEventListener("keyup", setRoiModeFromShift);' in INDEX_HTML
+    assert "if (isSaveModifier(event)) return;" in INDEX_HTML
+    assert "if (els.roiMode.checked && !saveModifier) return;" in INDEX_HTML
+    assert "function selectionPayload(current, longitude, latitude)" in INDEX_HTML
+    assert "preview(request, {setReadyStatus: false})" in INDEX_HTML
+    assert "saveSelectionAndAdvance(event.shiftKey, request)" in INDEX_HTML
+    assert "preview().then(() => saveSelectionAndAdvance" not in INDEX_HTML
+    assert "Wait for the next panorama before clicking again." in INDEX_HTML
     assert "function navigatePanorama(delta)" in INDEX_HTML
     assert 'event.key === "ArrowLeft"' in INDEX_HTML
     assert 'event.key === "ArrowRight"' in INDEX_HTML
@@ -422,6 +434,7 @@ def test_render_selected_pinhole_cli_writes_images_and_report(tmp_path, capsys) 
         str(output_path),
         str(second_output_path),
     ]
+    assert all(record["render_key"].startswith("sha256:") for record in report["renders"])
     captured = capsys.readouterr()
     assert "Rendered: 2" in captured.out
     assert "Rendering selected pinholes" in captured.err
@@ -450,8 +463,17 @@ def test_render_selected_pinhole_cli_reuses_existing_and_deletes_stale(
                 "renders": [
                     {
                         "selection_id": "front__sel-000",
+                        "pano_image_name": "front.png",
+                        "selection_index": 0,
+                        "longitude": pi / 4,
+                        "latitude": 0.0,
                         "output_file": str(existing_output),
                         "output_name": existing_output.name,
+                        "width": 10,
+                        "height": 8,
+                        "fov_x": pi / 2,
+                        "fov_y": pi / 3,
+                        "interpolation": "nearest",
                     },
                     {
                         "selection_id": "old__sel-000",
@@ -497,6 +519,12 @@ def test_render_selected_pinhole_cli_reuses_existing_and_deletes_stale(
             "8",
             "-w",
             "10",
+            "--fov-x-deg",
+            "90",
+            "--fov-y-deg",
+            "60",
+            "--interpolation",
+            "nearest",
         ]
     )
 
@@ -520,6 +548,95 @@ def test_render_selected_pinhole_cli_reuses_existing_and_deletes_stale(
     assert "Rendered: 1" in captured.out
     assert "Reused existing: 1" in captured.out
     assert "Deleted stale: 1" in captured.out
+
+
+def test_render_selected_pinhole_cli_regenerates_same_name_when_coordinates_change(
+    tmp_path,
+) -> None:
+    image_dir = tmp_path / "images"
+    output_dir = tmp_path / "renders"
+    image_dir.mkdir()
+    output_dir.mkdir()
+    Image = pytest.importorskip("PIL.Image")
+    Image.fromarray(make_equirectangular_image()).save(image_dir / "front.png")
+
+    existing_output = output_dir / "front__sel-000.png"
+    existing_pixels = np.full((8, 10, 3), 255, dtype=np.uint8)
+    Image.fromarray(existing_pixels).save(existing_output)
+    (output_dir / RENDER_REPORT_FILENAME).write_text(
+        json.dumps(
+            {
+                "renders": [
+                    {
+                        "selection_id": "front__sel-000",
+                        "pano_image_name": "front.png",
+                        "selection_index": 0,
+                        "longitude": 0.0,
+                        "latitude": 0.0,
+                        "output_file": str(existing_output),
+                        "output_name": existing_output.name,
+                        "width": 10,
+                        "height": 8,
+                        "fov_x": pi / 2,
+                        "fov_y": pi / 3,
+                        "interpolation": "nearest",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    selections_path = tmp_path / "selections.json"
+    selections_store = build_selection_store(
+        image_dir=image_dir,
+        selections=[
+            selection_record(
+                pano_image_name="front.png",
+                selection_index=0,
+                longitude=pi / 4,
+                latitude=0.0,
+                selected_by="manual-pinhole-select",
+            ),
+        ],
+        selection_mode="manual",
+    )
+    selections_path.write_text(json.dumps(selections_store), encoding="utf-8")
+
+    exit_code = render_selected_main(
+        [
+            "-s",
+            str(selections_path),
+            "-o",
+            str(output_dir),
+            "-h",
+            "8",
+            "-w",
+            "10",
+            "--fov-x-deg",
+            "90",
+            "--fov-y-deg",
+            "60",
+            "--interpolation",
+            "nearest",
+        ]
+    )
+
+    report = json.loads(
+        (output_dir / RENDER_REPORT_FILENAME).read_text(encoding="utf-8")
+    )
+    assert exit_code == 0
+    assert report["newly_rendered_count"] == 1
+    assert report["reused_count"] == 0
+    assert report["deleted_count"] == 1
+    assert report["deleted"][0]["output_name"] == "front__sel-000.png"
+    assert report["deleted"][0]["render_key"].startswith("sha256:")
+    assert report["deleted"][0]["reason"] == (
+        "render key not present in current selections"
+    )
+    assert report["renders"][0]["render_status"] == "rendered"
+    assert report["renders"][0]["render_key"].startswith("sha256:")
+    assert not np.array_equal(np.asarray(Image.open(existing_output)), existing_pixels)
 
 
 def test_render_selected_pinhole_cli_reports_missing_sources(tmp_path) -> None:
@@ -1080,21 +1197,50 @@ def test_manual_select_pixel_coordinates_map_to_lon_lat() -> None:
     assert latitude == pytest.approx(pi / 2)
 
 
-def test_manual_select_roi_points_are_spaced_by_delta() -> None:
+def test_manual_select_roi_points_use_spherical_spacing() -> None:
+    equator_points = roi_points_by_delta(
+        longitude_min=-0.6,
+        longitude_max=0.6,
+        latitude_min=-0.01,
+        latitude_max=0.01,
+        delta_degrees=degrees(0.2),
+    )
+    high_latitude = pi / 3.0
+    high_latitude_points = roi_points_by_delta(
+        longitude_min=-0.6,
+        longitude_max=0.6,
+        latitude_min=high_latitude - 0.01,
+        latitude_max=high_latitude + 0.01,
+        delta_degrees=degrees(0.2),
+    )
+
+    assert len(equator_points) == 6
+    assert len(high_latitude_points) == 3
+    assert len(high_latitude_points) < len(equator_points)
+    assert [latitude for _, latitude in equator_points] == pytest.approx([0.0] * 6)
+    assert [latitude for _, latitude in high_latitude_points] == pytest.approx(
+        [high_latitude] * 3
+    )
+
+    first_longitude, row_latitude = high_latitude_points[0]
+    second_longitude, _ = high_latitude_points[1]
+    row_distance = 2.0 * asin(
+        cos(row_latitude) * sin(abs(second_longitude - first_longitude) / 2.0)
+    )
+
+    assert row_distance == pytest.approx(0.2)
+
+
+def test_manual_select_roi_points_return_center_when_roi_is_smaller_than_delta() -> None:
     points = roi_points_by_delta(
-        longitude_min=-1.0,
-        longitude_max=1.0,
-        latitude_min=-1.0,
-        latitude_max=1.0,
+        longitude_min=-0.1,
+        longitude_max=0.1,
+        latitude_min=-0.05,
+        latitude_max=0.05,
         delta_degrees=degrees(1.0),
     )
 
-    assert points == [
-        (-0.5, 0.5),
-        (0.5, 0.5),
-        (-0.5, -0.5),
-        (0.5, -0.5),
-    ]
+    assert points == [(0.0, 0.0)]
 
 
 def test_image_dir_selector_state_uses_flat_selections(tmp_path) -> None:

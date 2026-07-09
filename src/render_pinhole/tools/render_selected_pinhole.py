@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import json
 from math import degrees, radians
 from pathlib import Path
@@ -137,10 +138,18 @@ def render_selected_pinhole_images(
         image_dir=image_dir,
         output_dir=output_dir,
         output_extension=output_extension,
+        width=width,
+        height=height,
+        fov_x=fov_x,
+        fov_y=fov_y,
+        interpolation=interpolation,
     )
+    previous_records = _load_previous_render_records(output_dir)
     if prune_stale:
         deleted = _delete_stale_render_outputs(
             output_dir=output_dir,
+            previous_records=previous_records,
+            expected_render_keys={str(job["render_key"]) for job in jobs},
             expected_output_names={job["output_path"].name for job in jobs},
         )
         report["deleted"] = deleted
@@ -156,6 +165,7 @@ def render_selected_pinhole_images(
         workers=workers,
         show_progress=show_progress,
         overwrite=overwrite,
+        previous_records=previous_records,
     )
     for outcome in sorted(outcomes, key=lambda record: int(record["order"])):
         kind = outcome.pop("kind")
@@ -186,6 +196,11 @@ def _render_jobs(
     image_dir: Path,
     output_dir: Path,
     output_extension: str,
+    width: int,
+    height: int,
+    fov_x: float,
+    fov_y: float,
+    interpolation: str,
 ) -> list[dict[str, Any]]:
     return [
         {
@@ -193,6 +208,15 @@ def _render_jobs(
             "selection": selection,
             "source_path": image_dir / str(selection.get("pano_image_name", "")),
             "output_path": output_dir / _rendered_filename(selection, output_extension),
+            "render_key": render_key(
+                selection=selection,
+                width=width,
+                height=height,
+                fov_x=fov_x,
+                fov_y=fov_y,
+                interpolation=interpolation,
+                output_extension=output_extension,
+            ),
         }
         for order, selection in enumerate(selections)
     ]
@@ -209,8 +233,12 @@ def _render_jobs_with_progress(
     workers: int,
     show_progress: bool,
     overwrite: bool,
+    previous_records: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     job_groups = _jobs_by_source_path(jobs)
+    previous_records_by_output_name = _previous_records_by_output_name(
+        previous_records,
+    )
     progress_options = {
         "total": len(jobs),
         "desc": "Rendering selected pinholes",
@@ -224,6 +252,7 @@ def _render_jobs_with_progress(
         "fov_y": fov_y,
         "interpolation": interpolation,
         "overwrite": overwrite,
+        "previous_records_by_output_name": previous_records_by_output_name,
     }
 
     outcomes: list[dict[str, Any]] = []
@@ -263,6 +292,7 @@ def _render_source_group(
     fov_y: float,
     interpolation: str,
     overwrite: bool,
+    previous_records_by_output_name: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     if not jobs:
         return []
@@ -274,7 +304,12 @@ def _render_source_group(
         output_path = job["output_path"]
         if not overwrite and output_path.is_file():
             output_size = _image_file_resolution(output_path)
-            if output_size is not None:
+            previous_record = previous_records_by_output_name.get(output_path.name)
+            if (
+                output_size is not None
+                and previous_record is not None
+                and _previous_record_matches_job(previous_record, job)
+            ):
                 if source_size is None:
                     source_size = _image_file_resolution(source_path)
                 outcomes.append(
@@ -290,6 +325,7 @@ def _render_source_group(
                             fov_x=fov_x,
                             fov_y=fov_y,
                             interpolation=interpolation,
+                            render_key=str(job["render_key"]),
                             render_status="reused_existing",
                         ),
                     }
@@ -366,6 +402,7 @@ def _render_source_group(
                     fov_x=fov_x,
                     fov_y=fov_y,
                     interpolation=interpolation,
+                    render_key=str(job["render_key"]),
                     render_status="rendered",
                 ),
             }
@@ -505,6 +542,65 @@ def _rendered_filename(selection: dict[str, Any], extension: str) -> str:
     return f"{stem}{extension}"
 
 
+def render_key(
+    *,
+    selection: dict[str, Any],
+    width: int,
+    height: int,
+    fov_x: float,
+    fov_y: float,
+    interpolation: str,
+    output_extension: str,
+) -> str:
+    identity = render_identity(
+        pano_image_name=selection.get("pano_image_name"),
+        longitude=selection.get("longitude"),
+        latitude=selection.get("latitude"),
+        width=width,
+        height=height,
+        fov_x=fov_x,
+        fov_y=fov_y,
+        interpolation=interpolation,
+        output_extension=output_extension,
+    )
+    return _render_key_from_identity(identity)
+
+
+def render_identity(
+    *,
+    pano_image_name: Any,
+    longitude: Any,
+    latitude: Any,
+    width: Any,
+    height: Any,
+    fov_x: Any,
+    fov_y: Any,
+    interpolation: Any,
+    output_extension: Any,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "pano_image_name": str(pano_image_name),
+        "longitude": _canonical_float(longitude),
+        "latitude": _canonical_float(latitude),
+        "width": int(width),
+        "height": int(height),
+        "fov_x": _canonical_float(fov_x),
+        "fov_y": _canonical_float(fov_y),
+        "interpolation": str(interpolation),
+        "output_extension": _normalize_extension(str(output_extension)),
+    }
+
+
+def _render_key_from_identity(identity: dict[str, Any]) -> str:
+    payload = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _canonical_float(value: Any) -> str:
+    return format(float(value), ".17g")
+
+
 def _selection_issue_record(
     selection: dict[str, Any],
     *,
@@ -528,6 +624,7 @@ def _render_record(
     fov_x: float,
     fov_y: float,
     interpolation: str,
+    render_key: str,
     render_status: str,
 ) -> dict[str, Any]:
     source_width, source_height = source_size
@@ -541,6 +638,7 @@ def _render_record(
         "source_height": source_height,
         "output_file": str(output_path),
         "output_name": output_path.name,
+        "render_key": render_key,
         "width": output_width,
         "height": output_height,
         "longitude": selection.get("longitude"),
@@ -557,21 +655,12 @@ def _render_record(
 def _delete_stale_render_outputs(
     *,
     output_dir: Path,
+    previous_records: list[dict[str, Any]],
+    expected_render_keys: set[str],
     expected_output_names: set[str],
 ) -> list[dict[str, Any]]:
-    previous_report_path = output_dir / RENDER_REPORT_FILENAME
-    if not previous_report_path.is_file():
-        return []
-
-    try:
-        previous_report = _load_selection_store(previous_report_path)
-    except json.JSONDecodeError:
-        return []
-
     deleted = []
-    for record in previous_report.get("renders", []):
-        if not isinstance(record, dict):
-            continue
+    for record in previous_records:
         output_name = str(record.get("output_name") or "")
         output_path = _previous_render_output_path(
             record=record,
@@ -579,8 +668,17 @@ def _delete_stale_render_outputs(
         )
         if not output_name and output_path is not None:
             output_name = output_path.name
-        if not output_name or output_name in expected_output_names:
+        if not output_name:
             continue
+        previous_render_key = _render_key_from_previous_record(record)
+        if previous_render_key is not None:
+            if previous_render_key in expected_render_keys:
+                continue
+            reason = "render key not present in current selections"
+        elif output_name in expected_output_names:
+            continue
+        else:
+            reason = "not present in current selections"
         if output_path is None or not output_path.is_file():
             continue
         output_path.unlink()
@@ -588,7 +686,8 @@ def _delete_stale_render_outputs(
             {
                 "output_name": output_name,
                 "output_file": str(output_path),
-                "reason": "not present in current selections",
+                "render_key": previous_render_key,
+                "reason": reason,
             }
         )
     return deleted
@@ -613,6 +712,63 @@ def _previous_render_output_path(
     except ValueError:
         return None
     return candidate
+
+
+def _load_previous_render_records(output_dir: Path) -> list[dict[str, Any]]:
+    previous_report_path = output_dir / RENDER_REPORT_FILENAME
+    if not previous_report_path.is_file():
+        return []
+    try:
+        previous_report = _load_selection_store(previous_report_path)
+    except json.JSONDecodeError:
+        return []
+    return [
+        record
+        for record in previous_report.get("renders", [])
+        if isinstance(record, dict)
+    ]
+
+
+def _previous_records_by_output_name(
+    previous_records: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    records_by_name = {}
+    for record in previous_records:
+        output_name = str(record.get("output_name") or "")
+        if output_name:
+            records_by_name[output_name] = record
+    return records_by_name
+
+
+def _previous_record_matches_job(
+    previous_record: dict[str, Any],
+    job: dict[str, Any],
+) -> bool:
+    previous_render_key = _render_key_from_previous_record(previous_record)
+    return previous_render_key == str(job["render_key"])
+
+
+def _render_key_from_previous_record(record: dict[str, Any]) -> str | None:
+    existing_key = record.get("render_key")
+    if existing_key:
+        return str(existing_key)
+    try:
+        output_name = str(record.get("output_name") or "")
+        output_extension = Path(output_name).suffix if output_name else DEFAULT_OUTPUT_EXTENSION
+        identity = render_identity(
+            pano_image_name=record.get("pano_image_name"),
+            longitude=record.get("longitude"),
+            latitude=record.get("latitude"),
+            width=record.get("width"),
+            height=record.get("height"),
+            fov_x=record.get("fov_x"),
+            fov_y=record.get("fov_y"),
+            interpolation=record.get("interpolation"),
+            output_extension=output_extension,
+        )
+    except (TypeError, ValueError):
+        return None
+    return _render_key_from_identity(identity)
 
 
 def _normalize_extension(extension: str) -> str:

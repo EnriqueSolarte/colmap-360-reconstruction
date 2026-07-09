@@ -9,7 +9,7 @@ import threading
 from collections import OrderedDict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from math import degrees, pi, radians
+from math import degrees, pi
 from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import urlparse
@@ -34,6 +34,7 @@ from render_pinhole.selection_schema import (
 )
 from render_pinhole.geometry import validate_latitude, wrap_longitude
 from render_pinhole.source_images import IMAGE_EXTENSIONS
+from render_pinhole.view_sampling import spherical_roi_points_by_delta
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -255,41 +256,13 @@ def roi_points_by_delta(
     latitude_max: float,
     delta_degrees: float,
 ) -> list[tuple[float, float]]:
-    if delta_degrees <= 0:
-        raise ValueError("ROI delta angle must be positive")
-    longitude_min = wrap_longitude(float(longitude_min))
-    longitude_max = wrap_longitude(float(longitude_max))
-    latitude_min = float(latitude_min)
-    latitude_max = float(latitude_max)
-    validate_latitude(latitude_min)
-    validate_latitude(latitude_max)
-    if longitude_max <= longitude_min:
-        raise ValueError("ROI longitude_max must be greater than longitude_min")
-    if latitude_max <= latitude_min:
-        raise ValueError("ROI latitude_max must be greater than latitude_min")
-
-    delta = radians(float(delta_degrees))
-    longitude_values = axis_values_by_delta(longitude_min, longitude_max, delta)
-    latitude_values = list(
-        reversed(axis_values_by_delta(latitude_min, latitude_max, delta))
+    return spherical_roi_points_by_delta(
+        longitude_min=longitude_min,
+        longitude_max=longitude_max,
+        latitude_min=latitude_min,
+        latitude_max=latitude_max,
+        delta_degrees=delta_degrees,
     )
-    return [
-        (longitude, latitude)
-        for latitude in latitude_values
-        for longitude in longitude_values
-    ]
-
-
-def axis_values_by_delta(minimum: float, maximum: float, delta: float) -> list[float]:
-    span = maximum - minimum
-    if span <= delta:
-        return [(minimum + maximum) / 2.0]
-    value = minimum + delta / 2.0
-    points = []
-    while value < maximum:
-        points.append(value)
-        value += delta
-    return points
 
 
 def render_flat_preview_jpeg(
@@ -1337,6 +1310,7 @@ INDEX_HTML = r"""<!doctype html>
     let suppressNextClick = false;
     let highlightedSelectionIndex = null;
     let loadedPanoramaKey = null;
+    let saveInFlight = false;
     const PANORAMA_PREFETCH_RADIUS = 10;
     const PANORAMA_PREVIEW_CACHE_LIMIT = 21;
     const PANORAMA_PREFETCH_CONCURRENCY = 3;
@@ -1358,6 +1332,11 @@ INDEX_HTML = r"""<!doctype html>
       };
     }
     function setStatus(message) { els.status.textContent = message || ""; }
+    function isSaveModifier(event) { return event.metaKey || event.ctrlKey; }
+    function setRoiModeFromShift(event) {
+      if (event.key !== "Shift") return;
+      els.roiMode.checked = event.type === "keydown";
+    }
 
     function navigatePanorama(delta) {
       if (!state || !state.panorama_count) return;
@@ -1645,37 +1624,42 @@ INDEX_HTML = r"""<!doctype html>
       preview().catch(error => setStatus(error.message));
     }
 
-    async function preview() {
-      const current = pano();
+    function selectionPayload(current, longitude, latitude) {
+      return {
+        pano_index: current.pano_index,
+        longitude,
+        latitude,
+        render: renderOverrides()
+      };
+    }
+
+    function selectionPayloadFromInputs() {
+      return selectionPayload(
+        pano(),
+        radians(els.lonDeg.value),
+        radians(els.latDeg.value)
+      );
+    }
+
+    async function preview(request = selectionPayloadFromInputs(), {setReadyStatus = true} = {}) {
       setStatus("Rendering preview...");
       const response = await fetch("/api/preview", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({
-          pano_index: current.pano_index,
-          longitude: radians(els.lonDeg.value),
-          latitude: radians(els.latDeg.value),
-          render: renderOverrides()
-        })
+        body: JSON.stringify(request)
       });
       if (!response.ok) throw new Error(await response.text());
       const blob = await response.blob();
       els.preview.src = URL.createObjectURL(blob);
-      setStatus("Preview ready.");
+      if (setReadyStatus) setStatus("Preview ready.");
     }
 
-    async function saveSelection({redraw = true} = {}) {
-      const current = pano();
+    async function saveSelection({redraw = true, request = selectionPayloadFromInputs()} = {}) {
       setStatus("Saving...");
       const response = await fetch("/api/selections", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({
-          pano_index: current.pano_index,
-          longitude: radians(els.lonDeg.value),
-          latitude: radians(els.latDeg.value),
-          render: renderOverrides()
-        })
+        body: JSON.stringify(request)
       });
       if (!response.ok) throw new Error(await response.text());
       const payload = await response.json();
@@ -1687,15 +1671,24 @@ INDEX_HTML = r"""<!doctype html>
       return payload;
     }
 
-    async function saveSelectionAndAdvance(advanceAfterSave) {
-      await saveSelection({redraw: false});
-      if (advanceAfterSave && index < state.panorama_count - 1) {
-        index += 1;
-        draw();
-        setStatus("Saved. Moved to next panorama.");
-      } else {
-        draw();
-        setStatus("Saved.");
+    async function saveSelectionAndAdvance(advanceAfterSave, request) {
+      if (saveInFlight) {
+        setStatus("Saving. Wait for the next panorama before clicking again.");
+        return;
+      }
+      saveInFlight = true;
+      try {
+        await saveSelection({redraw: false, request});
+        if (advanceAfterSave && index < state.panorama_count - 1) {
+          index += 1;
+          draw();
+          setStatus("Saved. Moved to next panorama.");
+        } else {
+          draw();
+          setStatus("Saved.");
+        }
+      } finally {
+        saveInFlight = false;
       }
     }
 
@@ -1848,6 +1841,7 @@ INDEX_HTML = r"""<!doctype html>
 
     function startRoi(event) {
       if (!els.roiMode.checked || event.button !== 0) return;
+      if (isSaveModifier(event)) return;
       event.preventDefault();
       roiStart = cursorPoint(event);
       isDrawingRoi = true;
@@ -1896,18 +1890,22 @@ INDEX_HTML = r"""<!doctype html>
         suppressNextClick = false;
         return;
       }
-      if (els.roiMode.checked) return;
+      const saveModifier = isSaveModifier(event);
+      if (els.roiMode.checked && !saveModifier) return;
+      if (saveModifier && saveInFlight) {
+        setStatus("Saving. Wait for the next panorama before clicking again.");
+        return;
+      }
       const point = cursorPoint(event);
       const angles = pointAngles(point);
       els.lonDeg.value = degrees(angles.longitude).toFixed(2);
       els.latDeg.value = degrees(angles.latitude).toFixed(2);
-      const saveModifier = event.metaKey || event.ctrlKey;
+      const request = selectionPayload(pano(), angles.longitude, angles.latitude);
       if (saveModifier) {
-        preview()
-          .then(() => saveSelectionAndAdvance(event.shiftKey))
-          .catch(error => setStatus(error.message));
+        preview(request, {setReadyStatus: false}).catch(error => setStatus(error.message));
+        saveSelectionAndAdvance(event.shiftKey, request).catch(error => setStatus(error.message));
       } else {
-        preview().catch(error => setStatus(error.message));
+        preview(request).catch(error => setStatus(error.message));
       }
     }
 
@@ -1933,6 +1931,7 @@ INDEX_HTML = r"""<!doctype html>
     els.resetPanoBtn.onclick = () => resetPanoSelections().catch(error => setStatus(error.message));
     els.resetCollectionBtn.onclick = () => resetCollectionSelections().catch(error => setStatus(error.message));
     window.addEventListener("keydown", event => {
+      setRoiModeFromShift(event);
       if (event.key === "ArrowLeft") {
         event.preventDefault();
         navigatePanorama(-1);
@@ -1947,6 +1946,7 @@ INDEX_HTML = r"""<!doctype html>
       }
       if (event.key.toLowerCase() === "s") els.saveBtn.click();
     });
+    window.addEventListener("keyup", setRoiModeFromShift);
     window.addEventListener("resize", () => {
       if (state && state.panorama_count) drawMarkers(pano());
     });

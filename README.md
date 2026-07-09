@@ -287,9 +287,10 @@ Basic selection behavior:
 
 For faster batch selection, enable `ROI sampling`, draw a box from the upper
 left to the lower right of the region you want, and set `Delta deg`. The tool
-samples a regular longitude/latitude grid inside that box using the chosen
-angular spacing. Smaller deltas create more views; larger deltas create fewer
-views.
+samples a spherical grid inside that box using the chosen angular spacing.
+Rows near the panorama poles contain fewer longitude samples because the
+corresponding latitude rings are smaller on the sphere. Smaller deltas create
+more views; larger deltas create fewer views.
 
 Good manual selections usually follow these rules:
 
@@ -332,8 +333,11 @@ default is `--workers 1`, which is slower but has predictable memory use.
 Existing expected output images are reused by default, so rerunning the command
 only renders missing selections. Pass `--overwrite` to regenerate existing
 outputs. When a previous `render_report.json` exists, images listed in that old
-report are deleted if they are no longer present in the current selections; pass
-`--keep-stale` to keep them.
+report are deleted if their render identity is no longer present in the current
+selections; pass `--keep-stale` to keep them. Render identity includes the
+source panorama name, longitude, latitude, output size, FOV, interpolation, and
+output extension, so matching output filenames alone are not reused when the
+underlying view changed.
 
 ### Stage 3: Attach COLMAP Poses
 
