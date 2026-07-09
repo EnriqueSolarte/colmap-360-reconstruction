@@ -60,7 +60,7 @@ def run_pinhole_reconstruction(
     *,
     image_dir: Path | None = None,
     pose_report_path: Path | None = None,
-    use_position_priors: bool = False,
+    use_position_priors: bool | None = None,
     initial_poses_from_pose_report: bool = False,
     overlap: int = 10,
     loop_detection: bool = True,
@@ -75,8 +75,13 @@ def run_pinhole_reconstruction(
     written_position_prior_count: int | None = None
     initial_pose_summary = None
     point_colorization_summary = None
-    if use_position_priors and pose_report_path is None:
-        raise ValueError("--use-position-priors requires --pose-report")
+    effective_use_position_priors = (
+        pose_report_path is not None
+        if use_position_priors is None
+        else use_position_priors
+    )
+    if effective_use_position_priors and pose_report_path is None:
+        raise ValueError("position priors require pose_report_path")
     if initial_poses_from_pose_report and pose_report_path is None:
         raise ValueError("--initial-poses-from-pose-report requires --pose-report")
     stage_started_at = started_at
@@ -144,9 +149,9 @@ def run_pinhole_reconstruction(
     )
     record_elapsed_stage(elapsed_seconds_by_stage, "feature_stats", stage_started_at)
 
-    if use_position_priors:
+    if effective_use_position_priors:
         if pose_prior_summary is None:
-            raise ValueError("--use-position-priors requires --pose-report")
+            raise ValueError("position priors require pose_report_path")
         stage_started_at = time.perf_counter()
         written_position_prior_count = write_position_priors_to_database(
             pycolmap_module,
@@ -195,7 +200,7 @@ def run_pinhole_reconstruction(
 
     stage_started_at = time.perf_counter()
     mapper_options = create_mapper_options(pycolmap_module, execution)
-    if use_position_priors:
+    if effective_use_position_priors:
         mapper_options.use_prior_position = True
     reconstructions = run_incremental_mapping(
         pycolmap_module,
@@ -266,7 +271,7 @@ def run_pinhole_reconstruction(
         best_reconstruction=best_reconstruction,
         import_workers=import_workers,
         pose_prior_summary=pose_prior_summary,
-        use_position_priors=use_position_priors,
+        use_position_priors=effective_use_position_priors,
         written_position_prior_count=written_position_prior_count,
         initial_pose_summary=initial_pose_summary,
         point_colorization_summary=point_colorization_summary,

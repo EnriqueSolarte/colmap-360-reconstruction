@@ -6,13 +6,15 @@ import io
 import json
 import mimetypes
 import threading
+from collections import OrderedDict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from math import degrees, pi, radians
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urlparse
 
+import numpy as np
 from PIL import Image
 
 from colmap.camera import camera_from_fov
@@ -37,12 +39,20 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_PREVIEW_MAX_WIDTH = 512
 DEFAULT_PREVIEW_MAX_HEIGHT = 384
-DEFAULT_PANORAMA_DISPLAY_MAX_WIDTH = 1600
-DEFAULT_PANORAMA_DISPLAY_MAX_HEIGHT = 800
+DEFAULT_PREVIEW_JPEG_QUALITY = 80
+DEFAULT_PREVIEW_SOURCE_MAX_WIDTH = 2048
+DEFAULT_PREVIEW_SOURCE_MAX_HEIGHT = 1024
+DEFAULT_PANORAMA_DISPLAY_MAX_WIDTH = 1024
+DEFAULT_PANORAMA_DISPLAY_MAX_HEIGHT = 512
+DEFAULT_PANORAMA_DISPLAY_JPEG_QUALITY = 75
 PANORAMA_PREVIEW_CACHE_CONTROL = "no-store"
+DEFAULT_DISPLAY_CACHE_SIZE = 8
+DEFAULT_PREVIEW_RENDERER_CACHE_SIZE = 3
 MAX_UNDO_DEPTH = 20
 FLAT_SELECTIONS_FILENAME = "selections.json"
 SELECTOR_MODE_IMAGE_DIR = "image_dir"
+
+T = TypeVar("T")
 
 
 def serve_image_dir_selector(
@@ -282,20 +292,68 @@ def axis_values_by_delta(minimum: float, maximum: float, delta: float) -> list[f
     return points
 
 
+def render_flat_preview_jpeg(
+    image_record: dict[str, Any],
+    longitude: float,
+    latitude: float,
+    overrides: dict[str, Any] | None = None,
+    *,
+    renderer: EquirectangularToPinhole | None = None,
+) -> bytes:
+    pinhole = render_flat_preview_array(
+        image_record,
+        longitude,
+        latitude,
+        overrides,
+        renderer=renderer,
+    )
+    buffer = io.BytesIO()
+    Image.fromarray(pinhole).convert("RGB").save(
+        buffer,
+        format="JPEG",
+        quality=DEFAULT_PREVIEW_JPEG_QUALITY,
+        optimize=False,
+    )
+    return buffer.getvalue()
+
+
 def render_flat_preview_png(
     image_record: dict[str, Any],
     longitude: float,
     latitude: float,
     overrides: dict[str, Any] | None = None,
+    *,
+    renderer: EquirectangularToPinhole | None = None,
 ) -> bytes:
+    pinhole = render_flat_preview_array(
+        image_record,
+        longitude,
+        latitude,
+        overrides,
+        renderer=renderer,
+    )
+    buffer = io.BytesIO()
+    Image.fromarray(pinhole).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def render_flat_preview_array(
+    image_record: dict[str, Any],
+    longitude: float,
+    latitude: float,
+    overrides: dict[str, Any] | None = None,
+    *,
+    renderer: EquirectangularToPinhole | None = None,
+) -> np.ndarray:
     source_path = Path(str(image_record["source_path"]))
     params = preview_render_params(render_params(flat_render_metadata(), overrides))
     longitude = wrap_longitude(float(longitude))
     latitude = float(latitude)
     validate_latitude(latitude)
 
-    renderer = EquirectangularToPinhole.from_file(source_path)
-    pinhole = renderer.render(
+    if renderer is None:
+        renderer = EquirectangularToPinhole.from_file(source_path)
+    return renderer.render(
         height=params["height"],
         width=params["width"],
         longitude=longitude,
@@ -304,9 +362,50 @@ def render_flat_preview_png(
         fov_y=params["fov_y"],
         interpolation=params["interpolation"],
     )
-    buffer = io.BytesIO()
-    Image.fromarray(pinhole).save(buffer, format="PNG")
-    return buffer.getvalue()
+
+
+def load_preview_renderer(
+    source_path: Path,
+    *,
+    max_width: int = DEFAULT_PREVIEW_SOURCE_MAX_WIDTH,
+    max_height: int = DEFAULT_PREVIEW_SOURCE_MAX_HEIGHT,
+) -> EquirectangularToPinhole:
+    if max_width <= 0 or max_height <= 0:
+        raise ValueError("preview source max dimensions must be positive")
+    with Image.open(source_path) as image:
+        preview = image.convert("RGB")
+        preview.thumbnail((max_width, max_height), Image.Resampling.BILINEAR)
+        return EquirectangularToPinhole(np.asarray(preview))
+
+
+def image_cache_key(source_path: Path) -> tuple[str, int, int]:
+    stat = source_path.stat()
+    return (str(source_path), int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def lru_cache_get(
+    cache: OrderedDict[tuple[Any, ...], T],
+    key: tuple[Any, ...],
+) -> T | None:
+    value = cache.get(key)
+    if value is None:
+        return None
+    cache.move_to_end(key)
+    return value
+
+
+def lru_cache_put(
+    cache: OrderedDict[tuple[Any, ...], T],
+    key: tuple[Any, ...],
+    value: T,
+    *,
+    max_size: int,
+) -> T:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max_size:
+        cache.popitem(last=False)
+    return value
 
 
 def render_flat_panorama_display_jpeg(
@@ -320,9 +419,14 @@ def render_flat_panorama_display_jpeg(
     source_path = Path(str(image_record["source_path"]))
     with Image.open(source_path) as image:
         display = image.convert("RGB")
-        display.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+        display.thumbnail((max_width, max_height), Image.Resampling.BILINEAR)
         buffer = io.BytesIO()
-        display.save(buffer, format="JPEG", quality=85, optimize=True)
+        display.save(
+            buffer,
+            format="JPEG",
+            quality=DEFAULT_PANORAMA_DISPLAY_JPEG_QUALITY,
+            optimize=False,
+        )
     return buffer.getvalue()
 
 
@@ -530,9 +634,53 @@ class ManualPinholeSelectionServer(ThreadingHTTPServer):
         self.image_records = image_records
         self.state_lock = threading.Lock()
         self.undo_stack: list[Any] = []
+        self.display_jpeg_cache: OrderedDict[tuple[Any, ...], bytes] = OrderedDict()
+        self.preview_renderer_cache: OrderedDict[
+            tuple[Any, ...],
+            EquirectangularToPinhole,
+        ] = OrderedDict()
 
     def image_dir_path(self) -> Path:
         return self.image_dir
+
+    def cached_panorama_display_jpeg(self, image_record: dict[str, Any]) -> bytes:
+        source_path = Path(str(image_record["source_path"]))
+        key = (
+            *image_cache_key(source_path),
+            DEFAULT_PANORAMA_DISPLAY_MAX_WIDTH,
+            DEFAULT_PANORAMA_DISPLAY_MAX_HEIGHT,
+        )
+        cached = lru_cache_get(self.display_jpeg_cache, key)
+        if cached is not None:
+            return cached
+        display = render_flat_panorama_display_jpeg(image_record)
+        return lru_cache_put(
+            self.display_jpeg_cache,
+            key,
+            display,
+            max_size=DEFAULT_DISPLAY_CACHE_SIZE,
+        )
+
+    def cached_preview_renderer(
+        self,
+        image_record: dict[str, Any],
+    ) -> EquirectangularToPinhole:
+        source_path = Path(str(image_record["source_path"]))
+        key = (
+            *image_cache_key(source_path),
+            DEFAULT_PREVIEW_SOURCE_MAX_WIDTH,
+            DEFAULT_PREVIEW_SOURCE_MAX_HEIGHT,
+        )
+        cached = lru_cache_get(self.preview_renderer_cache, key)
+        if cached is not None:
+            return cached
+        renderer = load_preview_renderer(source_path)
+        return lru_cache_put(
+            self.preview_renderer_cache,
+            key,
+            renderer,
+            max_size=DEFAULT_PREVIEW_RENDERER_CACHE_SIZE,
+        )
 
 
 class ManualPinholeSelectionHandler(BaseHTTPRequestHandler):
@@ -552,7 +700,7 @@ class ManualPinholeSelectionHandler(BaseHTTPRequestHandler):
             if path.startswith("/api/panorama-preview/"):
                 pano_index = int(path.rsplit("/", 1)[1])
                 with self.server.state_lock:
-                    display = render_flat_panorama_display_jpeg(
+                    display = self.server.cached_panorama_display_jpeg(
                         self.image_record_at_index(pano_index)
                     )
                 self.send_bytes(
@@ -580,13 +728,17 @@ class ManualPinholeSelectionHandler(BaseHTTPRequestHandler):
             payload = self.read_json_body()
             if path == "/api/preview":
                 with self.server.state_lock:
-                    preview = render_flat_preview_png(
-                        self.image_record_at_index(int(payload["pano_index"])),
+                    image_record = self.image_record_at_index(
+                        int(payload["pano_index"]),
+                    )
+                    preview = render_flat_preview_jpeg(
+                        image_record,
                         float(payload["longitude"]),
                         float(payload["latitude"]),
                         payload.get("render"),
+                        renderer=self.server.cached_preview_renderer(image_record),
                     )
-                self.send_bytes(preview, "image/png")
+                self.send_bytes(preview, "image/jpeg")
                 return
             if path == "/api/selections":
                 with self.server.state_lock:
@@ -1184,7 +1336,14 @@ INDEX_HTML = r"""<!doctype html>
     let isDrawingRoi = false;
     let suppressNextClick = false;
     let highlightedSelectionIndex = null;
+    let loadedPanoramaKey = null;
+    const PANORAMA_PREFETCH_RADIUS = 10;
+    const PANORAMA_PREVIEW_CACHE_LIMIT = 21;
+    const PANORAMA_PREFETCH_CONCURRENCY = 3;
     const HIGHLIGHT_DISTANCE_PX = 14;
+    const panoramaPreviewCache = new Map();
+    let panoramaPrefetchQueue = [];
+    let activePanoramaPrefetches = 0;
 
     function radians(value) { return Number(value) * Math.PI / 180; }
     function degrees(value) { return Number(value) * 180 / Math.PI; }
@@ -1221,6 +1380,131 @@ INDEX_HTML = r"""<!doctype html>
       draw();
     }
 
+    function panoramaPreviewName(current) {
+      return current.pano_image_name || current.pano_filename || current.pano_index;
+    }
+
+    function panoramaPreviewKey(current) {
+      return `${current.pano_index}:${panoramaPreviewName(current)}`;
+    }
+
+    function panoramaPreviewUrl(current) {
+      return `/api/panorama-preview/${current.pano_index}?v=${encodeURIComponent(panoramaPreviewKey(current))}`;
+    }
+
+    function touchPanoramaPreview(key, entry) {
+      entry.lastUsed = Date.now();
+      panoramaPreviewCache.delete(key);
+      panoramaPreviewCache.set(key, entry);
+      return entry;
+    }
+
+    function cachedPanoramaPreview(current) {
+      const key = panoramaPreviewKey(current);
+      const entry = panoramaPreviewCache.get(key);
+      if (!entry || !entry.objectUrl) return null;
+      return touchPanoramaPreview(key, entry);
+    }
+
+    async function loadPanoramaPreview(current) {
+      const key = panoramaPreviewKey(current);
+      const cached = panoramaPreviewCache.get(key);
+      if (cached) {
+        touchPanoramaPreview(key, cached);
+        if (cached.objectUrl) return cached;
+        if (cached.promise) return cached.promise;
+      }
+
+      const entry = {
+        objectUrl: null,
+        promise: null,
+        panoIndex: Number(current.pano_index),
+        lastUsed: Date.now()
+      };
+      entry.promise = fetch(panoramaPreviewUrl(current), {cache: "no-store"})
+        .then(response => {
+          if (!response.ok) throw new Error(`Could not load panorama preview ${current.pano_index}`);
+          return response.blob();
+        })
+        .then(blob => {
+          entry.objectUrl = URL.createObjectURL(blob);
+          entry.promise = null;
+          touchPanoramaPreview(key, entry);
+          evictPanoramaPreviewCache(index);
+          return entry;
+        })
+        .catch(error => {
+          panoramaPreviewCache.delete(key);
+          throw error;
+        });
+      panoramaPreviewCache.set(key, entry);
+      return entry.promise;
+    }
+
+    function setPanoramaImage(current, entry) {
+      const key = panoramaPreviewKey(current);
+      if (!entry || !entry.objectUrl || loadedPanoramaKey !== key) return;
+      els.panorama.onload = () => drawMarkers(pano());
+      els.panorama.src = entry.objectUrl;
+      if (els.panorama.complete) {
+        requestAnimationFrame(() => drawMarkers(current));
+      }
+    }
+
+    function evictPanoramaPreviewCache(centerIndex) {
+      while (panoramaPreviewCache.size > PANORAMA_PREVIEW_CACHE_LIMIT) {
+        let candidateKey = null;
+        let candidateEntry = null;
+        let candidateDistance = -1;
+        for (const [key, entry] of panoramaPreviewCache) {
+          if (entry.promise || key === loadedPanoramaKey) continue;
+          const distance = Math.abs(entry.panoIndex - centerIndex);
+          if (distance > candidateDistance) {
+            candidateKey = key;
+            candidateEntry = entry;
+            candidateDistance = distance;
+          }
+        }
+        if (!candidateKey || !candidateEntry) return;
+        URL.revokeObjectURL(candidateEntry.objectUrl);
+        panoramaPreviewCache.delete(candidateKey);
+      }
+    }
+
+    function prefetchNearbyPanoramas(centerIndex) {
+      if (!state || !state.panorama_count) return;
+      const records = [];
+      for (let offset = 1; offset <= PANORAMA_PREFETCH_RADIUS; offset += 1) {
+        for (const candidateIndex of [centerIndex + offset, centerIndex - offset]) {
+          if (candidateIndex < 0 || candidateIndex >= state.panorama_count) continue;
+          records.push(state.panoramas[candidateIndex]);
+        }
+      }
+      panoramaPrefetchQueue = records.filter(current => {
+        const key = panoramaPreviewKey(current);
+        return !panoramaPreviewCache.has(key);
+      });
+      pumpPanoramaPrefetchQueue();
+      evictPanoramaPreviewCache(centerIndex);
+    }
+
+    function pumpPanoramaPrefetchQueue() {
+      while (
+        activePanoramaPrefetches < PANORAMA_PREFETCH_CONCURRENCY
+        && panoramaPrefetchQueue.length
+      ) {
+        const current = panoramaPrefetchQueue.shift();
+        if (!current || panoramaPreviewCache.has(panoramaPreviewKey(current))) continue;
+        activePanoramaPrefetches += 1;
+        loadPanoramaPreview(current)
+          .catch(() => {})
+          .finally(() => {
+            activePanoramaPrefetches -= 1;
+            pumpPanoramaPrefetchQueue();
+          });
+      }
+    }
+
     function draw() {
       if (!state || !state.panorama_count) return;
       highlightedSelectionIndex = null;
@@ -1238,14 +1522,24 @@ INDEX_HTML = r"""<!doctype html>
       els.next.disabled = index >= state.panorama_count - 1;
       els.autoGridBtn.disabled = false;
       clearMarkers();
-      els.panorama.onload = () => drawMarkers(pano());
-      const previewName = current.pano_image_name || current.pano_filename || current.pano_index;
-      const previewCacheKey = encodeURIComponent(`${previewName}:${Date.now()}`);
-      els.panorama.src = `/api/panorama-preview/${current.pano_index}?v=${previewCacheKey}`;
+      const nextPanoramaKey = panoramaPreviewKey(current);
+      const panoramaChanged = loadedPanoramaKey !== nextPanoramaKey;
+      if (panoramaChanged) {
+        loadedPanoramaKey = nextPanoramaKey;
+        const cached = cachedPanoramaPreview(current);
+        if (cached) {
+          setPanoramaImage(current, cached);
+        } else {
+          loadPanoramaPreview(current)
+            .then(entry => setPanoramaImage(current, entry))
+            .catch(error => setStatus(error.message));
+        }
+      }
       drawSelections(current);
-      if (els.panorama.complete) {
+      if (!panoramaChanged && els.panorama.complete) {
         requestAnimationFrame(() => drawMarkers(current));
       }
+      prefetchNearbyPanoramas(index);
       setStatus("");
     }
 

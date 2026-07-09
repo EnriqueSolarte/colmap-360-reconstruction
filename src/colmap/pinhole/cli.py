@@ -51,16 +51,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help=(
             "Optional pose_report.json from manual-pinhole-attach-poses. "
-            "By default this only reports camera-center prior coverage; combine "
-            "with --use-position-priors to enable COLMAP position priors."
+            "When set, camera-center position priors are enabled by default."
         ),
     )
     parser.add_argument(
-        "--use-position-priors",
-        action="store_true",
+        "--no-use-position-priors",
+        dest="use_position_priors",
+        action="store_false",
+        default=None,
         help=(
-            "Write camera-center priors from --pose-report into the COLMAP "
-            "database and enable mapper position-prior loss."
+            "Do not write camera-center priors from --pose-report into the "
+            "COLMAP database. The pose report is still parsed and reported "
+            "as prior coverage metadata."
         ),
     )
     parser.add_argument(
@@ -182,8 +184,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--image-dir must be an existing directory: {args.image_dir}")
     if args.pose_report is not None and not args.pose_report.is_file():
         parser.error(f"--pose-report must be an existing file: {args.pose_report}")
-    if args.use_position_priors and args.pose_report is None:
-        parser.error("--use-position-priors requires --pose-report")
+    if args.use_position_priors is None:
+        args.use_position_priors = args.pose_report is not None
     if args.initial_poses_from_pose_report and args.pose_report is None:
         parser.error("--initial-poses-from-pose-report requires --pose-report")
     if args.overlap <= 0:

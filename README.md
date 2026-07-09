@@ -390,7 +390,6 @@ colmap-pinhole-reconstruct \
   --render-report /data/itri-3d-reconstruction/scene-reconstruction/parking-lot-001/car-01-001/pinhole-renders-x1/render_report.json \
   --image-dir /data/itri-3d-reconstruction/scene-reconstruction/parking-lot-001/car-01-001/pinhole-renders-x2 \
   --pose-report /data/itri-3d-reconstruction/scene-reconstruction/parking-lot-001/car-01-001/pinhole-x1_panorama_pose_base/pose_report.json \
-  --use-position-priors \
   --initial-poses-from-pose-report \
   -w /data/itri-3d-reconstruction/scene-reconstruction/parking-lot-001/car-01-001/pinhole-colmap-x2-6dof-pose-priors \
   --num-threads 4 \
@@ -402,6 +401,10 @@ colmap-pinhole-reconstruct \
 Before running, make sure every `output_name` listed in the x1
 `render_report.json` exists in the x2 image directory. If any x2 image is still
 rendering or missing, import fails fast with the missing filename.
+
+When `--pose-report` is passed, camera-center position priors are enabled by
+default. Pass `--no-use-position-priors` to keep the pose report as coverage
+metadata only while running an unconstrained comparison.
 
 For higher-resolution images, consider increasing `--max-num-features` from the
 default `8192`; `16384` is a practical first x2 setting. The default

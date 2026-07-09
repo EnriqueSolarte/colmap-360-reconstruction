@@ -18,15 +18,24 @@ from render_pinhole.selection_schema import (
     selection_record,
 )
 from render_pinhole.tools.manual_pinhole_select_server import (
+    DEFAULT_PANORAMA_DISPLAY_JPEG_QUALITY,
+    DEFAULT_PANORAMA_DISPLAY_MAX_HEIGHT,
+    DEFAULT_PANORAMA_DISPLAY_MAX_WIDTH,
+    DEFAULT_PREVIEW_JPEG_QUALITY,
+    DEFAULT_PREVIEW_RENDERER_CACHE_SIZE,
+    DEFAULT_PREVIEW_SOURCE_MAX_HEIGHT,
+    DEFAULT_PREVIEW_SOURCE_MAX_WIDTH,
     INDEX_HTML,
     PANORAMA_PREVIEW_CACHE_CONTROL,
     append_flat_selection,
     flat_api_state,
     image_dir_panorama_records,
+    load_preview_renderer,
     load_flat_selection_store,
     pixel_to_longitude_latitude,
     replace_flat_auto_grid_selections,
     render_flat_panorama_display_jpeg,
+    render_flat_preview_jpeg,
     render_flat_preview_png,
     reset_flat_collection_selections,
     roi_points_by_delta,
@@ -1133,7 +1142,7 @@ def test_image_dir_selector_preview_and_reset_are_colmap_free(tmp_path) -> None:
     store = load_flat_selection_store(output_dir, image_dir, image_records)
 
     append_flat_selection(store, image_records[0], pi / 4, 0.0)
-    preview = render_flat_preview_png(
+    preview = render_flat_preview_jpeg(
         image_records[0],
         pi / 4,
         0.0,
@@ -1147,8 +1156,21 @@ def test_image_dir_selector_preview_and_reset_are_colmap_free(tmp_path) -> None:
     )
     removed_count = reset_flat_collection_selections(store)
 
-    assert preview.startswith(b"\x89PNG")
+    assert preview.startswith(b"\xff\xd8")
+    assert Image.open(io.BytesIO(preview)).format == "JPEG"
     assert np.asarray(Image.open(io.BytesIO(preview))).shape == (8, 10, 3)
+    assert render_flat_preview_png(
+        image_records[0],
+        pi / 4,
+        0.0,
+        {
+            "width": 10,
+            "height": 8,
+            "fov_x": pi / 2,
+            "fov_y": pi / 3,
+            "interpolation": "nearest",
+        },
+    ).startswith(b"\x89PNG")
     assert removed_count == 1
     assert store["selection_summary"] == {
         "selected_panorama_count": 0,
@@ -1207,15 +1229,48 @@ def test_manual_select_panorama_display_uses_resized_jpeg(tmp_path) -> None:
     assert result.size == (16, 8)
 
 
-def test_manual_select_panorama_preview_avoids_stale_index_cache() -> None:
+def test_manual_select_panorama_display_defaults_are_interactive_size() -> None:
+    assert DEFAULT_PANORAMA_DISPLAY_MAX_WIDTH == 1024
+    assert DEFAULT_PANORAMA_DISPLAY_MAX_HEIGHT == 512
+    assert DEFAULT_PANORAMA_DISPLAY_JPEG_QUALITY == 75
+
+
+def test_manual_select_preview_defaults_are_interactive_size() -> None:
+    assert DEFAULT_PREVIEW_JPEG_QUALITY == 80
+    assert DEFAULT_PREVIEW_SOURCE_MAX_WIDTH == 2048
+    assert DEFAULT_PREVIEW_SOURCE_MAX_HEIGHT == 1024
+    assert DEFAULT_PREVIEW_RENDERER_CACHE_SIZE == 3
+
+
+def test_manual_select_preview_renderer_uses_resized_source(tmp_path) -> None:
+    source_path = tmp_path / "pano.png"
+    Image = pytest.importorskip("PIL.Image")
+    image = np.zeros((32, 64, 3), dtype=np.uint8)
+    image[..., 0] = np.arange(64, dtype=np.uint8)
+    image[..., 1] = np.arange(32, dtype=np.uint8)[:, None]
+    Image.fromarray(image).save(source_path)
+
+    renderer = load_preview_renderer(source_path, max_width=16, max_height=8)
+
+    assert renderer.image.shape == (8, 16, 3)
+
+
+def test_manual_select_panorama_preview_uses_stable_per_panorama_cache_key() -> None:
     assert PANORAMA_PREVIEW_CACHE_CONTROL == "no-store"
-    assert "Date.now()" in INDEX_HTML
+    assert "loadedPanoramaKey" in INDEX_HTML
     assert (
-        "/api/panorama-preview/${current.pano_index}?v=${previewCacheKey}"
+        "/api/panorama-preview/${current.pano_index}?v="
+        "${encodeURIComponent(panoramaPreviewKey(current))}"
         in INDEX_HTML
     )
 
 
+def test_manual_select_prefetches_nearby_panorama_previews() -> None:
+    assert "const PANORAMA_PREFETCH_RADIUS = 10;" in INDEX_HTML
+    assert "const PANORAMA_PREVIEW_CACHE_LIMIT = 21;" in INDEX_HTML
+    assert "const PANORAMA_PREFETCH_CONCURRENCY = 3;" in INDEX_HTML
+    assert "prefetchNearbyPanoramas(index);" in INDEX_HTML
+    assert "URL.revokeObjectURL(candidateEntry.objectUrl);" in INDEX_HTML
 
 
 class FakeColmapImage:

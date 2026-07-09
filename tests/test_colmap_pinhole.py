@@ -315,7 +315,6 @@ def test_pinhole_reconstruct_cli_accepts_baseline_options(tmp_path: Path) -> Non
             str(image_dir),
             "--pose-report",
             str(pose_report_path),
-            "--use-position-priors",
             "--initial-poses-from-pose-report",
             "--workspace",
             str(tmp_path / "workspace"),
@@ -336,17 +335,58 @@ def test_pinhole_reconstruct_cli_accepts_baseline_options(tmp_path: Path) -> Non
     assert args.loop_detection is True
 
 
-def test_pinhole_reconstruct_cli_requires_pose_report_for_position_priors(
+def test_pinhole_reconstruct_cli_can_disable_default_position_priors(
     tmp_path: Path,
 ) -> None:
     report_path = tmp_path / "render_report.json"
     report_path.write_text('{"renders": []}\n', encoding="utf-8")
+    pose_report_path = tmp_path / "pose_report.json"
+    pose_report_path.write_text('{"views": []}\n', encoding="utf-8")
+
+    args = parse_reconstruct_args(
+        [
+            "--render-report",
+            str(report_path),
+            "--pose-report",
+            str(pose_report_path),
+            "--no-use-position-priors",
+        ],
+    )
+
+    assert args.use_position_priors is False
+
+
+def test_pinhole_reconstruct_cli_defaults_position_priors_off_without_pose_report(
+    tmp_path: Path,
+) -> None:
+    report_path = tmp_path / "render_report.json"
+    report_path.write_text('{"renders": []}\n', encoding="utf-8")
+
+    args = parse_reconstruct_args(
+        [
+            "--render-report",
+            str(report_path),
+        ],
+    )
+
+    assert args.use_position_priors is False
+
+
+def test_pinhole_reconstruct_cli_rejects_positive_position_priors_flag(
+    tmp_path: Path,
+) -> None:
+    report_path = tmp_path / "render_report.json"
+    report_path.write_text('{"renders": []}\n', encoding="utf-8")
+    pose_report_path = tmp_path / "pose_report.json"
+    pose_report_path.write_text('{"views": []}\n', encoding="utf-8")
 
     with pytest.raises(SystemExit):
         parse_reconstruct_args(
             [
                 "--render-report",
                 str(report_path),
+                "--pose-report",
+                str(pose_report_path),
                 "--use-position-priors",
             ],
         )
@@ -779,7 +819,6 @@ def test_pinhole_reconstruction_pipeline_runs_baseline_with_fakes(
         render_report_path=report_path,
         workspace=tmp_path / "workspace",
         pose_report_path=pose_report_path,
-        use_position_priors=True,
         initial_poses_from_pose_report=True,
         overlap=4,
         overwrite=True,
