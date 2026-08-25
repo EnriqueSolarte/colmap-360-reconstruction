@@ -16,7 +16,7 @@ set -a
 source "${ENV_FILE}"
 set +a
 
-: "${ITRI_3D_RECONSTRUCTION:?Set ITRI_3D_RECONSTRUCTION in ${ENV_FILE}}"
+: "${DATA:?Set DATA in ${ENV_FILE}}"
 
 if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     echo "Container '${CONTAINER_NAME}' is already running. Attaching..."
@@ -35,8 +35,7 @@ else
         --volume="${DOCKER_UTILS}:/docker_utils" \
         --volume="${AGENT_SKILLS}:/agent-skills" \
         --volume="${DIR}/../:/workspace" \
-        --volume="${ITRI_3D_RECONSTRUCTION}:/data/itri-3d-reconstruction" \
-        --volume='/media/datasets/hm_semantic_maps/map_free_navigation/real_scenes:/real_scenes' \
+        --volume="${DATA}:/data/" \
         -e QT_XCB_GL_INTEGRATION=xcb_egl \
         scene-reconstruction-colmap:dev
 fi

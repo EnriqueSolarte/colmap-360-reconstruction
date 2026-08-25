@@ -99,8 +99,8 @@ Use the maintained native equirectangular pipeline for 360 images:
 
 ```bash
 colmap-panorama-reconstruct \
-  --input-image-path /path/to/panoramas \
-  --workspace /workspace/data/colmap-equirectangular \
+  --input-image-path /data/panoramas \
+  --workspace /data/colmap-equirectangular \
   --matcher sequential \
   --overlap 15 \
   --overwrite
@@ -145,8 +145,8 @@ Start with a small smoke reconstruction before a full run:
 
 ```bash
 colmap-panorama-reconstruct \
-  --input-image-path /path/to/panoramas \
-  --workspace /workspace/data/colmap-equirectangular-smoke \
+  --input-image-path /data/panoramas \
+  --workspace /data/colmap-equirectangular-smoke \
   --image-limit 12 \
   --no-loop-detection \
   --overwrite
@@ -157,6 +157,9 @@ download and make runs reproducible, pass a local tree with
 `--vocab-tree-path /path/to/vocab_tree.bin`. The command automatically points
 COLMAP/libcurl at `/etc/ssl/certs/ca-certificates.crt` when available; override
 it with `--ssl-cert-file` when needed.
+
+>> Is this refering to data/colmap-vocab-tree-faiss/itri_vocab_tree_words8K.faiss.bin If so. we should correctly point out to this file
+
 
 For larger ordered panorama captures, keyframe matching can reduce the pair
 list before COLMAP matching. The sequential-vocabtree selector clusters images
@@ -253,7 +256,7 @@ images:
 
 ```bash
 manual-pinhole-select \
-  --image-dir /path/to/workspace/images \
+  --image-dir /data/images \
   --host 127.0.0.1 \
   --port 8765
 ```
@@ -262,7 +265,7 @@ Open the printed URL, for example `http://127.0.0.1:8765`. If `--output-dir`
 is not passed, the selector writes beside the image directory:
 
 ```text
-/path/to/workspace/selections.json
+/data/selections.json
 ```
 
 The panorama image is an equirectangular view:
@@ -308,9 +311,9 @@ Render one pinhole image per saved selection:
 
 ```bash
 manual-pinhole-render-selected \
-  -s /path/to/workspace/selections.json \
-  --image-dir /path/to/workspace/images \
-  -o /path/to/workspace/renders \
+  -s /path/to/selections.json \
+  --image-dir /data/images \
+  -o /data/renders \
   -w 1280 \
   -h 1280 \
   --fov-x-deg 70 \
@@ -346,10 +349,10 @@ poses to the rendered pinhole views:
 
 ```bash
 manual-pinhole-attach-poses \
-  -s /path/to/workspace/selections.json \
-  --render-report /path/to/workspace/renders/render_report.json \
-  --sparse-best /path/to/workspace/sparse_best \
-  -o /path/to/workspace/pose-renders
+  -s /data/selections.json \
+  --render-report /data/render_report.json \
+  --sparse-best /data/colmap/sparse_best \
+  -o /data/pose-renders
 ```
 
 If `-o/--output-dir` is not passed, the command writes to `posed-renders/`
@@ -391,11 +394,11 @@ Example using x1 metadata and x2 rendered images:
 
 ```bash
 colmap-pinhole-reconstruct \
-  --render-report /data/itri-3d-reconstruction/scene-reconstruction/parking-lot-001/car-01-001/pinhole-renders-x1/render_report.json \
-  --image-dir /data/itri-3d-reconstruction/scene-reconstruction/parking-lot-001/car-01-001/pinhole-renders-x2 \
-  --pose-report /data/itri-3d-reconstruction/scene-reconstruction/parking-lot-001/car-01-001/pinhole-x1_panorama_pose_base/pose_report.json \
+  --render-report /data/render_report.json \
+  --image-dir /data/images \
+  --pose-report /data/pose_report.json \
   --initial-poses-from-pose-report \
-  -w /data/itri-3d-reconstruction/scene-reconstruction/parking-lot-001/car-01-001/pinhole-colmap-x2-6dof-pose-priors \
+  -w /data/pose-priors \
   --num-threads 4 \
   --import-workers 100 \
   --max-num-features 16384 \
@@ -449,7 +452,7 @@ Summary mode works without Open3D:
 
 ```bash
 colmap-visualize \
-  --model /workspace/data/colmap-equirectangular/sparse_best \
+  --model /data/sparse_best \
   --summary-only
 ```
 
@@ -457,7 +460,7 @@ Interactive visualization requires Open3D and GUI/OpenGL support:
 
 ```bash
 colmap-visualize \
-  --model /workspace/data/colmap-equirectangular/sparse_best
+  --model /data/colmap-equirectangular/sparse_best
 ```
 
 For equirectangular workspaces, the visualizer automatically draws each
@@ -469,7 +472,7 @@ panorama center direction. You can override this if needed:
 
 ```bash
 colmap-visualize \
-  --model /workspace/data/colmap-equirectangular/sparse_best \
+  --model /data/colmap-equirectangular/sparse_best \
   --camera-style sphere
 ```
 
@@ -478,7 +481,7 @@ exported point cloud:
 
 ```bash
 colmap-visualize \
-  --model /path/to/workspace/pose-renders/sparse/0 \
+  --model /data/pose-renders/sparse/0 \
   --camera-style pinhole
 ```
 
