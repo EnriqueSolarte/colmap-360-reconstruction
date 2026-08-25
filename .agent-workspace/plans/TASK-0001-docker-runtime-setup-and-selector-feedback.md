@@ -4,10 +4,10 @@
 Protocol: amber@v3
 Record schema: 2
 Task: TASK-0001
-Status: ready
+Status: completed
 Owner: Codex
 Dependencies: none
-Plan revision: 7
+Plan revision: 9
 Current milestone: M4
 ```
 
@@ -34,7 +34,7 @@ permanent evolving execution strategy.
 | M1 | Confirm Docker runtime contract | `completed` | 3 | none | Completed 2026-08-25 |
 | M2 | Install project dependencies in image | `completed` | 4 | M1 | Completed 2026-08-25 |
 | M3 | Align data mounting and Docker documentation | `completed` | 4 | M2 | Completed 2026-08-25 |
-| M4 | Verify documented selector workflow | `ready-for-approval` | 2 | M3 | Ready for approval 2026-08-25 |
+| M4 | Verify documented selector workflow | `completed` | 4 | M3 | Completed 2026-08-25 |
 
 ## M1 — Confirm Docker runtime contract
 
@@ -215,8 +215,8 @@ closeout is committed as `docs(docker): complete TASK-0001 M3 workflow`.
 
 ## M4 — Verify documented selector workflow
 
-State: `ready-for-approval`
-Revision: 2
+State: `completed`
+Revision: 4
 Depends on: M3
 Milestone type: implementation
 
@@ -245,6 +245,30 @@ The command exposes a reachable URL or reports a concrete startup error.
 Host networking makes `127.0.0.1` valid for the documented local workflow;
 remote access is out of scope.
 
+### Implementation closeout
+
+**What and why.** M4 verified that the documented interactive workflow makes
+the selector startup URL visible, so no application-level output-flushing
+change is required for the supported TTY invocation.
+
+**How and where.** In the running `scene-reconstruction-colmap` container,
+`docker exec -it scene-reconstruction-colmap timeout 12s
+manual-pinhole-select --image-dir /data/1782890858308 --host 127.0.0.1
+--port 8765` reported `http://127.0.0.1:8765`, the image directory, and the
+selections path. A short detached probe then returned a non-empty response from
+`http://127.0.0.1:8765/` through host networking and was stopped.
+
+**Evidence.** `pytest -q tests/test_renderer_api.py` passed in the container
+with `45 passed`. The documented TTY command printed its startup output; the
+host-network probe established reachability.
+
+**Known limits.** The running container was created from the pre-M2 image, but
+it uses the repository bind mount and was sufficient to verify the selector
+workflow; M2 separately verified the new image's project installation and
+commands. Non-TTY output remains potentially buffered and is not the supported
+documented workflow. This closeout is committed as
+`test(docker): complete TASK-0001 M4 selector workflow`.
+
 ## Plan change log
 
 | Date | Milestone | Change | Reason | Approval |
@@ -256,3 +280,5 @@ remote access is out of scope.
 | 2026-08-25 | M2 | Revision 4 completed; M3 revision 2 ready for approval | Image build and requested package/command verification passed | approved |
 | 2026-08-25 | M3 | Revision 3 started | User approved M3 execution | approved |
 | 2026-08-25 | M3 | Revision 4 completed; M4 revision 2 ready for approval | Mount guidance and Docker documentation checks passed | approved |
+| 2026-08-25 | M4 | Revision 3 started | User approved M4 execution | approved |
+| 2026-08-25 | M4 | Revision 4 completed | TTY selector output, URL reachability, and focused tests passed | approved |

@@ -3,13 +3,13 @@
 ```text
 Protocol: amber@v3
 Record schema: 2
-Status: ready
+Status: ready-to-merge
 Owner: Codex
 Parallel-safe: no
 Parallel approval: not-required
 Plan source: .agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md
 Current milestone: M4
-Last verified commit: 76e9052ef48d77b5d0e695f528fbcaea81d7ce96; M2 image-install commit
+Last verified commit: ca3a57ea1cf2038b911966f6dc82db66560fbfa8; M3 workflow commit
 Definition approval: approved 2026-08-25
 Parent task: none
 Parent milestone: none
@@ -31,7 +31,7 @@ and make interactive selector startup observable.
   `/data/1782890858308` as an example only.
 - [x] README documents the verified local FAISS vocabulary-tree asset at its
   `/workspace/data/...` container path.
-- [ ] The selector start command visibly reports its URL in the documented
+- [x] The selector start command visibly reports its URL in the documented
   Docker invocation.
 
 ## Scope
@@ -80,8 +80,8 @@ changing reconstruction algorithms, or modifying any dataset contents.
   `docker_run.sh`.
 - `data/colmap-vocab-tree-faiss/itri_vocab_tree_words8K.faiss.bin` exists in
   the repository and is available in the container at `/workspace/data/...`.
-- The selector prints startup information, but `docker exec` without a TTY can
-  buffer that output.
+- The selector prints startup information; M4 confirmed that the documented
+  `docker exec -it` invocation visibly reports its URL.
 - The canonical checkout is
   `/home/kike/ws/scene-reconstruction-ws/colmap-reconstruction-ws/colmap-reconstruction-ws`.
 - The task branch was created from `dev` at `6dee2e5` under the repository
@@ -96,6 +96,9 @@ changing reconstruction algorithms, or modifying any dataset contents.
   at `/data`, while the checked-in FAISS asset remains at `/workspace/data/...`.
   The selector example uses the valid `COLMAP_REC` shell variable and labels
   `/data/1782890858308` as an example.
+- M4 ran the selector against `/data/1782890858308`; its TTY invocation printed
+  `http://127.0.0.1:8765`, and a temporary probe received a non-empty response
+  from that URL before the selector was stopped.
 
 ## Validation
 
@@ -120,11 +123,19 @@ changing reconstruction algorithms, or modifying any dataset contents.
 - Command or check: inspected README for `COLMAP_REC`, `docker exec -it`, the
   example scene path, the checked-in FAISS path, and removal of the unresolved
   intake note.
+- Command or check: inside `scene-reconstruction-colmap`,
+  `pytest -q tests/test_renderer_api.py` passed (`45 passed`).
+- Command or check: `docker exec -it scene-reconstruction-colmap timeout 12s
+  manual-pinhole-select --image-dir /data/1782890858308 --host 127.0.0.1
+  --port 8765` printed the selector URL and startup paths.
+- Command or check: a temporary detached selector returned a non-empty
+  `http://127.0.0.1:8765/` response and was stopped after the probe.
 
 ## Next action
 
-Request approval for M4 before changing selector output behavior or running the
-live selector workflow.
+Request explicit approval to merge
+`task/TASK-0001-docker-runtime-setup-and-selector-feedback` into `dev` after
+reviewing its commit range and residual risks.
 
 ## Closure
 
