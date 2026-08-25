@@ -1,7 +1,7 @@
 # Active task index
 
 Protocol: amber@v3
-Status: active
+Status: idle
 Updated: 2026-08-25
 Project scope: colmap-reconstruction-ws
 
@@ -13,6 +13,4 @@ Project scope: colmap-reconstruction-ws
 
 ## Open tasks
 
-| Task | Status | Owner | Repositories | Parallel-safe | Plan | Current milestone | Dependencies |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| TASK-0001 | ready-to-merge | Codex | . | no | [plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md](plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md) | M8 | none |
+No open tasks.

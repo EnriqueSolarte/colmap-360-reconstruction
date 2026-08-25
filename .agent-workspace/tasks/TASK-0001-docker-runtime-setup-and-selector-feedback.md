@@ -3,13 +3,13 @@
 ```text
 Protocol: amber@v3
 Record schema: 2
-Status: ready-to-merge
+Status: archived
 Owner: Codex
 Parallel-safe: no
 Parallel approval: not-required
 Plan source: .agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md
 Current milestone: M8
-Last verified commit: c70fc27052a9e3ce626793051ddef1dc4088f95b; M7 selector-demo commit
+Last verified commit: 7eebf8b332fafb26692193b145338fe9e7a02fde; M8 output-guide commit and dev integration
 Definition approval: approved 2026-08-25
 Parent task: none
 Parent milestone: none
@@ -158,14 +158,14 @@ changing reconstruction algorithms, or modifying any dataset contents.
 
 ## Next action
 
-Request explicit approval to merge
-`task/TASK-0001-docker-runtime-setup-and-selector-feedback` into `dev` after
-reviewing its commit range and residual risks.
+Archived after verified integration into `dev`. The approved release promotion
+from `dev` to `main` and tag `v1.0.0` remain in progress.
 
 ## Closure
 
 | Repository | Source branch | Target branch | Integration commit | Post-merge validation |
 | --- | --- | --- | --- | --- |
-| `.` | `not merged` | `dev` | `not merged` | `not run` |
+| `.` | `task/TASK-0001-docker-runtime-setup-and-selector-feedback` | `dev` | `7eebf8b332fafb26692193b145338fe9e7a02fde` (fast-forward) | Amber validator passed 2026-08-25 |
 
-- Deviations from plan: none.
+- Deviations from plan: none. The subsequent `dev` → `main` promotion is a
+  release operation requested after task integration.
