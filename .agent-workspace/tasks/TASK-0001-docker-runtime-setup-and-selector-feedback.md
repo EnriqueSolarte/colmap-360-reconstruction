@@ -8,8 +8,8 @@ Owner: Codex
 Parallel-safe: no
 Parallel approval: not-required
 Plan source: .agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md
-Current milestone: M4
-Last verified commit: ca3a57ea1cf2038b911966f6dc82db66560fbfa8; M3 workflow commit
+Current milestone: M5
+Last verified commit: 17a63211630dad734e3f2349805685a560cb0671; M4 selector-workflow commit
 Definition approval: approved 2026-08-25
 Parent task: none
 Parent milestone: none
@@ -33,6 +33,8 @@ and make interactive selector startup observable.
   `/workspace/data/...` container path.
 - [x] The selector start command visibly reports its URL in the documented
   Docker invocation.
+- [x] README starts with a practical Docker-first usage path and defers
+  detailed reference material and optional extras to the end.
 
 ## Scope
 
@@ -61,14 +63,16 @@ changing reconstruction algorithms, or modifying any dataset contents.
 
 ## Plan
 
-[`.agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md`](../plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md), current milestone `M4`.
+[`.agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md`](../plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md), current milestone `M5`.
 
 ## Documentation and ADR traceability
 
 - Changed path: `README.md`
 - Reason and supporting evidence: M3 documents the user-configured host
   `DATA` mount, valid `COLMAP_REC` Docker invocation, example scene path, and
-  the repository FAISS asset. The original user report remains open evidence at
+  the repository FAISS asset. M5 reorganizes the same README into a
+  Docker-first guide followed by detailed reference and extras. The original
+  user report remains open evidence at
   `.agent-workspace/evidence/TASK-0001-M1-current-issues-2026-08-24.md`.
 
 ## Current verified state
@@ -99,6 +103,8 @@ changing reconstruction algorithms, or modifying any dataset contents.
 - M4 ran the selector against `/data/1782890858308`; its TTY invocation printed
   `http://127.0.0.1:8765`, and a temporary probe received a non-empty response
   from that URL before the selector was stopped.
+- M5 places the build, container start, native reconstruction, and selector
+  paths before local-install alternatives and detailed reference material.
 
 ## Validation
 
@@ -130,6 +136,8 @@ changing reconstruction algorithms, or modifying any dataset contents.
   --port 8765` printed the selector URL and startup paths.
 - Command or check: a temporary detached selector returned a non-empty
   `http://127.0.0.1:8765/` response and was stopped after the probe.
+- Command or check: M5 inspected heading hierarchy and the Docker command,
+  selector path, FAISS path, and detailed-command prefix guidance.
 
 ## Next action
 

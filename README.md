@@ -13,7 +13,66 @@ The primary 360-image workflow is:
 The COLMAP output is monocular and unscaled. Do not treat it as metric geometry
 until it has been aligned with an external scale source.
 
-## Install
+## Use it now
+
+This is the shortest Docker-first path. It covers the two primary workflows:
+native reconstruction directly from panoramas, and manual selection of pinhole
+views.
+
+### 1. Build and start the container
+
+```bash
+bash docker/docker_build.sh
+bash docker/docker_run.sh
+export COLMAP_REC=scene-reconstruction-colmap
+```
+
+`docker/docker_run.sh` sources `env`. Its user-configured `DATA` host path
+(by default `~/data/360-data`) is mounted at `/data` in the container. Replace
+the example scene directory below with a directory beneath your own `DATA`
+path; `/data/1782890858308` is only an example.
+
+### 2. Choose a workflow
+
+Run a native panorama reconstruction when the source directory contains the
+equirectangular panoramas you want to reconstruct:
+
+```bash
+docker exec -it "$COLMAP_REC" colmap-panorama-reconstruct \
+  --input-image-path /data/panoramas \
+  --workspace /data/colmap-equirectangular \
+  --matcher sequential \
+  --overlap 15 \
+  --overwrite
+```
+
+Launch the selector when you first want to choose directions and render pinhole
+views from panoramas:
+
+```bash
+docker exec -it "$COLMAP_REC" manual-pinhole-select \
+  --image-dir /data/1782890858308 \
+  --host 127.0.0.1 \
+  --port 8765
+```
+
+Open the printed `http://127.0.0.1:8765` URL in a browser. The selector writes
+`selections.json` beside the image directory unless you pass `--output-dir`.
+The detailed CLI snippets below show the command that runs inside the
+container; prefix one with `docker exec -it "$COLMAP_REC"` when issuing it
+from the host.
+
+### 3. Know where outputs and assets live
+
+Generated workspaces and scene data belong below `/data`. The repository is
+mounted separately at `/workspace`; its verified local FAISS vocabulary-tree
+asset is
+`/workspace/data/colmap-vocab-tree-faiss/itri_vocab_tree_words8K.faiss.bin`,
+not a file below `/data`.
+
+## Details and extras
+
+### Local installation and development
 
 From the repository root:
 
@@ -51,42 +110,9 @@ You can combine extras:
 python -m pip install -e '.[test,colmap,visualize]'
 ```
 
-## Docker Workflow
-
 <!-- Task: TASK-0001 -->
 
-Build the image from the repository root, then start (or attach to) the named
-container:
-
-```bash
-bash docker/docker_build.sh
-bash docker/docker_run.sh
-export COLMAP_REC=scene-reconstruction-colmap
-```
-
-`docker/docker_run.sh` sources `env`. Its `DATA` value is a user-owned host
-directory; the default `DATA=~/data/360-data` is mounted at `/data` in the
-container. Do not replace it with automatic home-directory handling in the
-script. Scene paths such as `/data/1782890858308` are examples only—replace
-them with a directory beneath your configured `DATA` path.
-
-Run the documented CLI examples inside the container. For example, start the
-interactive selector with a TTY so its startup URL is visible:
-
-```bash
-docker exec -it "$COLMAP_REC" manual-pinhole-select \
-  --image-dir /data/1782890858308 \
-  --host 127.0.0.1 \
-  --port 8765
-```
-
-The repository is mounted separately at `/workspace`. The verified local FAISS
-vocabulary-tree asset is therefore
-`/workspace/data/colmap-vocab-tree-faiss/itri_vocab_tree_words8K.faiss.bin`,
-not a file below `/data`. Prefix any remaining CLI example with
-`docker exec -it "$COLMAP_REC"` when running it from the host.
-
-## Renderer Defaults
+### Renderer defaults
 
 The standalone renderer helper constants are:
 
@@ -110,7 +136,7 @@ cy: 480.0
 These values assume all generated pinhole images share the same resolution and
 field of view.
 
-## Python API
+### Python API
 
 ```python
 from render_pinhole import EquirectangularToPinhole
@@ -128,7 +154,7 @@ image = renderer.render(
 
 `image` is a NumPy array.
 
-## Reconstruct Directly From 360 Panoramas
+### Native panorama reconstruction reference
 
 Use the maintained native equirectangular pipeline for 360 images:
 
@@ -268,7 +294,7 @@ for both runs. Treat lower matching/runtime numbers as a speed gain only if the
 candidate preserves acceptable registered-image count, sparse point count, and
 reprojection error.
 
-## Select And Render Pinhole Views
+### Pinhole workflow reference
 
 The current pinhole workflow is split into three stages:
 
@@ -281,7 +307,7 @@ Selection and rendering are pure image operations. They do not require COLMAP,
 `pycolmap`, `sparse_best`, optimized poses, or rig metadata. Pose attachment is
 the only stage that reads the reconstructed COLMAP model.
 
-### Stage 1: Select Directions
+#### Stage 1: Select directions
 
 Launch the selector directly from a directory of equirectangular panorama
 images:
@@ -337,7 +363,7 @@ Good manual selections usually follow these rules:
 - Keep the FOV and resolution consistent for a downstream training set unless
   you have a specific reason to vary intrinsics.
 
-### Stage 2: Render Selected Pinhole Images
+#### Stage 2: Render selected pinhole images
 
 Render one pinhole image per saved selection:
 
@@ -374,7 +400,7 @@ source panorama name, longitude, latitude, output size, FOV, interpolation, and
 output extension, so matching output filenames alone are not reused when the
 underlying view changed.
 
-### Stage 3: Attach COLMAP Poses
+#### Stage 3: Attach COLMAP poses
 
 After a native equirectangular COLMAP reconstruction exists, attach panorama
 poses to the rendered pinhole views:
@@ -403,7 +429,7 @@ The pose attachment stage writes:
 This COLMAP text model can be used by downstream tools that expect pinhole
 camera images and COLMAP-style camera poses.
 
-### Reconstruct With Higher-Resolution Pinhole Images
+#### Reconstruct with higher-resolution pinhole images
 
 `colmap-pinhole-reconstruct` can use one render report as the metadata/FOV
 manifest while reading the actual images from a different directory. This is
@@ -450,7 +476,7 @@ default `8192`; `16384` is a practical first x2 setting. The default
 `--max-image-size -1` keeps COLMAP feature extraction at the full imported image
 resolution.
 
-### Example Workspace
+#### Example workspace
 
 For the tested workspace:
 
@@ -478,7 +504,7 @@ manual-pinhole-attach-poses \
   -o /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/pose-renders
 ```
 
-## Visualize Or Summarize COLMAP Output
+### Visualize or summarize COLMAP output
 
 Summary mode works without Open3D:
 
@@ -534,7 +560,7 @@ colmap-visualize \
 In headless containers this may fail if Open3D cannot create a rendering
 window. Summary mode remains usable in that environment.
 
-## Utility Scripts
+### Utility scripts
 
 Create a sampled directory of image symlinks:
 
@@ -562,13 +588,13 @@ tools-shift-panorama \
   --workers 8
 ```
 
-## Important Limits
+### Important limits
 
 - COLMAP output is raw monocular geometry in arbitrary scale and frame.
 - Metric scale recovery is not implemented for the current dataset.
 - `data/` is ignored by git because COLMAP workspaces are generated artifacts.
 
-## Run Tests
+### Run tests
 
 ```bash
 pytest -q

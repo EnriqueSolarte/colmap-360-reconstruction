@@ -7,8 +7,8 @@ Task: TASK-0001
 Status: completed
 Owner: Codex
 Dependencies: none
-Plan revision: 9
-Current milestone: M4
+Plan revision: 11
+Current milestone: M5
 ```
 
 The task is the durable goal and integration contract. This plan is the
@@ -35,6 +35,7 @@ permanent evolving execution strategy.
 | M2 | Install project dependencies in image | `completed` | 4 | M1 | Completed 2026-08-25 |
 | M3 | Align data mounting and Docker documentation | `completed` | 4 | M2 | Completed 2026-08-25 |
 | M4 | Verify documented selector workflow | `completed` | 4 | M3 | Completed 2026-08-25 |
+| M5 | Reorganize README as a usage-first guide | `completed` | 2 | M4 | Completed 2026-08-25 |
 
 ## M1 — Confirm Docker runtime contract
 
@@ -269,6 +270,66 @@ commands. Non-TTY output remains potentially buffered and is not the supported
 documented workflow. This closeout is committed as
 `test(docker): complete TASK-0001 M4 selector workflow`.
 
+## M5 — Reorganize README as a usage-first guide
+
+State: `completed`
+Revision: 2
+Depends on: M4
+Milestone type: implementation
+
+### Deliverable
+
+A README that begins with a concise Docker-first path for the two primary
+workflows and places detailed reference material and optional extras at the
+end.
+
+### Scope
+
+Reorder and clarify README content only. Preserve command behavior, current
+Docker contract, and the documented data and FAISS paths.
+
+### Validation
+
+- Inspect heading hierarchy and the top-level usage flow.
+- Verify the documented Docker commands, paths, and task traceability remain
+  present.
+- Run the Amber validator and `git diff --check`.
+
+### Completion condition
+
+A new reader can identify how to start the container, run a native panorama
+reconstruction, and launch the pinhole selector before encountering detailed
+reference and optional workflows.
+
+### Decisions and risks
+
+Keep advanced material rather than removing it. Reorganization can introduce
+broken heading hierarchy or accidentally alter commands, so validation compares
+the primary command and path strings explicitly.
+
+### Implementation closeout
+
+**What and why.** The README now leads with the practical Docker sequence and
+the two primary user choices before presenting local-install alternatives and
+the full command reference. This makes the intended first run discoverable
+without discarding advanced material.
+
+**How and where.** `README.md` has a `Use it now` section with container setup,
+native reconstruction, selector launch, output locations, and a reminder that
+detailed commands run inside the container. `Details and extras` contains the
+previous local installation, API, reconstruction options, pinhole workflow,
+visualization, utility, and limitation material with a nested heading
+hierarchy.
+
+**Evidence.** Heading inspection confirmed the usage path precedes the
+details boundary. Command/path inspection confirmed `COLMAP_REC`,
+`docker exec -it`, `/data/1782890858308`, and the repository FAISS path remain
+present. The Amber validator and `git diff --check` passed.
+
+**Known limits.** This reorganizes documentation only; it does not re-run
+Docker, selector, or reconstruction tests. This closeout is committed as
+`docs(readme): complete TASK-0001 M5 usage guide`.
+
 ## Plan change log
 
 | Date | Milestone | Change | Reason | Approval |
@@ -282,3 +343,5 @@ documented workflow. This closeout is committed as
 | 2026-08-25 | M3 | Revision 4 completed; M4 revision 2 ready for approval | Mount guidance and Docker documentation checks passed | approved |
 | 2026-08-25 | M4 | Revision 3 started | User approved M4 execution | approved |
 | 2026-08-25 | M4 | Revision 4 completed | TTY selector output, URL reachability, and focused tests passed | approved |
+| 2026-08-25 | M5 | Revision 1 started | User approved README usage-first reorganization | approved |
+| 2026-08-25 | M5 | Revision 2 completed | Docker-first usage guide and end-of-document reference structure verified | approved |
