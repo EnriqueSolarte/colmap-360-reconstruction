@@ -8,8 +8,8 @@ Owner: Codex
 Parallel-safe: no
 Parallel approval: not-required
 Plan source: .agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md
-Current milestone: M3
-Last verified commit: 91d4b4777d2622828eb6ff6a7d2378d3819206c4; M1 diagnostic commit
+Current milestone: M4
+Last verified commit: 76e9052ef48d77b5d0e695f528fbcaea81d7ce96; M2 image-install commit
 Definition approval: approved 2026-08-25
 Parent task: none
 Parent milestone: none
@@ -25,11 +25,11 @@ and make interactive selector startup observable.
 
 - [x] The Docker image installs `.[test,colmap,visualize]` during image build.
 - [x] The build has access to the repository source needed for that install.
-- [ ] The user-configured `DATA` host directory mounts at `/data` without
+- [x] The user-configured `DATA` host directory mounts at `/data` without
   changing `docker_run.sh` to derive it from the user's home directory.
-- [ ] README container examples use a valid container-name variable and label
+- [x] README container examples use a valid container-name variable and label
   `/data/1782890858308` as an example only.
-- [ ] README documents the verified local FAISS vocabulary-tree asset at its
+- [x] README documents the verified local FAISS vocabulary-tree asset at its
   `/workspace/data/...` container path.
 - [ ] The selector start command visibly reports its URL in the documented
   Docker invocation.
@@ -61,19 +61,20 @@ changing reconstruction algorithms, or modifying any dataset contents.
 
 ## Plan
 
-[`.agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md`](../plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md), current milestone `M3`.
+[`.agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md`](../plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md), current milestone `M4`.
 
 ## Documentation and ADR traceability
 
-- Changed path: `.agent-workspace/evidence/TASK-0001-M1-current-issues-2026-08-24.md`
-- Reason and supporting evidence: User-provided intake report moved to open
-  evidence for TASK-0001/M1. Its requests and observed selector behavior remain
-  unverified pending M1 diagnostic validation.
+- Changed path: `README.md`
+- Reason and supporting evidence: M3 documents the user-configured host
+  `DATA` mount, valid `COLMAP_REC` Docker invocation, example scene path, and
+  the repository FAISS asset. The original user report remains open evidence at
+  `.agent-workspace/evidence/TASK-0001-M1-current-issues-2026-08-24.md`.
 
 ## Current verified state
 
-- The image build context is currently `docker/`, so it cannot install this
-  repository from `pyproject.toml` and `src/`.
+- The image build context is the repository root; the Dockerfile copies it into
+  `/workspace` and installs the requested editable project extras.
 - `DATA=~/data/360-data` is user configuration; its sourced host value drives
   the `/data` mount. It must not be replaced by automatic home resolution in
   `docker_run.sh`.
@@ -91,6 +92,10 @@ changing reconstruction algorithms, or modifying any dataset contents.
   `sha256:8cb5455fc1842825dabbbd00a72cba70b8638e9e529e2c7e78de17301f8ffc32`.
   Its requested extras and project console commands were verified inside the
   resulting image.
+- M3 documents `DATA=~/data/360-data` as a user-configured host path mounted
+  at `/data`, while the checked-in FAISS asset remains at `/workspace/data/...`.
+  The selector example uses the valid `COLMAP_REC` shell variable and labels
+  `/data/1782890858308` as an example.
 
 ## Validation
 
@@ -110,11 +115,16 @@ changing reconstruction algorithms, or modifying any dataset contents.
   reported `colmap-360-reconstruction 0.1.0`.
 - Command or check: focused project tests not run; M2 changed only image build
   configuration.
+- Command or check: M3 `bash -n docker/docker_run.sh docker/docker_build.sh`
+  passed; sourcing `./env` resolved `DATA=/home/kike/data/360-data`.
+- Command or check: inspected README for `COLMAP_REC`, `docker exec -it`, the
+  example scene path, the checked-in FAISS path, and removal of the unresolved
+  intake note.
 
 ## Next action
 
-Request approval for M3 before changing Docker runtime mounts or README
-documentation.
+Request approval for M4 before changing selector output behavior or running the
+live selector workflow.
 
 ## Closure
 

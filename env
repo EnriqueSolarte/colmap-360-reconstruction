@@ -1,1 +1,2 @@
+# Host directory mounted at /data by docker/docker_run.sh.
 DATA=~/data/360-data

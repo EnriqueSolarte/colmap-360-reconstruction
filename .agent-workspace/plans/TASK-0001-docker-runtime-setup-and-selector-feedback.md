@@ -7,8 +7,8 @@ Task: TASK-0001
 Status: ready
 Owner: Codex
 Dependencies: none
-Plan revision: 5
-Current milestone: M3
+Plan revision: 7
+Current milestone: M4
 ```
 
 The task is the durable goal and integration contract. This plan is the
@@ -33,8 +33,8 @@ permanent evolving execution strategy.
 | --- | --- | --- | --- | --- | --- |
 | M1 | Confirm Docker runtime contract | `completed` | 3 | none | Completed 2026-08-25 |
 | M2 | Install project dependencies in image | `completed` | 4 | M1 | Completed 2026-08-25 |
-| M3 | Align data mounting and Docker documentation | `ready-for-approval` | 2 | M2 | Ready for approval 2026-08-25 |
-| M4 | Verify documented selector workflow | `proposed` | 1 | M3 | Created 2026-08-25 |
+| M3 | Align data mounting and Docker documentation | `completed` | 4 | M2 | Completed 2026-08-25 |
+| M4 | Verify documented selector workflow | `ready-for-approval` | 2 | M3 | Ready for approval 2026-08-25 |
 
 ## M1 — Confirm Docker runtime contract
 
@@ -159,8 +159,8 @@ closeout is committed as `feat(docker): complete TASK-0001 M2 image install`.
 
 ## M3 — Align data mounting and Docker documentation
 
-State: `ready-for-approval`
-Revision: 2
+State: `completed`
+Revision: 4
 Depends on: M2
 Milestone type: implementation
 
@@ -189,10 +189,34 @@ repository mount at `/workspace/data`.
 Do not infer a user's home directory in `docker_run.sh`. Avoid documenting a
 dataset-specific path as a required default.
 
+### Implementation closeout
+
+**What and why.** M3 made the existing user-controlled data mount and Docker
+command boundary explicit, so readers do not confuse host scene data with
+repository-provided assets.
+
+**How and where.** `env` now labels `DATA` as the host directory that
+`docker/docker_run.sh` mounts at `/data`. `README.md` adds a Docker workflow
+that sets `COLMAP_REC=scene-reconstruction-colmap`, uses
+`docker exec -it "$COLMAP_REC"`, identifies `/data/1782890858308` as an
+example scene path, and gives the FAISS asset's repository mount path
+`/workspace/data/colmap-vocab-tree-faiss/itri_vocab_tree_words8K.faiss.bin`.
+The mount implementation itself is unchanged.
+
+**Evidence.** `bash -n docker/docker_run.sh docker/docker_build.sh` passed.
+Sourcing `./env` resolved `DATA=/home/kike/data/360-data`. README inspection
+confirmed the container variable, `docker exec -it` selector invocation,
+example-path label, FAISS path, and removal of the unresolved intake note.
+
+**Known limits and downstream effect.** M3 does not start a container or prove
+selector output visibility. M4 must run the documented selector command and
+verify that it reports a reachable URL or a concrete startup error. This
+closeout is committed as `docs(docker): complete TASK-0001 M3 workflow`.
+
 ## M4 — Verify documented selector workflow
 
-State: `proposed`
-Revision: 1
+State: `ready-for-approval`
+Revision: 2
 Depends on: M3
 Milestone type: implementation
 
@@ -230,3 +254,5 @@ remote access is out of scope.
 | 2026-08-25 | M1 | Revision 3 completed; M2 revision 2 ready for approval | Static Docker/runtime contract verified; implementation remains approval-gated | approved |
 | 2026-08-25 | M2 | Revision 3 started | User approved M2 execution | approved |
 | 2026-08-25 | M2 | Revision 4 completed; M3 revision 2 ready for approval | Image build and requested package/command verification passed | approved |
+| 2026-08-25 | M3 | Revision 3 started | User approved M3 execution | approved |
+| 2026-08-25 | M3 | Revision 4 completed; M4 revision 2 ready for approval | Mount guidance and Docker documentation checks passed | approved |

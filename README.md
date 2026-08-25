@@ -51,6 +51,41 @@ You can combine extras:
 python -m pip install -e '.[test,colmap,visualize]'
 ```
 
+## Docker Workflow
+
+<!-- Task: TASK-0001 -->
+
+Build the image from the repository root, then start (or attach to) the named
+container:
+
+```bash
+bash docker/docker_build.sh
+bash docker/docker_run.sh
+export COLMAP_REC=scene-reconstruction-colmap
+```
+
+`docker/docker_run.sh` sources `env`. Its `DATA` value is a user-owned host
+directory; the default `DATA=~/data/360-data` is mounted at `/data` in the
+container. Do not replace it with automatic home-directory handling in the
+script. Scene paths such as `/data/1782890858308` are examples only—replace
+them with a directory beneath your configured `DATA` path.
+
+Run the documented CLI examples inside the container. For example, start the
+interactive selector with a TTY so its startup URL is visible:
+
+```bash
+docker exec -it "$COLMAP_REC" manual-pinhole-select \
+  --image-dir /data/1782890858308 \
+  --host 127.0.0.1 \
+  --port 8765
+```
+
+The repository is mounted separately at `/workspace`. The verified local FAISS
+vocabulary-tree asset is therefore
+`/workspace/data/colmap-vocab-tree-faiss/itri_vocab_tree_words8K.faiss.bin`,
+not a file below `/data`. Prefix any remaining CLI example with
+`docker exec -it "$COLMAP_REC"` when running it from the host.
+
 ## Renderer Defaults
 
 The standalone renderer helper constants are:
@@ -157,9 +192,6 @@ download and make runs reproducible, pass a local tree with
 `--vocab-tree-path /path/to/vocab_tree.bin`. The command automatically points
 COLMAP/libcurl at `/etc/ssl/certs/ca-certificates.crt` when available; override
 it with `--ssl-cert-file` when needed.
-
->> Is this refering to data/colmap-vocab-tree-faiss/itri_vocab_tree_words8K.faiss.bin If so. we should correctly point out to this file
-
 
 For larger ordered panorama captures, keyframe matching can reduce the pair
 list before COLMAP matching. The sequential-vocabtree selector clusters images
