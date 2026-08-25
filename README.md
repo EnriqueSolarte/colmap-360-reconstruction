@@ -58,8 +58,10 @@ docker exec -it "$COLMAP_REC" manual-pinhole-select \
 
 ![Manual pinhole selector: selecting directions and rendering previews](assets/redering-pinhole-views.gif)
 
-Open the printed `http://127.0.0.1:8765` URL in a browser. The selector writes
-`selections.json` beside the image directory unless you pass `--output-dir`.
+Open the printed `http://127.0.0.1:8765` URL in a browser. By default, the
+selector writes `selections.json` to the parent of the image directory; with
+the example above, that is `/data/selections.json`. Pass `--output-dir` to use
+a different location.
 Use the selector in the browser:
 
 - Click to preview a direction without saving it.
@@ -76,9 +78,9 @@ Render one pinhole image per saved selection:
 
 ```bash
 docker exec -it "$COLMAP_REC" manual-pinhole-render-selected \
-  -s /data/1782890858308/selections.json \
+  -s /data/selections.json \
   --image-dir /data/1782890858308 \
-  -o /data/1782890858308/renders \
+  -o /data/renders \
   -w 1280 \
   -h 1280 \
   --fov-x-deg 70 \
@@ -93,8 +95,8 @@ outputs are easy to locate.
 The render stage writes:
 
 ```text
-/data/1782890858308/renders/
-/data/1782890858308/renders/render_report.json
+/data/renders/
+/data/renders/render_report.json
 ```
 
 Use `--workers N` to render panorama groups with multiple worker threads. The
@@ -115,10 +117,10 @@ poses to the rendered pinhole views:
 
 ```bash
 docker exec -it "$COLMAP_REC" manual-pinhole-attach-poses \
-  -s /data/1782890858308/selections.json \
-  --render-report /data/1782890858308/renders/render_report.json \
+  -s /data/selections.json \
+  --render-report /data/renders/render_report.json \
   --sparse-best /data/colmap-equirectangular/sparse_best \
-  -o /data/1782890858308/pose-renders
+  -o /data/pose-renders
 ```
 
 If `-o/--output-dir` is not passed, the command writes to `posed-renders/`
@@ -128,10 +130,10 @@ from the registered COLMAP model unless `--allow-missing-poses` is passed.
 The pose attachment stage writes:
 
 ```text
-/data/1782890858308/pose-renders/pose_report.json
-/data/1782890858308/pose-renders/sparse/0/cameras.txt
-/data/1782890858308/pose-renders/sparse/0/images.txt
-/data/1782890858308/pose-renders/sparse/0/points3D.txt
+/data/pose-renders/pose_report.json
+/data/pose-renders/sparse/0/cameras.txt
+/data/pose-renders/sparse/0/images.txt
+/data/pose-renders/sparse/0/points3D.txt
 ```
 
 This COLMAP text model can be used by downstream tools that expect pinhole
@@ -140,6 +142,8 @@ camera images and COLMAP-style camera poses.
 ### 5. Visualize or summarize COLMAP output
 
 Summary mode works without Open3D:
+
+![COLMAP sparse reconstruction visualization](assets/colmap-teaser.gif)
 
 ```bash
 docker exec -it "$COLMAP_REC" colmap-visualize \
@@ -172,7 +176,7 @@ exported point cloud:
 
 ```bash
 docker exec -it "$COLMAP_REC" colmap-visualize \
-  --model /data/1782890858308/pose-renders/sparse/0 \
+  --model /data/pose-renders/sparse/0 \
   --camera-style pinhole
 ```
 

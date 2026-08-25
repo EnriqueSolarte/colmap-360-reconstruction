@@ -7,8 +7,8 @@ Task: TASK-0001
 Status: completed
 Owner: Codex
 Dependencies: none
-Plan revision: 15
-Current milestone: M7
+Plan revision: 17
+Current milestone: M8
 ```
 
 The task is the durable goal and integration contract. This plan is the
@@ -38,6 +38,7 @@ permanent evolving execution strategy.
 | M5 | Reorganize README as a usage-first guide | `completed` | 2 | M4 | Completed 2026-08-25 |
 | M6 | Polish practical README workflow | `completed` | 2 | M5 | Completed 2026-08-25 |
 | M7 | Embed selector demonstration | `completed` | 2 | M6 | Completed 2026-08-25 |
+| M8 | Align output paths and visualization guide | `completed` | 2 | M7 | Completed 2026-08-25 |
 
 ## M1 — Confirm Docker runtime contract
 
@@ -437,6 +438,66 @@ Amber workspace validator passed.
 this milestone verifies only its presence, type, and README linkage. This
 closeout is committed as `docs(readme): complete TASK-0001 M7 selector demo`.
 
+## M8 — Align output paths and visualization guide
+
+State: `completed`
+Revision: 2
+Depends on: M7
+Milestone type: implementation
+
+### Deliverable
+
+A README whose selector, renderer, pose-attachment, and visualization examples
+use the actual default `/data` output layout, with the supplied visualization
+GIF embedded at the summary section.
+
+### Scope
+
+Preserve the user's command-path edits, correct the surrounding default-output
+explanation and generated-path listings, add the supplied GIF, and synchronize
+Amber records.
+
+### Validation
+
+- Inspect the selector implementation's default output-directory behavior.
+- Confirm both GIF assets exist and are valid GIF data.
+- Run `git diff --check` and the Amber workspace validator.
+
+### Completion condition
+
+The README does not contradict the selector's default output location, all
+linked example paths agree, and the visualization GIF uses a repository-relative
+link.
+
+### Decisions and risks
+
+The selector's `--output-dir` is optional because its implementation defaults
+to `args.image_dir.parent`; document that behavior instead of adding an
+unnecessary flag. The new GIF is approximately 7.7 MB and is retained as
+supplied without optimization.
+
+### Implementation closeout
+
+**What and why.** M8 aligns the user-updated command paths with the selector's
+real default output location and replaces the visualization placeholder with
+the supplied demonstration GIF.
+
+**How and where.** In `README.md`, the selector explanation now states that
+`--image-dir /data/1782890858308` defaults to `/data/selections.json`; the
+following render, pose, output-listing, and pinhole-visualization paths use
+`/data/renders` and `/data/pose-renders`. The new
+`assets/colmap-teaser.gif` is embedded at the visualization summary section.
+
+**Evidence.** Inspection of
+`src/render_pinhole/tools/manual_pinhole_select.py` confirmed that a missing
+`--output-dir` resolves to `args.image_dir.parent`. Both GIFs were recognized
+as GIF89a data (`1040×743` and `720×420`); `git diff --check` and the Amber
+workspace validator passed.
+
+**Known limits.** Documentation and assets only; the commands, renderer, and
+visualizer were not re-executed. The new GIF is retained at its supplied size.
+This closeout is committed as `docs(readme): complete TASK-0001 M8 output guide`.
+
 ## Plan change log
 
 | Date | Milestone | Change | Reason | Approval |
@@ -456,3 +517,5 @@ closeout is committed as `docs(readme): complete TASK-0001 M7 selector demo`.
 | 2026-08-25 | M6 | Revision 2 completed | Browser controls and Docker-ready pinhole command sequence validated | approved |
 | 2026-08-25 | M7 | Revision 1 started | User requested the selector GIF be added at the launch-command note | approved |
 | 2026-08-25 | M7 | Revision 2 completed | Supplied GIF embedded at the selector command and path/type checks passed | approved |
+| 2026-08-25 | M8 | Revision 1 started | User requested README updates after changing output paths and adding a visualization GIF | approved |
+| 2026-08-25 | M8 | Revision 2 completed | Selector-default path documentation and visualization GIF validated | approved |

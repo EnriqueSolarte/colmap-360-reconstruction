@@ -8,8 +8,8 @@ Owner: Codex
 Parallel-safe: no
 Parallel approval: not-required
 Plan source: .agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md
-Current milestone: M7
-Last verified commit: 67508a8d77e09968e7690025b316961da399e155; M6 README-workflow polish commit
+Current milestone: M8
+Last verified commit: c70fc27052a9e3ce626793051ddef1dc4088f95b; M7 selector-demo commit
 Definition approval: approved 2026-08-25
 Parent task: none
 Parent milestone: none
@@ -40,6 +40,8 @@ and make interactive selector startup observable.
   visualization.
 - [x] README shows the supplied selector demonstration GIF beside the selector
   launch command through a repository-relative asset path.
+- [x] README accurately documents the selector's default parent-directory
+  output layout and shows the supplied visualization GIF.
 
 ## Scope
 
@@ -68,7 +70,7 @@ changing reconstruction algorithms, or modifying any dataset contents.
 
 ## Plan
 
-[`.agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md`](../plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md), current milestone `M7`.
+[`.agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md`](../plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md), current milestone `M8`.
 
 ## Documentation and ADR traceability
 
@@ -78,7 +80,9 @@ changing reconstruction algorithms, or modifying any dataset contents.
   the repository FAISS asset. M5 reorganizes the same README into a
   Docker-first guide followed by detailed reference and extras. M6 adds clear
   selector controls and host-ready commands for the complete pinhole path. M7
-  embeds the supplied selector demonstration asset beside its launch command. The original
+  embeds the supplied selector demonstration asset beside its launch command.
+  M8 documents the default parent-directory output layout and adds a
+  visualization demonstration. The original
   user report remains open evidence at
   `.agent-workspace/evidence/TASK-0001-M1-current-issues-2026-08-24.md`.
 
@@ -115,6 +119,9 @@ changing reconstruction algorithms, or modifying any dataset contents.
 - M6 retains the example `/data/1782890858308` path and turns the selector
   notes into browser controls plus host-ready Docker commands for rendering,
   optional pose attachment, and visualization.
+- M8 documents that the selector defaults to the parent of its image directory,
+  so the example layout uses `/data/selections.json`, `/data/renders`, and
+  `/data/pose-renders`; it also embeds the supplied visualization GIF.
 
 ## Validation
 
