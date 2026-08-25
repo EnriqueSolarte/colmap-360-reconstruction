@@ -7,8 +7,8 @@ Task: TASK-0001
 Status: completed
 Owner: Codex
 Dependencies: none
-Plan revision: 11
-Current milestone: M5
+Plan revision: 13
+Current milestone: M6
 ```
 
 The task is the durable goal and integration contract. This plan is the
@@ -36,6 +36,7 @@ permanent evolving execution strategy.
 | M3 | Align data mounting and Docker documentation | `completed` | 4 | M2 | Completed 2026-08-25 |
 | M4 | Verify documented selector workflow | `completed` | 4 | M3 | Completed 2026-08-25 |
 | M5 | Reorganize README as a usage-first guide | `completed` | 2 | M4 | Completed 2026-08-25 |
+| M6 | Polish practical README workflow | `completed` | 2 | M5 | Completed 2026-08-25 |
 
 ## M1 — Confirm Docker runtime contract
 
@@ -330,6 +331,59 @@ present. The Amber validator and `git diff --check` passed.
 Docker, selector, or reconstruction tests. This closeout is committed as
 `docs(readme): complete TASK-0001 M5 usage guide`.
 
+## M6 — Polish practical README workflow
+
+State: `completed`
+Revision: 2
+Depends on: M5
+Milestone type: implementation
+
+### Deliverable
+
+A concise, Docker-ready pinhole workflow that explains browser selection
+controls and continues from saved selections through rendering, optional pose
+attachment, and visualization.
+
+### Scope
+
+Polish the user-edited README only and update the Amber task records. Preserve
+the concrete example scene path and keep advanced behavior/reference material.
+
+### Validation
+
+- Check Markdown hierarchy, command prefixes, and documented paths.
+- Run `git diff --check` and the Amber workspace validator.
+
+### Completion condition
+
+A reader can follow the selector workflow from browser interaction through the
+next command-line stages without needing to infer container prefixes or paths.
+
+### Decisions and risks
+
+Use `/data/1782890858308` consistently as the clearly labelled example path.
+Documentation-only changes must not claim that reconstruction or GUI behavior
+was re-tested.
+
+### Implementation closeout
+
+**What and why.** M6 turns the user-added selector notes into a concise,
+actionable browser-control guide and completes the first-run pinhole path.
+
+**How and where.** `README.md` now retains `/data/1782890858308` as the
+explicit example path, explains preview/save/delete/navigation controls, and
+uses `docker exec -it "$COLMAP_REC"` for rendering, optional pose attachment,
+and visualization. Detailed selection guidance and advanced reconstruction
+material remain in `Details and extras`.
+
+**Evidence.** Markdown heading and command/path inspection passed.
+`git diff --check` passed, and the Amber workspace validator passed after the
+milestone records were synchronized.
+
+**Known limits.** This is a documentation-only polish. It does not rerun
+Docker, browser interaction, rendering, pose attachment, or visualization.
+This closeout is committed as `docs(readme): complete TASK-0001 M6 workflow polish`.
+
 ## Plan change log
 
 | Date | Milestone | Change | Reason | Approval |
@@ -345,3 +399,5 @@ Docker, selector, or reconstruction tests. This closeout is committed as
 | 2026-08-25 | M4 | Revision 4 completed | TTY selector output, URL reachability, and focused tests passed | approved |
 | 2026-08-25 | M5 | Revision 1 started | User approved README usage-first reorganization | approved |
 | 2026-08-25 | M5 | Revision 2 completed | Docker-first usage guide and end-of-document reference structure verified | approved |
+| 2026-08-25 | M6 | Revision 1 started | User requested README review and polish after adding selector-operation notes | approved |
+| 2026-08-25 | M6 | Revision 2 completed | Browser controls and Docker-ready pinhole command sequence validated | approved |

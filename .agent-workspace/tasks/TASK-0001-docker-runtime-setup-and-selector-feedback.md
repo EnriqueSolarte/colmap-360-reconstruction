@@ -8,8 +8,8 @@ Owner: Codex
 Parallel-safe: no
 Parallel approval: not-required
 Plan source: .agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md
-Current milestone: M5
-Last verified commit: 17a63211630dad734e3f2349805685a560cb0671; M4 selector-workflow commit
+Current milestone: M6
+Last verified commit: 4b4152042c65c5b805742e27c119a8d95dfef26a; M5 README-guide commit
 Definition approval: approved 2026-08-25
 Parent task: none
 Parent milestone: none
@@ -35,6 +35,9 @@ and make interactive selector startup observable.
   Docker invocation.
 - [x] README starts with a practical Docker-first usage path and defers
   detailed reference material and optional extras to the end.
+- [x] README clearly explains selector controls and gives an end-to-end
+  Docker command sequence for rendering, optional pose attachment, and
+  visualization.
 
 ## Scope
 
@@ -63,7 +66,7 @@ changing reconstruction algorithms, or modifying any dataset contents.
 
 ## Plan
 
-[`.agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md`](../plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md), current milestone `M5`.
+[`.agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md`](../plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md), current milestone `M6`.
 
 ## Documentation and ADR traceability
 
@@ -71,7 +74,8 @@ changing reconstruction algorithms, or modifying any dataset contents.
 - Reason and supporting evidence: M3 documents the user-configured host
   `DATA` mount, valid `COLMAP_REC` Docker invocation, example scene path, and
   the repository FAISS asset. M5 reorganizes the same README into a
-  Docker-first guide followed by detailed reference and extras. The original
+  Docker-first guide followed by detailed reference and extras. M6 adds clear
+  selector controls and host-ready commands for the complete pinhole path. The original
   user report remains open evidence at
   `.agent-workspace/evidence/TASK-0001-M1-current-issues-2026-08-24.md`.
 
@@ -105,6 +109,9 @@ changing reconstruction algorithms, or modifying any dataset contents.
   from that URL before the selector was stopped.
 - M5 places the build, container start, native reconstruction, and selector
   paths before local-install alternatives and detailed reference material.
+- M6 retains the example `/data/1782890858308` path and turns the selector
+  notes into browser controls plus host-ready Docker commands for rendering,
+  optional pose attachment, and visualization.
 
 ## Validation
 

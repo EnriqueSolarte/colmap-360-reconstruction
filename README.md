@@ -32,14 +32,14 @@ export COLMAP_REC=scene-reconstruction-colmap
 the example scene directory below with a directory beneath your own `DATA`
 path; `/data/1782890858308` is only an example.
 
-### 2. Choose a workflow
+### 2. Reconstruct panoramas, or start the pinhole workflow
 
 Run a native panorama reconstruction when the source directory contains the
 equirectangular panoramas you want to reconstruct:
 
 ```bash
 docker exec -it "$COLMAP_REC" colmap-panorama-reconstruct \
-  --input-image-path /data/panoramas \
+  --input-image-path /data/1782890858308 \
   --workspace /data/colmap-equirectangular \
   --matcher sequential \
   --overlap 15 \
@@ -58,11 +58,140 @@ docker exec -it "$COLMAP_REC" manual-pinhole-select \
 
 Open the printed `http://127.0.0.1:8765` URL in a browser. The selector writes
 `selections.json` beside the image directory unless you pass `--output-dir`.
-The detailed CLI snippets below show the command that runs inside the
-container; prefix one with `docker exec -it "$COLMAP_REC"` when issuing it
-from the host.
+Use the selector in the browser:
 
-### 3. Know where outputs and assets live
+- Click to preview a direction without saving it.
+- Hold `Cmd` (macOS) or `Ctrl` (Linux/Windows) while clicking to save that
+  direction and render its preview.
+- Move the pointer near a saved point to highlight it; press `d` to delete the
+  highlighted point.
+- Press the left and right arrow keys to move to the previous or next
+  panorama.
+
+### 3. Render the saved pinhole views
+
+Render one pinhole image per saved selection:
+
+```bash
+docker exec -it "$COLMAP_REC" manual-pinhole-render-selected \
+  -s /data/1782890858308/selections.json \
+  --image-dir /data/1782890858308 \
+  -o /data/1782890858308/renders \
+  -w 1280 \
+  -h 1280 \
+  --fov-x-deg 70 \
+  --fov-y-deg 70
+```
+
+`--image-dir` is optional when `selections.json` contains `source.image_dir`.
+If `-o/--output-dir` is not passed, the renderer writes to `renders/` beside
+the selections file. The command above uses explicit paths so its inputs and
+outputs are easy to locate.
+
+The render stage writes:
+
+```text
+/data/1782890858308/renders/
+/data/1782890858308/renders/render_report.json
+```
+
+Use `--workers N` to render panorama groups with multiple worker threads. The
+default is `--workers 1`, which is slower but has predictable memory use.
+Existing expected output images are reused by default, so rerunning the command
+only renders missing selections. Pass `--overwrite` to regenerate existing
+outputs. When a previous `render_report.json` exists, images listed in that old
+report are deleted if their render identity is no longer present in the current
+selections; pass `--keep-stale` to keep them. Render identity includes the
+source panorama name, longitude, latitude, output size, FOV, interpolation, and
+output extension, so matching output filenames alone are not reused when the
+underlying view changed.
+
+### 4. Attach COLMAP poses (optional)
+
+After a native equirectangular COLMAP reconstruction exists, attach panorama
+poses to the rendered pinhole views:
+
+```bash
+docker exec -it "$COLMAP_REC" manual-pinhole-attach-poses \
+  -s /data/1782890858308/selections.json \
+  --render-report /data/1782890858308/renders/render_report.json \
+  --sparse-best /data/colmap-equirectangular/sparse_best \
+  -o /data/1782890858308/pose-renders
+```
+
+If `-o/--output-dir` is not passed, the command writes to `posed-renders/`
+beside the render report. The command fails when a selected panorama is missing
+from the registered COLMAP model unless `--allow-missing-poses` is passed.
+
+The pose attachment stage writes:
+
+```text
+/data/1782890858308/pose-renders/pose_report.json
+/data/1782890858308/pose-renders/sparse/0/cameras.txt
+/data/1782890858308/pose-renders/sparse/0/images.txt
+/data/1782890858308/pose-renders/sparse/0/points3D.txt
+```
+
+This COLMAP text model can be used by downstream tools that expect pinhole
+camera images and COLMAP-style camera poses.
+
+### 5. Visualize or summarize COLMAP output
+
+Summary mode works without Open3D:
+
+```bash
+docker exec -it "$COLMAP_REC" colmap-visualize \
+  --model /data/colmap-equirectangular/sparse_best \
+  --summary-only
+```
+
+Interactive visualization requires Open3D and GUI/OpenGL support:
+
+```bash
+docker exec -it "$COLMAP_REC" colmap-visualize \
+  --model /data/colmap-equirectangular/sparse_best
+```
+
+For equirectangular workspaces, the visualizer automatically draws each
+panorama as a small surface sphere with a local RGB arrow coordinate frame
+instead of drawing a pinhole camera frustum. The sphere radius is one
+quarter of the local frame size. The local frame is centered at the panorama
+view center: +x points right, +y points down, and +z points through the
+panorama center direction. You can override this if needed:
+
+```bash
+docker exec -it "$COLMAP_REC" colmap-visualize \
+  --model /data/colmap-equirectangular/sparse_best \
+  --camera-style sphere
+```
+
+For pose-attached pinhole render exports, draw pinhole camera frustums and the
+exported point cloud:
+
+```bash
+docker exec -it "$COLMAP_REC" colmap-visualize \
+  --model /data/1782890858308/pose-renders/sparse/0 \
+  --camera-style pinhole
+```
+
+When the visualizer detects a nearby `pose_report.json` from
+`manual-pinhole-attach-poses`, it shows untracked/synthetic `points3D` by
+default because the derived pinhole export intentionally omits COLMAP feature
+tracks. Use `--min-track-length N` to override that filtering behavior.
+
+To save a preview image:
+
+```bash
+docker exec -it "$COLMAP_REC" colmap-visualize \
+  --model /data/colmap-equirectangular/sparse_best \
+  --save-image /data/colmap-equirectangular/map-preview.png \
+  --summary-only
+```
+
+In headless containers this may fail if Open3D cannot create a rendering
+window. Summary mode remains usable in that environment.
+
+### 6. Know where outputs and assets live
 
 Generated workspaces and scene data belong below `/data`. The repository is
 mounted separately at `/workspace`; its verified local FAISS vocabulary-tree
@@ -363,72 +492,6 @@ Good manual selections usually follow these rules:
 - Keep the FOV and resolution consistent for a downstream training set unless
   you have a specific reason to vary intrinsics.
 
-#### Stage 2: Render selected pinhole images
-
-Render one pinhole image per saved selection:
-
-```bash
-manual-pinhole-render-selected \
-  -s /path/to/selections.json \
-  --image-dir /data/images \
-  -o /data/renders \
-  -w 1280 \
-  -h 1280 \
-  --fov-x-deg 70 \
-  --fov-y-deg 70
-```
-
-`--image-dir` is optional when `selections.json` contains `source.image_dir`.
-If `-o/--output-dir` is not passed, the renderer writes to `renders/` beside
-the selections file.
-
-The render stage writes:
-
-```text
-/path/to/workspace/renders/
-/path/to/workspace/renders/render_report.json
-```
-
-Use `--workers N` to render panorama groups with multiple worker threads. The
-default is `--workers 1`, which is slower but has predictable memory use.
-Existing expected output images are reused by default, so rerunning the command
-only renders missing selections. Pass `--overwrite` to regenerate existing
-outputs. When a previous `render_report.json` exists, images listed in that old
-report are deleted if their render identity is no longer present in the current
-selections; pass `--keep-stale` to keep them. Render identity includes the
-source panorama name, longitude, latitude, output size, FOV, interpolation, and
-output extension, so matching output filenames alone are not reused when the
-underlying view changed.
-
-#### Stage 3: Attach COLMAP poses
-
-After a native equirectangular COLMAP reconstruction exists, attach panorama
-poses to the rendered pinhole views:
-
-```bash
-manual-pinhole-attach-poses \
-  -s /data/selections.json \
-  --render-report /data/render_report.json \
-  --sparse-best /data/colmap/sparse_best \
-  -o /data/pose-renders
-```
-
-If `-o/--output-dir` is not passed, the command writes to `posed-renders/`
-beside the render report. The command fails when a selected panorama is missing
-from the registered COLMAP model unless `--allow-missing-poses` is passed.
-
-The pose attachment stage writes:
-
-```text
-/path/to/workspace/pose-renders/pose_report.json
-/path/to/workspace/pose-renders/sparse/0/cameras.txt
-/path/to/workspace/pose-renders/sparse/0/images.txt
-/path/to/workspace/pose-renders/sparse/0/points3D.txt
-```
-
-This COLMAP text model can be used by downstream tools that expect pinhole
-camera images and COLMAP-style camera poses.
-
 #### Reconstruct with higher-resolution pinhole images
 
 `colmap-pinhole-reconstruct` can use one render report as the metadata/FOV
@@ -504,61 +567,7 @@ manual-pinhole-attach-poses \
   -o /data/itri-3d-reconstruction/scene-reconstruction/2026-07-02-001/pose-renders
 ```
 
-### Visualize or summarize COLMAP output
 
-Summary mode works without Open3D:
-
-```bash
-colmap-visualize \
-  --model /data/sparse_best \
-  --summary-only
-```
-
-Interactive visualization requires Open3D and GUI/OpenGL support:
-
-```bash
-colmap-visualize \
-  --model /data/colmap-equirectangular/sparse_best
-```
-
-For equirectangular workspaces, the visualizer automatically draws each
-panorama as a small surface sphere with a local RGB arrow coordinate frame
-instead of drawing a pinhole camera frustum. The sphere radius is one
-quarter of the local frame size. The local frame is centered at the panorama
-view center: +x points right, +y points down, and +z points through the
-panorama center direction. You can override this if needed:
-
-```bash
-colmap-visualize \
-  --model /data/colmap-equirectangular/sparse_best \
-  --camera-style sphere
-```
-
-For pose-attached pinhole render exports, draw pinhole camera frustums and the
-exported point cloud:
-
-```bash
-colmap-visualize \
-  --model /data/pose-renders/sparse/0 \
-  --camera-style pinhole
-```
-
-When the visualizer detects a nearby `pose_report.json` from
-`manual-pinhole-attach-poses`, it shows untracked/synthetic `points3D` by
-default because the derived pinhole export intentionally omits COLMAP feature
-tracks. Use `--min-track-length N` to override that filtering behavior.
-
-To save a preview image:
-
-```bash
-colmap-visualize \
-  --model /workspace/data/colmap-equirectangular/sparse_best \
-  --save-image /workspace/data/colmap-equirectangular/map-preview.png \
-  --summary-only
-```
-
-In headless containers this may fail if Open3D cannot create a rendering
-window. Summary mode remains usable in that environment.
 
 ### Utility scripts
 
