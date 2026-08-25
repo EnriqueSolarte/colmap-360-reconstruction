@@ -7,8 +7,8 @@ Task: TASK-0001
 Status: ready
 Owner: Codex
 Dependencies: none
-Plan revision: 3
-Current milestone: M2
+Plan revision: 5
+Current milestone: M3
 ```
 
 The task is the durable goal and integration contract. This plan is the
@@ -32,8 +32,8 @@ permanent evolving execution strategy.
 | ID | Milestone | State | Revision | Depends on | Last change |
 | --- | --- | --- | --- | --- | --- |
 | M1 | Confirm Docker runtime contract | `completed` | 3 | none | Completed 2026-08-25 |
-| M2 | Install project dependencies in image | `ready-for-approval` | 2 | M1 | Ready for approval 2026-08-25 |
-| M3 | Align data mounting and Docker documentation | `proposed` | 1 | M2 | Created 2026-08-25 |
+| M2 | Install project dependencies in image | `completed` | 4 | M1 | Completed 2026-08-25 |
+| M3 | Align data mounting and Docker documentation | `ready-for-approval` | 2 | M2 | Ready for approval 2026-08-25 |
 | M4 | Verify documented selector workflow | `proposed` | 1 | M3 | Created 2026-08-25 |
 
 ## M1 — Confirm Docker runtime contract
@@ -103,8 +103,8 @@ is committed as `chore(task): complete TASK-0001 M1 Docker contract diagnosis`.
 
 ## M2 — Install project dependencies in image
 
-State: `ready-for-approval`
-Revision: 2
+State: `completed`
+Revision: 4
 Depends on: M1
 Milestone type: implementation
 
@@ -132,10 +132,35 @@ The image build completes and the requested project extras are installed.
 The runtime `/workspace` bind mount must remain compatible with the editable
 installation. Image build time and dependency availability are external risks.
 
+### Implementation closeout
+
+**What and why.** The image now builds from the repository root and installs
+the editable project with the `test`, `colmap`, and `visualize` extras. This
+makes the image self-contained for project command discovery before its
+`/workspace` runtime bind mount is attached.
+
+**How and where.** `docker/docker_build.sh` passes `${DIR}/..` as the Docker
+build context. `docker/dockerfile.dev-container` sets `WORKDIR /workspace`,
+copies that context there, then runs `python -m pip install --no-cache-dir -e
+'[test,colmap,visualize]'`.
+
+**Evidence.** A no-cache build completed and produced
+`scene-reconstruction-colmap:dev` image
+`sha256:8cb5455fc1842825dabbbd00a72cba70b8638e9e529e2c7e78de17301f8ffc32`.
+Inside it, imports of `pycolmap`, `open3d`, `cv2`, `colmap.panorama.cli`, and
+`render_pinhole.tools.manual_pinhole_select_server` passed. `command -v`
+found `colmap-panorama-reconstruct`, `manual-pinhole-select`, and
+`colmap-visualize`; pip reported project version `0.1.0`.
+
+**Known limits and downstream effect.** This does not verify runtime bind
+mount behavior, README accuracy, live selector output, or focused tests. M3
+owns mount/documentation alignment; M4 owns the live selector workflow. This
+closeout is committed as `feat(docker): complete TASK-0001 M2 image install`.
+
 ## M3 — Align data mounting and Docker documentation
 
-State: `proposed`
-Revision: 1
+State: `ready-for-approval`
+Revision: 2
 Depends on: M2
 Milestone type: implementation
 
@@ -203,3 +228,5 @@ remote access is out of scope.
 | 2026-08-25 | Plan | Revision 1 created | Approved task definition from current issue note | approved |
 | 2026-08-25 | M1 | Revision 2 started | User approved task-branch setup and M1 diagnostic execution | approved |
 | 2026-08-25 | M1 | Revision 3 completed; M2 revision 2 ready for approval | Static Docker/runtime contract verified; implementation remains approval-gated | approved |
+| 2026-08-25 | M2 | Revision 3 started | User approved M2 execution | approved |
+| 2026-08-25 | M2 | Revision 4 completed; M3 revision 2 ready for approval | Image build and requested package/command verification passed | approved |

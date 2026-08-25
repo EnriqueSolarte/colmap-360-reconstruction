@@ -70,7 +70,11 @@ RUN mkdir -p /etc/bash_completion.d && \
     glab completion -s bash > /etc/bash_completion.d/glab && \
     printf '\nif [ -f /etc/bash_completion ]; then\n    . /etc/bash_completion\nfi\n' >> /root/.bashrc
 
-COPY dockerfile.dev-container /dockerfile.dev-container
+WORKDIR /workspace
+COPY . /workspace
+
+RUN python -m pip install --no-cache-dir --upgrade pip && \
+    python -m pip install --no-cache-dir -e '.[test,colmap,visualize]'
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \

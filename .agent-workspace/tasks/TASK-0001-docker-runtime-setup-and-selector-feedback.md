@@ -8,8 +8,8 @@ Owner: Codex
 Parallel-safe: no
 Parallel approval: not-required
 Plan source: .agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md
-Current milestone: M2
-Last verified commit: 1a4b8afd1dac7169cec2ff30d3fd1f2ecbb24052; task baseline commit
+Current milestone: M3
+Last verified commit: 91d4b4777d2622828eb6ff6a7d2378d3819206c4; M1 diagnostic commit
 Definition approval: approved 2026-08-25
 Parent task: none
 Parent milestone: none
@@ -23,8 +23,8 @@ and make interactive selector startup observable.
 
 ## Acceptance criteria
 
-- [ ] The Docker image installs `.[test,colmap,visualize]` during image build.
-- [ ] The build has access to the repository source needed for that install.
+- [x] The Docker image installs `.[test,colmap,visualize]` during image build.
+- [x] The build has access to the repository source needed for that install.
 - [ ] The user-configured `DATA` host directory mounts at `/data` without
   changing `docker_run.sh` to derive it from the user's home directory.
 - [ ] README container examples use a valid container-name variable and label
@@ -61,7 +61,7 @@ changing reconstruction algorithms, or modifying any dataset contents.
 
 ## Plan
 
-[`.agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md`](../plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md), current milestone `M1`.
+[`.agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md`](../plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md), current milestone `M3`.
 
 ## Documentation and ADR traceability
 
@@ -87,6 +87,10 @@ changing reconstruction algorithms, or modifying any dataset contents.
   Git policy in `.gh-rule.md`.
 - M1 established the static Docker and documentation contract. It did not build
   an image, run Docker, or verify selector output through `docker exec`.
+- M2 built `scene-reconstruction-colmap:dev` as image
+  `sha256:8cb5455fc1842825dabbbd00a72cba70b8638e9e529e2c7e78de17301f8ffc32`.
+  Its requested extras and project console commands were verified inside the
+  resulting image.
 
 ## Validation
 
@@ -97,12 +101,20 @@ changing reconstruction algorithms, or modifying any dataset contents.
 - Command or check: inspected Docker build context, Dockerfile installation
   directives, README Docker invocation, selector startup prints, and the local
   FAISS asset during M1.
-- Command or check: Docker build and focused tests not run.
+- Command or check: M2 no-cache Docker build completed with the repository root
+  as its context.
+- Command or check: in the M2 image, imports of `pycolmap`, `open3d`, `cv2`,
+  `colmap.panorama.cli`, and the selector server passed.
+- Command or check: in the M2 image, `colmap-panorama-reconstruct`,
+  `manual-pinhole-select`, and `colmap-visualize` were found on `PATH`; pip
+  reported `colmap-360-reconstruction 0.1.0`.
+- Command or check: focused project tests not run; M2 changed only image build
+  configuration.
 
 ## Next action
 
-Request approval for M2 before changing Docker build context or Dockerfile
-installation behavior.
+Request approval for M3 before changing Docker runtime mounts or README
+documentation.
 
 ## Closure
 
