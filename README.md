@@ -56,6 +56,8 @@ docker exec -it "$COLMAP_REC" manual-pinhole-select \
   --port 8765
 ```
 
+![Manual pinhole selector: selecting directions and rendering previews](assets/redering-pinhole-views.gif)
+
 Open the printed `http://127.0.0.1:8765` URL in a browser. The selector writes
 `selections.json` beside the image directory unless you pass `--output-dir`.
 Use the selector in the browser:

@@ -8,8 +8,8 @@ Owner: Codex
 Parallel-safe: no
 Parallel approval: not-required
 Plan source: .agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md
-Current milestone: M6
-Last verified commit: 4b4152042c65c5b805742e27c119a8d95dfef26a; M5 README-guide commit
+Current milestone: M7
+Last verified commit: 67508a8d77e09968e7690025b316961da399e155; M6 README-workflow polish commit
 Definition approval: approved 2026-08-25
 Parent task: none
 Parent milestone: none
@@ -38,6 +38,8 @@ and make interactive selector startup observable.
 - [x] README clearly explains selector controls and gives an end-to-end
   Docker command sequence for rendering, optional pose attachment, and
   visualization.
+- [x] README shows the supplied selector demonstration GIF beside the selector
+  launch command through a repository-relative asset path.
 
 ## Scope
 
@@ -66,7 +68,7 @@ changing reconstruction algorithms, or modifying any dataset contents.
 
 ## Plan
 
-[`.agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md`](../plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md), current milestone `M6`.
+[`.agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md`](../plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md), current milestone `M7`.
 
 ## Documentation and ADR traceability
 
@@ -75,7 +77,8 @@ changing reconstruction algorithms, or modifying any dataset contents.
   `DATA` mount, valid `COLMAP_REC` Docker invocation, example scene path, and
   the repository FAISS asset. M5 reorganizes the same README into a
   Docker-first guide followed by detailed reference and extras. M6 adds clear
-  selector controls and host-ready commands for the complete pinhole path. The original
+  selector controls and host-ready commands for the complete pinhole path. M7
+  embeds the supplied selector demonstration asset beside its launch command. The original
   user report remains open evidence at
   `.agent-workspace/evidence/TASK-0001-M1-current-issues-2026-08-24.md`.
 

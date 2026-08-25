@@ -7,8 +7,8 @@ Task: TASK-0001
 Status: completed
 Owner: Codex
 Dependencies: none
-Plan revision: 13
-Current milestone: M6
+Plan revision: 15
+Current milestone: M7
 ```
 
 The task is the durable goal and integration contract. This plan is the
@@ -37,6 +37,7 @@ permanent evolving execution strategy.
 | M4 | Verify documented selector workflow | `completed` | 4 | M3 | Completed 2026-08-25 |
 | M5 | Reorganize README as a usage-first guide | `completed` | 2 | M4 | Completed 2026-08-25 |
 | M6 | Polish practical README workflow | `completed` | 2 | M5 | Completed 2026-08-25 |
+| M7 | Embed selector demonstration | `completed` | 2 | M6 | Completed 2026-08-25 |
 
 ## M1 — Confirm Docker runtime contract
 
@@ -384,6 +385,58 @@ milestone records were synchronized.
 Docker, browser interaction, rendering, pose attachment, or visualization.
 This closeout is committed as `docs(readme): complete TASK-0001 M6 workflow polish`.
 
+## M7 — Embed selector demonstration
+
+State: `completed`
+Revision: 2
+Depends on: M6
+Milestone type: implementation
+
+### Deliverable
+
+The supplied selector GIF is tracked under `assets/` and displayed directly
+below the selector launch command in the README.
+
+### Scope
+
+Replace only the user-authored insertion note with a repository-relative image
+link; add the supplied GIF and synchronize Amber records.
+
+### Validation
+
+- Confirm the linked asset exists and is recognized as GIF image data.
+- Run `git diff --check` and the Amber workspace validator.
+
+### Completion condition
+
+The README has no placeholder note and renders the supplied GIF from a tracked,
+repository-relative path.
+
+### Decisions and risks
+
+Keep the supplied filename to avoid modifying the user-provided binary. The GIF
+adds approximately 2.8 MB to the repository; no conversion or optimization is
+in scope.
+
+### Implementation closeout
+
+**What and why.** M7 replaces the README placeholder with the supplied selector
+demonstration, so users can see the browser interaction before following its
+control instructions.
+
+**How and where.** `README.md` embeds
+`assets/redering-pinhole-views.gif` immediately below the
+`manual-pinhole-select` command. The binary is retained unchanged under
+`assets/` and is resolved through the repository-relative Markdown path.
+
+**Evidence.** `test -f assets/redering-pinhole-views.gif` passed; `file`
+identified it as GIF89a image data at 1040×743. `git diff --check` and the
+Amber workspace validator passed.
+
+**Known limits.** The animation itself was not content-reviewed or optimized;
+this milestone verifies only its presence, type, and README linkage. This
+closeout is committed as `docs(readme): complete TASK-0001 M7 selector demo`.
+
 ## Plan change log
 
 | Date | Milestone | Change | Reason | Approval |
@@ -401,3 +454,5 @@ This closeout is committed as `docs(readme): complete TASK-0001 M6 workflow poli
 | 2026-08-25 | M5 | Revision 2 completed | Docker-first usage guide and end-of-document reference structure verified | approved |
 | 2026-08-25 | M6 | Revision 1 started | User requested README review and polish after adding selector-operation notes | approved |
 | 2026-08-25 | M6 | Revision 2 completed | Browser controls and Docker-ready pinhole command sequence validated | approved |
+| 2026-08-25 | M7 | Revision 1 started | User requested the selector GIF be added at the launch-command note | approved |
+| 2026-08-25 | M7 | Revision 2 completed | Supplied GIF embedded at the selector command and path/type checks passed | approved |
