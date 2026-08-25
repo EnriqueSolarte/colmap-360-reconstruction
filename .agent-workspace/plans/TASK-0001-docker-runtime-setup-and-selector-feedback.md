@@ -4,11 +4,11 @@
 Protocol: amber@v3
 Record schema: 2
 Task: TASK-0001
-Status: proposed
-Owner: unassigned
+Status: ready
+Owner: Codex
 Dependencies: none
-Plan revision: 1
-Current milestone: M1
+Plan revision: 3
+Current milestone: M2
 ```
 
 The task is the durable goal and integration contract. This plan is the
@@ -31,15 +31,15 @@ permanent evolving execution strategy.
 
 | ID | Milestone | State | Revision | Depends on | Last change |
 | --- | --- | --- | --- | --- | --- |
-| M1 | Confirm Docker runtime contract | `proposed` | 1 | none | Created 2026-08-25 |
-| M2 | Install project dependencies in image | `proposed` | 1 | M1 | Created 2026-08-25 |
+| M1 | Confirm Docker runtime contract | `completed` | 3 | none | Completed 2026-08-25 |
+| M2 | Install project dependencies in image | `ready-for-approval` | 2 | M1 | Ready for approval 2026-08-25 |
 | M3 | Align data mounting and Docker documentation | `proposed` | 1 | M2 | Created 2026-08-25 |
 | M4 | Verify documented selector workflow | `proposed` | 1 | M3 | Created 2026-08-25 |
 
 ## M1 — Confirm Docker runtime contract
 
-State: `proposed`
-Revision: 1
+State: `completed`
+Revision: 3
 Depends on: none
 Milestone type: diagnostic
 
@@ -69,10 +69,42 @@ documentation paths, and selector feedback remedy supported by evidence.
 documentation example, not a required dataset location. The existing dirty
 files must be preserved.
 
+### Diagnostics and findings
+
+**What and why.** M1 established the current Docker runtime contract before
+implementation, so M2 can correct the image-install path without overwriting
+the preserved baseline edits.
+
+**How and where.** In this repository, `docker/docker_build.sh` invokes
+`docker build` with `docker/` as its context. `docker/dockerfile.dev-container`
+does not copy `pyproject.toml` or `src/` and has no project `pip install`
+directive. `docker/docker_run.sh` sources the repository `env` file by absolute
+path; its `DATA` value resolves to `/home/kike/data/360-data` and is bound at
+`/data/`. The repository is mounted independently at `/workspace`, where
+`data/colmap-vocab-tree-faiss/itri_vocab_tree_words8K.faiss.bin` exists.
+
+**Documentation and selector facts.** The README has no `docker exec` or
+`COLMAP-REC` invocation and retains an unresolved note about the FAISS asset.
+`src/render_pinhole/tools/manual_pinhole_select_server.py` prints its URL but
+does not request flushing, so the cause of silent non-TTY `docker exec` output
+is not established by static inspection.
+
+**Evidence.** `bash -n docker/docker_build.sh docker/docker_run.sh` passed.
+Sourcing `./env` and the absolute path used by `docker_run.sh` both yielded
+`DATA=/home/kike/data/360-data`. The Amber validator passed. The related user
+report remains open evidence at
+`.agent-workspace/evidence/TASK-0001-M1-current-issues-2026-08-24.md`.
+
+**Known limits and downstream effect.** No Docker image build, package import,
+focused selector test, or live `docker exec` invocation ran. M2 must change and
+verify the build context and image dependency installation; M3 must repair the
+README/mount documentation; M4 must test selector observability. This closeout
+is committed as `chore(task): complete TASK-0001 M1 Docker contract diagnosis`.
+
 ## M2 — Install project dependencies in image
 
-State: `proposed`
-Revision: 1
+State: `ready-for-approval`
+Revision: 2
 Depends on: M1
 Milestone type: implementation
 
@@ -169,3 +201,5 @@ remote access is out of scope.
 | Date | Milestone | Change | Reason | Approval |
 | --- | --- | --- | --- | --- |
 | 2026-08-25 | Plan | Revision 1 created | Approved task definition from current issue note | approved |
+| 2026-08-25 | M1 | Revision 2 started | User approved task-branch setup and M1 diagnostic execution | approved |
+| 2026-08-25 | M1 | Revision 3 completed; M2 revision 2 ready for approval | Static Docker/runtime contract verified; implementation remains approval-gated | approved |

@@ -15,4 +15,4 @@ Project scope: colmap-reconstruction-ws
 
 | Task | Status | Owner | Repositories | Parallel-safe | Plan | Current milestone | Dependencies |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| TASK-0001 | proposed | unassigned | . | no | [plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md](plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md) | M1 | none |
+| TASK-0001 | ready | Codex | . | no | [plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md](plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md) | M2 | none |

@@ -3,13 +3,13 @@
 ```text
 Protocol: amber@v3
 Record schema: 2
-Status: proposed
-Owner: unassigned
+Status: ready
+Owner: Codex
 Parallel-safe: no
 Parallel approval: not-required
 Plan source: .agent-workspace/plans/TASK-0001-docker-runtime-setup-and-selector-feedback.md
-Current milestone: M1
-Last verified commit: 6dee2e5daa1acbd9ff2c1d5396d94b4bcbe38be2; task baseline on branch
+Current milestone: M2
+Last verified commit: 1a4b8afd1dac7169cec2ff30d3fd1f2ecbb24052; task baseline commit
 Definition approval: approved 2026-08-25
 Parent task: none
 Parent milestone: none
@@ -85,17 +85,24 @@ changing reconstruction algorithms, or modifying any dataset contents.
   `/home/kike/ws/scene-reconstruction-ws/colmap-reconstruction-ws/colmap-reconstruction-ws`.
 - The task branch was created from `dev` at `6dee2e5` under the repository
   Git policy in `.gh-rule.md`.
+- M1 established the static Docker and documentation contract. It did not build
+  an image, run Docker, or verify selector output through `docker exec`.
 
 ## Validation
 
-- Command or check: Amber workspace validator passed before task creation.
-- Command or check: `bash -n docker/docker_run.sh docker/docker_build.sh` passed before task creation.
+- Command or check: Amber workspace validator passed during M1.
+- Command or check: `bash -n docker/docker_run.sh docker/docker_build.sh` passed during M1.
+- Command or check: sourced `./env` and the same absolute-path form used by
+  `docker_run.sh`; both resolved `DATA=/home/kike/data/360-data`.
+- Command or check: inspected Docker build context, Dockerfile installation
+  directives, README Docker invocation, selector startup prints, and the local
+  FAISS asset during M1.
 - Command or check: Docker build and focused tests not run.
 
 ## Next action
 
-Request approval for diagnostic milestone M1 before changing the current Docker,
-environment, README, or selector files.
+Request approval for M2 before changing Docker build context or Dockerfile
+installation behavior.
 
 ## Closure
 
